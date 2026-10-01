@@ -77,7 +77,7 @@ Then launch with `open $(brew --prefix)/CatEye.app`.
 
 ### Option 2: Download binary
 
-Grab `CatEye.zip` from the [latest release](https://github.com/flarco/cat-eye/releases), unzip, and double-click. On first launch, macOS will block it — right-click → Open → Open to bypass Gatekeeper (required for unsigned apps).
+Get `CatEye.zip` from the [latest release](https://github.com/flarco/cat-eye/releases), unzip it, and move `CatEye.app` to Applications. The app is signed with a Developer ID and notarized by Apple, so it opens without a Gatekeeper warning. It runs on Apple silicon and Intel Macs.
 
 ### Option 3: Build from source
 

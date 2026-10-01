@@ -33,6 +33,12 @@ CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./build.sh
 3. Update the README if behaviour or configuration changed.
 4. Open a pull request with a clear description of what and why.
 
+## Releases
+
+Each push to `main` by the owner starts `.github/workflows/release.yml`. The workflow builds a universal binary, signs it with the Developer ID, notarizes it, and publishes `CatEye.zip` to a new GitHub release. The tag is the last tag with the patch number plus one. For a minor or major release, set the higher version in `Info.plist`.
+
+The signing secrets are in the `release` environment, which accepts the `main` branch only. Workflows from other people and from forks cannot use them.
+
 ## Reporting bugs
 
 Open a GitHub issue with your macOS version, `gh --version` output, and steps to reproduce. Screenshots help — but please use demo data, not your real repo names.

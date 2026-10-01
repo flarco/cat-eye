@@ -8,6 +8,7 @@ final class SettingsVC: NSViewController {
     static var seenOwners: Set<String> = []
 
     let catalog: RepoCatalog
+    let updater: Updater
     var picked: Set<String>
     var orgs: Set<String>
     var repoScroll: NSScrollView?
@@ -18,16 +19,22 @@ final class SettingsVC: NSViewController {
     var refreshAllBtn: NSButton?
     var addField: NSTextField?
     var observer: NSObjectProtocol?
+    var updateObserver: NSObjectProtocol?
+    var updateLabel: NSTextField?
+    var updateBtn: NSButton?
 
-    init(catalog: RepoCatalog, picked: Set<String>, orgs: Set<String>) {
+    init(catalog: RepoCatalog, updater: Updater, picked: Set<String>, orgs: Set<String>) {
         self.catalog = catalog
+        self.updater = updater
         self.picked = picked
         self.orgs = orgs
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    deinit { if let o = observer { NotificationCenter.default.removeObserver(o) } }
+    deinit {
+        for o in [observer, updateObserver].compactMap({ $0 }) { NotificationCenter.default.removeObserver(o) }
+    }
 
     override func loadView() {
         let w = POP_W
@@ -56,6 +63,29 @@ final class SettingsVC: NSViewController {
         logoutBtn.frame = NSRect(x: w - 88, y: 10, width: 64, height: 24)
         accRow.addSubview(logoutBtn)
         container.addSubview(accRow); y += 40
+        container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
+
+        // ── Updates section ──
+        container.addSubview(SettingsHeader("UPDATES", y: y, w: w)); y += 28
+        let updRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
+        let auto = NSButton(checkboxWithTitle: "Automatically install updates", target: self, action: #selector(toggleAutoUpdate(_:)))
+        auto.font = .systemFont(ofSize: 12)
+        auto.state = AUTO_UPDATE ? .on : .off
+        auto.isEnabled = !updater.isDev
+        auto.frame = NSRect(x: 16, y: 10, width: 220, height: 20)
+        updRow.addSubview(auto)
+        let ul = NSTextField(labelWithString: "")
+        ul.font = .systemFont(ofSize: 11); ul.textColor = .secondaryLabelColor
+        ul.alignment = .right; ul.lineBreakMode = .byTruncatingTail
+        ul.frame = NSRect(x: 240, y: 12, width: w - 350, height: 16)
+        updRow.addSubview(ul)
+        updateLabel = ul
+        let ub = NSButton(title: "Check now", target: self, action: #selector(checkOrRestart))
+        ub.bezelStyle = .inline; ub.font = .systemFont(ofSize: 11)
+        ub.frame = NSRect(x: w - 104, y: 10, width: 88, height: 24)
+        updRow.addSubview(ub)
+        updateBtn = ub
+        container.addSubview(updRow); y += 40
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
         // ── Repos section ──
@@ -117,6 +147,9 @@ final class SettingsVC: NSViewController {
 
         observer = NotificationCenter.default.addObserver(forName: RepoCatalog.changed, object: catalog,
                                                           queue: .main) { [weak self] _ in self?.reload() }
+        updateObserver = NotificationCenter.default.addObserver(forName: Updater.changed, object: updater,
+                                                                queue: .main) { [weak self] _ in self?.updateUpdaterUI() }
+        updateUpdaterUI()
         reload()
         // The account check is fast, so it runs on its own and does not wait for the repo lists.
         catalog.checkAuth()
@@ -148,6 +181,25 @@ final class SettingsVC: NSViewController {
             }
             sl.textColor = .systemRed
         }
+    }
+
+    func updateUpdaterUI() {
+        let status = updater.statusText
+        updateLabel?.stringValue = "Version \(updater.current)" + (status.isEmpty ? "" : " · \(status)")
+        if case .failed = updater.state { updateLabel?.textColor = .systemRed } else { updateLabel?.textColor = .secondaryLabelColor }
+        updateLabel?.toolTip = updateLabel?.stringValue
+        if case .ready = updater.state { updateBtn?.title = "Restart now" } else { updateBtn?.title = "Check now" }
+        updateBtn?.isEnabled = !updater.busy
+    }
+
+    @objc func toggleAutoUpdate(_ sender: NSButton) {
+        AUTO_UPDATE = sender.state == .on
+        saveConfig()
+        if AUTO_UPDATE { updater.check(manual: false) }
+    }
+
+    @objc func checkOrRestart() {
+        if case .ready = updater.state { updater.install() } else { updater.check(manual: true) }
     }
 
     func updateSyncUI() {
@@ -187,47 +239,49 @@ final class SettingsVC: NSViewController {
     func isPicked(_ repo: String) -> Bool { isOrgPicked(repoOwner(repo)) || picked.contains(repo) }
 
     func rebuildTree() {
-        guard let doc = repoDoc else { return }
-        doc.subviews.forEach { $0.removeFromSuperview() }
-        let w = POP_W
-        var y: CGFloat = 4
+        NSApp.withPinnedAppearance {
+            guard let doc = repoDoc else { return }
+            doc.subviews.forEach { $0.removeFromSuperview() }
+            let w = POP_W
+            var y: CGFloat = 4
 
-        let owners = ownerLogins
-        for owner in owners {
-            let repos = reposOf(owner)
-            let count = repos.filter(isPicked).count
-            // Open owners with a partial pick the first time they appear, so picks are visible.
-            if SettingsVC.seenOwners.insert(owner).inserted && count > 0 && !isOrgPicked(owner) {
-                SettingsVC.expanded.insert(owner)
+            let owners = ownerLogins
+            for owner in owners {
+                let repos = reposOf(owner)
+                let count = repos.filter(isPicked).count
+                // Open owners with a partial pick the first time they appear, so picks are visible.
+                if SettingsVC.seenOwners.insert(owner).inserted && count > 0 && !isOrgPicked(owner) {
+                    SettingsVC.expanded.insert(owner)
+                }
+                let open = SettingsVC.expanded.contains(owner)
+                y = ownerRow(owner, repos: repos, count: count, open: open, y: y, w: w, in: doc)
+                guard open else { continue }
+                for repo in repos {
+                    let short = repo.split(separator: "/").dropFirst().joined(separator: "/")
+                    let cb = NSButton(checkboxWithTitle: " \(short)", target: self, action: #selector(toggleRepo(_:)))
+                    cb.font = .systemFont(ofSize: 12)
+                    cb.state = isPicked(repo) ? .on : .off
+                    cb.frame = NSRect(x: 52, y: y, width: w - 80, height: 22)
+                    cb.identifier = NSUserInterfaceItemIdentifier(repo)
+                    doc.addSubview(cb)
+                    y += 22
+                }
+                if repos.isEmpty {
+                    let l = label(isLoading(owner) ? "Loading…" : "No repos", x: 54, y: y + 3, width: 300)
+                    doc.addSubview(l)
+                    y += 22
+                }
+                y += 4
             }
-            let open = SettingsVC.expanded.contains(owner)
-            y = ownerRow(owner, repos: repos, count: count, open: open, y: y, w: w, in: doc)
-            guard open else { continue }
-            for repo in repos {
-                let short = repo.split(separator: "/").dropFirst().joined(separator: "/")
-                let cb = NSButton(checkboxWithTitle: " \(short)", target: self, action: #selector(toggleRepo(_:)))
-                cb.font = .systemFont(ofSize: 12)
-                cb.state = isPicked(repo) ? .on : .off
-                cb.frame = NSRect(x: 52, y: y, width: w - 80, height: 22)
-                cb.identifier = NSUserInterfaceItemIdentifier(repo)
-                doc.addSubview(cb)
-                y += 22
-            }
-            if repos.isEmpty {
-                let l = label(isLoading(owner) ? "Loading…" : "No repos", x: 54, y: y + 3, width: 300)
-                doc.addSubview(l)
-                y += 22
-            }
-            y += 4
-        }
 
-        if owners.isEmpty {
-            let text = catalog.refreshing ? "Loading repos…"
-                : (catalog.authChecked && catalog.user == nil ? "Login to see your repos" : "No repos found")
-            doc.addSubview(label(text, x: 16, y: 8, width: 300, size: 12))
-            y = 36
+            if owners.isEmpty {
+                let text = catalog.refreshing ? "Loading repos…"
+                    : (catalog.authChecked && catalog.user == nil ? "Login to see your repos" : "No repos found")
+                doc.addSubview(label(text, x: 16, y: 8, width: 300, size: 12))
+                y = 36
+            }
+            doc.frame.size.height = max(y + 4, repoScroll?.frame.height ?? 320)
         }
-        doc.frame.size.height = max(y + 4, repoScroll?.frame.height ?? 320)
     }
 
     func ownerRow(_ owner: String, repos: [String], count: Int, open: Bool,

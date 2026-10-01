@@ -13,6 +13,7 @@ struct AppConfig: Codable {
     var runsPerRepo: Int?
     var filterDefaultBranches: Bool?
     var sortByRecent: Bool?
+    var autoUpdate: Bool?
     var relay: RelayConfig?
 }
 
@@ -29,6 +30,7 @@ var POLL_ACTIVE: TimeInterval = 10
 var RUNS_PER_REPO: Int = 10
 var FILTER_DEFAULT_BRANCHES: Bool = false
 var SORT_BY_RECENT: Bool = true
+var AUTO_UPDATE: Bool = true
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
 let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -50,6 +52,7 @@ func loadConfig() {
     RUNS_PER_REPO = min(max(1, c.runsPerRepo ?? 10), 100)
     FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
     SORT_BY_RECENT = c.sortByRecent ?? true
+    AUTO_UPDATE = c.autoUpdate ?? true
     if let r = c.relay { RELAY = r }
 }
 
@@ -59,7 +62,7 @@ func saveConfig() {
                       orgs: PICKED_ORGS.isEmpty ? nil : PICKED_ORGS, pollInterval: POLL_NORMAL,
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
-                      relay: RELAY)
+                      autoUpdate: AUTO_UPDATE, relay: RELAY)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
@@ -2067,7 +2070,8 @@ class Footer: NSView {
         showQuota((NSApp.delegate as? GHActionsBar)?.rateLimit.latest)
 
         let f = DateFormatter(); f.dateFormat = "h:mm:ss a"
-        let ts = NSTextField(labelWithString: "Updated \(f.string(from: updated))")
+        let version = (NSApp.delegate as? GHActionsBar).map { "v\($0.updater.current) · " } ?? ""
+        let ts = NSTextField(labelWithString: "\(version)Updated \(f.string(from: updated))")
         ts.font = .systemFont(ofSize: 10); ts.textColor = .secondaryLabelColor; ts.alignment = .center
         ts.frame = NSRect(x: 134, y: 11, width: w - 274, height: 16)
         addSubview(ts)
@@ -2198,24 +2202,26 @@ class TabVC: NSViewController {
     }
 
     func rebuildContent() {
-        doc.subviews.forEach { $0.removeFromSuperview() }
-        let w = POP_W
-        var rows: [NSView] = []
+        NSApp.withPinnedAppearance {
+            doc.subviews.forEach { $0.removeFromSuperview() }
+            let w = POP_W
+            var rows: [NSView] = []
 
-        if REPOS.isEmpty {
-            rows.append(EmptyRow("No repos configured. Open Settings to get started.", w: w, icon: "gearshape"))
-        } else if selectedTab == 0 {
-            rows = buildActionsContent(w)
-        } else if selectedTab == 1 {
-            rows = buildPRContent(w)
-        } else {
-            rows = buildInsightsContent(w)
+            if REPOS.isEmpty {
+                rows.append(EmptyRow("No repos configured. Open Settings to get started.", w: w, icon: "gearshape"))
+            } else if selectedTab == 0 {
+                rows = buildActionsContent(w)
+            } else if selectedTab == 1 {
+                rows = buildPRContent(w)
+            } else {
+                rows = buildInsightsContent(w)
+            }
+
+            var y: CGFloat = 0
+            for row in rows { row.frame.origin = NSPoint(x: 0, y: y); doc.addSubview(row); y += row.frame.height }
+            doc.frame.size.height = max(y, 60)
+            relayout()
         }
-
-        var y: CGFloat = 0
-        for row in rows { row.frame.origin = NSPoint(x: 0, y: y); doc.addSubview(row); y += row.frame.height }
-        doc.frame.size.height = max(y, 60)
-        relayout()
     }
 
     // Resize the scroll area / footer / popover to fit the content, so inline
@@ -2532,6 +2538,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     let catalog = RepoCatalog(path: REPO_CACHE_PATH)
     var catalogTimer: Timer?
     let rateLimit = RateLimitMonitor()
+    let updater = Updater()
     lazy var relay: RelayClient = {
         let c = RelayClient(secrets: relayDeployer.secrets)
         c.sink = self
@@ -2598,6 +2605,11 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             ((self?.popover.contentViewController as? TabVC)?.footerView as? Footer)?.showQuota(self?.rateLimit.latest)
         }
         rateLimit.start()
+        updater.canRestart = { [weak self] in !(self?.popover.isShown ?? false) }
+        updater.start()
+        if let v = updater.takeUpdateNotice() {
+            notify(title: "Cat Eye", subtitle: "Updated to v\(v)", body: "The new version is running.", id: "updated-\(v)")
+        }
 
         // New repos of a whole-owner pick start to track after a catalog refresh.
         NotificationCenter.default.addObserver(forName: RepoCatalog.changed, object: catalog, queue: .main) { [weak self] _ in
@@ -2939,18 +2951,20 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             return
         }
         let newRuns = newGrouped.flatMap { $0.1 }
-        for run in newRuns {
-            let old = prevStatuses[run.url]
-            let wf = run.workflowName ?? run.name
-            if run.status == "in_progress" && old != "in_progress" {
-                log.info("Transition: \(wf) on \(run.headBranch) → in_progress (was \(old ?? "new"))")
-                notify(title: "\u{25B6}\u{FE0F} Action Started", body: "\(wf) on \(run.headBranch)", id: "start-\(run.url)")
-            }
-            if run.status == "completed" && (old == "in_progress" || old == "queued") {
-                let ok = run.conclusion == "success"
-                log.info("Transition: \(wf) on \(run.headBranch) → \(run.conclusion ?? "unknown") (was \(old ?? "new"))")
-                notify(title: ok ? "\u{2705} Action Passed" : "\u{274C} Action Failed",
-                       body: "\(wf) on \(run.headBranch) \u{2014} \(runDuration(run))", id: "end-\(run.url)")
+        for (repo, runs) in newGrouped {
+            for run in runs {
+                let old = prevStatuses[run.url]
+                let wf = run.workflowName ?? run.name
+                if run.status == "in_progress" && old != "in_progress" {
+                    log.info("Transition: \(wf) on \(run.headBranch) → in_progress (was \(old ?? "new"))")
+                    notify(title: repo, subtitle: "\u{25B6}\u{FE0F} Action Started", body: "\(wf) on \(run.headBranch)", id: "start-\(run.url)")
+                }
+                if run.status == "completed" && (old == "in_progress" || old == "queued") {
+                    let ok = run.conclusion == "success"
+                    log.info("Transition: \(wf) on \(run.headBranch) → \(run.conclusion ?? "unknown") (was \(old ?? "new"))")
+                    notify(title: repo, subtitle: ok ? "\u{2705} Action Passed" : "\u{274C} Action Failed",
+                           body: "\(wf) on \(run.headBranch) \u{2014} \(runDuration(run))", id: "end-\(run.url)")
+                }
             }
         }
         if partial {
@@ -2962,8 +2976,10 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         for run in newRuns { prevStatuses[run.url] = run.status }
     }
 
-    func notify(title: String, body: String, id: String) {
-        let c = UNMutableNotificationContent(); c.title = title; c.body = body; c.sound = .default
+    func notify(title: String, subtitle: String, body: String, id: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title; c.subtitle = subtitle; c.body = body; c.sound = .default
+        c.threadIdentifier = title
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: c, trigger: nil))
     }
 
@@ -3021,26 +3037,19 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         popover.appearance = appearance
     }
 
-    /// Construct views inside an explicit drawing-appearance context so every
-    /// `NSColor.X.cgColor` accessed during construction resolves with the right colors.
-    /// Without this, `layer.backgroundColor` ends up baked in whichever appearance the
-    /// process happened to last be drawing under.
+    /// Construct views under the pinned appearance. The popover loads its view
+    /// lazily at show time, so load it here or its CGColors bake in a stale appearance.
     func buildWithAppearance(_ block: () -> Void) {
-        let appearance = NSApp.appearance ?? NSApp.effectiveAppearance
-        if #available(macOS 11.0, *) {
-            appearance.performAsCurrentDrawingAppearance { block() }
-        } else {
-            let prev = NSAppearance.current
-            NSAppearance.current = appearance
+        NSApp.withPinnedAppearance {
             block()
-            NSAppearance.current = prev
+            _ = popover.contentViewController?.view
         }
     }
 
     @objc func systemAppearanceChanged() {
-        // Distributed notifications can arrive on a background thread; also CFPreferences
-        // may not have flushed yet — a tiny hop to the next main runloop is reliable.
-        DispatchQueue.main.async { [weak self] in
+        // Distributed notifications can arrive on a background thread, and an Auto
+        // appearance switch can post before AppleInterfaceStyle is written. Wait a bit.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
             self.applySystemAppearance()
             self.iconKey = nil
@@ -3064,7 +3073,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     @objc func showSettings() {
         popover.behavior = .transient
         applySystemAppearance()
-        buildWithAppearance { self.popover.contentViewController = SettingsVC(catalog: catalog, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS)) }
+        buildWithAppearance { self.popover.contentViewController = SettingsVC(catalog: catalog, updater: updater, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS)) }
         if !popover.isShown {
             closeTime = .distantPast
             toggle()
@@ -3104,6 +3113,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         popover.behavior = .transient
         popover.contentViewController = nil  // Release settings view if open
         scheduleTimer()                      // nobody is watching: back to the slow cadence
+        updater.installIfIdle()
     }
 }
 
@@ -3121,6 +3131,14 @@ extension GHActionsBar: RelaySink {
         scheduleTimer()
         if relay.state == .live { relayDeployer.refreshHookedRepos { [weak self] in self?.scheduleTimer() } }
         (popover?.contentViewController as? RelaySettingsVC)?.rebuild()
+    }
+}
+
+extension NSApplication {
+    /// Runs `block` with the pinned appearance as the drawing appearance, so every
+    /// `NSColor.X.cgColor` read in it resolves to the right light/dark value.
+    func withPinnedAppearance(_ block: () -> Void) {
+        (appearance ?? effectiveAppearance).performAsCurrentDrawingAppearance(block)
     }
 }
 

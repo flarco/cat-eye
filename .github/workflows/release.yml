@@ -1,10 +1,20 @@
 name: Release
 
-# Each push to main makes a signed, notarized release. The tag is the last tag with
-# the patch number plus one. A higher version in Info.plist wins, for minor or major bumps.
+# Each push to main that changes the app makes a signed, notarized release. Installed apps
+# update to it automatically. The tag is the last tag with the patch number plus one.
+# A higher version in Info.plist wins, for minor or major bumps.
 on:
   push:
     branches: [main]
+    # These files are not in the app. A change to them only must not restart every install.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'screenshots/**'
+      - 'assets/**'
+      - 'LICENSE'
+      - 'worker/test/**'
+      - 'update.sh'
   workflow_dispatch:
 
 permissions: {}

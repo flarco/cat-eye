@@ -166,7 +166,14 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `runsPerRepo` | `10` | Number of recent runs to fetch per repo |
 | `filterDefaultBranches` | `false` | Hide workflow runs from branches other than `main` or `develop` |
 | `sortByRecent` | `true` | Show repos with an active run first, then by newest run |
+| `autoUpdate` | `true` | Install new releases automatically, written by **Settings → Updates** |
 | `relay` | none | Live updates settings, written by **Settings → Live updates** (see below) |
+
+## Updates
+
+A release build (from the [releases page](https://github.com/flarco/cat-eye/releases)) checks GitHub for a new release at launch and every 4 hours. It downloads the release and installs it only if the bundle is signed with the Cat Eye Developer ID and notarized by Apple. Then it restarts. It does not restart while the popover is open. If the new version does not start, the previous version comes back.
+
+**Settings → Updates** shows the current version. Use it to turn off automatic installs, or to check now. Builds from source have a `-dev` version and do not update themselves. Use `./update.sh` for those.
 
 ## Live updates (optional)
 

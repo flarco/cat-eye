@@ -137,130 +137,132 @@ final class RelaySettingsVC: NSViewController {
     // MARK: Layout
 
     func rebuild() {
-        guard body != nil else { return }
-        retentionDraft = retentionField?.stringValue
-        reconcileDraft = reconcileField?.stringValue
-        unitDraft = retentionUnit?.indexOfSelectedItem
-        body.subviews.forEach { $0.removeFromSuperview() }
-        let w = POP_W
-        var y: CGFloat = 0
-        let s = deployer.state
+        NSApp.withPinnedAppearance {
+            guard body != nil else { return }
+            retentionDraft = retentionField?.stringValue
+            reconcileDraft = reconcileField?.stringValue
+            unitDraft = retentionUnit?.indexOfSelectedItem
+            body.subviews.forEach { $0.removeFromSuperview() }
+            let w = POP_W
+            var y: CGFloat = 0
+            let s = deployer.state
 
-        // Enable + status
-        let top = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
-        let en = NSButton(checkboxWithTitle: "Enable live updates", target: self, action: #selector(toggleEnabled(_:)))
-        en.font = .systemFont(ofSize: 12, weight: .medium)
-        en.state = RELAY.enabled ? .on : .off
-        en.isEnabled = s.joined || RELAY.enabled
-        en.frame = NSRect(x: 16, y: 10, width: 220, height: 20)
-        top.addSubview(en)
-        let (dotColor, statusText) = liveStatus()
-        top.addSubview(label(statusText, x: w - 236, y: 12, width: 200, size: 11, color: .secondaryLabelColor, align: .right))
-        top.addSubview(Dot(color: dotColor, frame: NSRect(x: w - 28, y: 15, width: 10, height: 10)))
-        body.addSubview(top); y += 40
+            // Enable + status
+            let top = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
+            let en = NSButton(checkboxWithTitle: "Enable live updates", target: self, action: #selector(toggleEnabled(_:)))
+            en.font = .systemFont(ofSize: 12, weight: .medium)
+            en.state = RELAY.enabled ? .on : .off
+            en.isEnabled = s.joined || RELAY.enabled
+            en.frame = NSRect(x: 16, y: 10, width: 220, height: 20)
+            top.addSubview(en)
+            let (dotColor, statusText) = liveStatus()
+            top.addSubview(label(statusText, x: w - 236, y: 12, width: 200, size: 11, color: .secondaryLabelColor, align: .right))
+            top.addSubview(Dot(color: dotColor, frame: NSRect(x: w - 28, y: 15, width: 10, height: 10)))
+            body.addSubview(top); y += 40
 
-        // Setup
-        y = section("SETUP", y: y, buttons: [
-            (checked ? "Check again" : "Checking…", #selector(checkAgain)),
-            (deployer.busy != nil ? "Working…" : (nextStep == nil ? "All set" : "Set up"), #selector(setUp)),
-        ], enabled: [deployer.busy == nil, deployer.busy == nil && nextStep != nil && checked])
-        for step in SetupStep.allCases { y = stepRow(step, y: y) }
-        if !REPOS.isEmpty && s.joined {
-            for repo in REPOS {
-                let st = deployer.hooks.statuses[repo] ?? .unknown
-                let row = NSView(frame: NSRect(x: 0, y: y, width: w, height: 18))
-                row.addSubview(label(repo, x: 64, y: 1, width: 240, size: 11, color: .secondaryLabelColor))
-                row.addSubview(label(deployer.describe(st), x: 310, y: 1, width: w - 326, size: 11, color: hookColor(st)))
-                body.addSubview(row); y += 18
-            }
-            y += 6
-        }
-
-        // Health
-        if let h = s.health {
-            y = section("HEALTH", y: y, buttons: [("Check now", #selector(checkAgain))], enabled: [deployer.busy == nil])
-            let oldest = h.oldestAt.map { relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "none"
-            let lastHook = h.lastWebhookAt.map { relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "never"
-            y = line("Events kept: \(h.events) · oldest \(oldest) · last webhook \(lastHook)", y: y)
-            let q = WriteQuota(rowsToday: h.rowsWrittenToday, now: Date())
-            let pct = Int((q.fraction * 100).rounded())
-            y = line("Writes today: about \(h.rowsWrittenToday) · projected \(q.projected) / \(FREE_ROWS_PER_DAY) per day (free plan, \(pct)%)",
-                     y: y, color: q.warn ? C_FAILURE : .secondaryLabelColor)
-            if q.warn { y = line("Warning: near the free write quota. Use Workers Paid, or track fewer repos.", y: y, color: C_FAILURE) }
-            y += 6
-
-            // Configuration
-            y = section("CONFIGURATION", y: y, buttons: [("Save", #selector(saveConfiguration))], enabled: [deployer.busy == nil])
-            let row = NSView(frame: NSRect(x: 0, y: y, width: w, height: 30))
-            row.addSubview(label("Keep events for", x: 16, y: 7, width: 120, size: 12))
-            let days = h.retentionHours % 24 == 0 && h.retentionHours >= 24
-            let rf = NSTextField(frame: NSRect(x: 136, y: 4, width: 50, height: 22))
-            rf.stringValue = retentionDraft ?? String(days ? h.retentionHours / 24 : h.retentionHours)
-            rf.font = .systemFont(ofSize: 12); rf.alignment = .right
-            row.addSubview(rf); retentionField = rf
-            let unit = NSPopUpButton(frame: NSRect(x: 192, y: 2, width: 90, height: 26), pullsDown: false)
-            unit.addItems(withTitles: ["hours", "days"])
-            unit.selectItem(at: unitDraft ?? (days ? 1 : 0))
-            unit.font = .systemFont(ofSize: 12)
-            row.addSubview(unit); retentionUnit = unit
-            row.addSubview(label("1 hour to 30 days", x: 290, y: 7, width: 200, size: 11, color: .secondaryLabelColor))
-            body.addSubview(row); y += 30
-
-            let row2 = NSView(frame: NSRect(x: 0, y: y, width: w, height: 30))
-            row2.addSubview(label("Reconcile poll every", x: 16, y: 7, width: 140, size: 12))
-            let cf = NSTextField(frame: NSRect(x: 156, y: 4, width: 50, height: 22))
-            cf.stringValue = reconcileDraft ?? String(Int((RELAY.reconcileInterval ?? 600) / 60))
-            cf.font = .systemFont(ofSize: 12); cf.alignment = .right
-            row2.addSubview(cf); reconcileField = cf
-            row2.addSubview(label("min (while live)", x: 212, y: 7, width: 200, size: 12))
-            body.addSubview(row2); y += 36
-
-            // Devices
-            y = section("DEVICES", y: y, buttons: [], enabled: [])
-            for dev in h.devices {
-                let r = NSView(frame: NSRect(x: 0, y: y, width: w, height: 24))
-                let me = dev.id == RELAY.deviceID
-                r.addSubview(label((dev.name ?? dev.id) + (me ? " (this Mac)" : ""), x: 16, y: 4, width: 240, size: 12))
-                let seen = dev.connected ? "connected" : (dev.lastSeen.map { "seen " + relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "never seen")
-                r.addSubview(label("\(seen) · lag \(dev.lag)", x: 260, y: 5, width: 260, size: 11, color: .secondaryLabelColor))
-                if !me {
-                    let b = button("Remove", #selector(removeDevice(_:)), x: w - 86, y: 1, width: 70)
-                    b.identifier = NSUserInterfaceItemIdentifier(dev.id)
-                    b.isEnabled = deployer.busy == nil
-                    r.addSubview(b)
+            // Setup
+            y = section("SETUP", y: y, buttons: [
+                (checked ? "Check again" : "Checking…", #selector(checkAgain)),
+                (deployer.busy != nil ? "Working…" : (nextStep == nil ? "All set" : "Set up"), #selector(setUp)),
+            ], enabled: [deployer.busy == nil, deployer.busy == nil && nextStep != nil && checked])
+            for step in SetupStep.allCases { y = stepRow(step, y: y) }
+            if !REPOS.isEmpty && s.joined {
+                for repo in REPOS {
+                    let st = deployer.hooks.statuses[repo] ?? .unknown
+                    let row = NSView(frame: NSRect(x: 0, y: y, width: w, height: 18))
+                    row.addSubview(label(repo, x: 64, y: 1, width: 240, size: 11, color: .secondaryLabelColor))
+                    row.addSubview(label(deployer.describe(st), x: 310, y: 1, width: w - 326, size: 11, color: hookColor(st)))
+                    body.addSubview(row); y += 18
                 }
-                body.addSubview(r); y += 24
+                y += 6
             }
-            y += 6
+
+            // Health
+            if let h = s.health {
+                y = section("HEALTH", y: y, buttons: [("Check now", #selector(checkAgain))], enabled: [deployer.busy == nil])
+                let oldest = h.oldestAt.map { relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "none"
+                let lastHook = h.lastWebhookAt.map { relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "never"
+                y = line("Events kept: \(h.events) · oldest \(oldest) · last webhook \(lastHook)", y: y)
+                let q = WriteQuota(rowsToday: h.rowsWrittenToday, now: Date())
+                let pct = Int((q.fraction * 100).rounded())
+                y = line("Writes today: about \(h.rowsWrittenToday) · projected \(q.projected) / \(FREE_ROWS_PER_DAY) per day (free plan, \(pct)%)",
+                         y: y, color: q.warn ? C_FAILURE : .secondaryLabelColor)
+                if q.warn { y = line("Warning: near the free write quota. Use Workers Paid, or track fewer repos.", y: y, color: C_FAILURE) }
+                y += 6
+
+                // Configuration
+                y = section("CONFIGURATION", y: y, buttons: [("Save", #selector(saveConfiguration))], enabled: [deployer.busy == nil])
+                let row = NSView(frame: NSRect(x: 0, y: y, width: w, height: 30))
+                row.addSubview(label("Keep events for", x: 16, y: 7, width: 120, size: 12))
+                let days = h.retentionHours % 24 == 0 && h.retentionHours >= 24
+                let rf = NSTextField(frame: NSRect(x: 136, y: 4, width: 50, height: 22))
+                rf.stringValue = retentionDraft ?? String(days ? h.retentionHours / 24 : h.retentionHours)
+                rf.font = .systemFont(ofSize: 12); rf.alignment = .right
+                row.addSubview(rf); retentionField = rf
+                let unit = NSPopUpButton(frame: NSRect(x: 192, y: 2, width: 90, height: 26), pullsDown: false)
+                unit.addItems(withTitles: ["hours", "days"])
+                unit.selectItem(at: unitDraft ?? (days ? 1 : 0))
+                unit.font = .systemFont(ofSize: 12)
+                row.addSubview(unit); retentionUnit = unit
+                row.addSubview(label("1 hour to 30 days", x: 290, y: 7, width: 200, size: 11, color: .secondaryLabelColor))
+                body.addSubview(row); y += 30
+
+                let row2 = NSView(frame: NSRect(x: 0, y: y, width: w, height: 30))
+                row2.addSubview(label("Reconcile poll every", x: 16, y: 7, width: 140, size: 12))
+                let cf = NSTextField(frame: NSRect(x: 156, y: 4, width: 50, height: 22))
+                cf.stringValue = reconcileDraft ?? String(Int((RELAY.reconcileInterval ?? 600) / 60))
+                cf.font = .systemFont(ofSize: 12); cf.alignment = .right
+                row2.addSubview(cf); reconcileField = cf
+                row2.addSubview(label("min (while live)", x: 212, y: 7, width: 200, size: 12))
+                body.addSubview(row2); y += 36
+
+                // Devices
+                y = section("DEVICES", y: y, buttons: [], enabled: [])
+                for dev in h.devices {
+                    let r = NSView(frame: NSRect(x: 0, y: y, width: w, height: 24))
+                    let me = dev.id == RELAY.deviceID
+                    r.addSubview(label((dev.name ?? dev.id) + (me ? " (this Mac)" : ""), x: 16, y: 4, width: 240, size: 12))
+                    let seen = dev.connected ? "connected" : (dev.lastSeen.map { "seen " + relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "never seen")
+                    r.addSubview(label("\(seen) · lag \(dev.lag)", x: 260, y: 5, width: 260, size: 11, color: .secondaryLabelColor))
+                    if !me {
+                        let b = button("Remove", #selector(removeDevice(_:)), x: w - 86, y: 1, width: 70)
+                        b.identifier = NSUserInterfaceItemIdentifier(dev.id)
+                        b.isEnabled = deployer.busy == nil
+                        r.addSubview(b)
+                    }
+                    body.addSubview(r); y += 24
+                }
+                y += 6
+            }
+
+            // Log
+            y = section("LOG", y: y, buttons: [], enabled: [])
+            let ls = NSScrollView(frame: NSRect(x: 12, y: y, width: w - 24, height: 140))
+            ls.hasVerticalScroller = true; ls.borderType = .bezelBorder
+            let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: w - 28, height: 140))
+            tv.isEditable = false; tv.isRichText = false
+            tv.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            tv.textContainerInset = NSSize(width: 4, height: 4)
+            tv.autoresizingMask = [.width]
+            ls.documentView = tv
+            body.addSubview(ls); logView = tv; y += 148
+            updateLog()
+
+            // Danger zone
+            let bottom = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
+            let rot = button("Rotate webhook secret", #selector(rotateSecret), x: 12, y: 8, width: 170)
+            rot.isEnabled = s.joined && deployer.busy == nil
+            bottom.addSubview(rot)
+            let rm = button("Remove relay…", #selector(removeRelay), x: w - 142, y: 8, width: 130)
+            rm.isEnabled = !RELAY.workerURL.isEmpty && s.wrangler != nil && deployer.busy == nil
+            bottom.addSubview(rm)
+            body.addSubview(bottom); y += 44
+
+            body.frame.size.height = y
+            // The popover sizes the view; never set it here, or the nav bar can go off the top.
+            let screenH = (view.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? POP_MAX_H
+            preferredContentSize = NSSize(width: w, height: min(44.5 + y, POP_MAX_H, screenH - 40))
         }
-
-        // Log
-        y = section("LOG", y: y, buttons: [], enabled: [])
-        let ls = NSScrollView(frame: NSRect(x: 12, y: y, width: w - 24, height: 140))
-        ls.hasVerticalScroller = true; ls.borderType = .bezelBorder
-        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: w - 28, height: 140))
-        tv.isEditable = false; tv.isRichText = false
-        tv.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        tv.textContainerInset = NSSize(width: 4, height: 4)
-        tv.autoresizingMask = [.width]
-        ls.documentView = tv
-        body.addSubview(ls); logView = tv; y += 148
-        updateLog()
-
-        // Danger zone
-        let bottom = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
-        let rot = button("Rotate webhook secret", #selector(rotateSecret), x: 12, y: 8, width: 170)
-        rot.isEnabled = s.joined && deployer.busy == nil
-        bottom.addSubview(rot)
-        let rm = button("Remove relay…", #selector(removeRelay), x: w - 142, y: 8, width: 130)
-        rm.isEnabled = !RELAY.workerURL.isEmpty && s.wrangler != nil && deployer.busy == nil
-        bottom.addSubview(rm)
-        body.addSubview(bottom); y += 44
-
-        body.frame.size.height = y
-        // The popover sizes the view; never set it here, or the nav bar can go off the top.
-        let screenH = (view.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? POP_MAX_H
-        preferredContentSize = NSSize(width: w, height: min(44.5 + y, POP_MAX_H, screenH - 40))
     }
 
     func liveStatus() -> (NSColor, String) {

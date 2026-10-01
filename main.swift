@@ -924,6 +924,11 @@ func runSelfTest() {
     let repos = ["O/Hooked", "O/Bare", "O/Denied", "O/Waiting"]
     let sts: [String: HookStatus] = ["O/Denied": .pollingOnly("x"), "O/Waiting": .waiting]
     check(RelayDeployer.unhooked(repos, hooked: nil, statuses: sts).isEmpty, "unhooked unknown before health")
+    let rl = try? JSONDecoder().decode(RateLimit.self, from: Data("""
+        {"resources":{"core":{"limit":5000,"used":3600,"remaining":1400,"reset":1},
+        "graphql":{"limit":5000,"used":100,"reset":1},"search":{"limit":30,"used":30,"reset":1}}}
+        """.utf8))
+    check(rl?.percent == 72 && rl?.color == C_QUEUED, "rate limit uses the fullest of REST and GraphQL")
     check(RelayDeployer.unhooked(repos, hooked: ["o/hooked", "o/denied"], statuses: sts) == ["O/Bare", "O/Denied"],
           "unhooked repos")
 
@@ -1020,6 +1025,53 @@ func statusBadgedIcon(_ base: NSImage?, color: NSColor, badge: String?) -> NSIma
     }
     img.isTemplate = false
     return img
+}
+
+// ─── GitHub rate limit ───────────────────────────────────────────────────────
+
+struct RateLimit: Decodable {
+    struct Bucket: Decodable {
+        let limit: Int, used: Int, reset: TimeInterval
+        var fraction: Double { limit > 0 ? Double(used) / Double(limit) : 0 }
+    }
+    let resources: [String: Bucket]
+
+    // Runs use REST and PRs use GraphQL. Show the bucket nearest its limit.
+    var buckets: [(name: String, bucket: Bucket)] {
+        [("REST", resources["core"]), ("GraphQL", resources["graphql"])].compactMap { n, b in b.map { (n, $0) } }
+    }
+    var fraction: Double { buckets.map { $0.bucket.fraction }.max() ?? 0 }
+    var percent: Int { Int((fraction * 100).rounded()) }
+    var color: NSColor { fraction >= 0.9 ? C_FAILURE : fraction >= 0.7 ? C_QUEUED : .secondaryLabelColor }
+
+    var tooltip: String {
+        let f = DateFormatter(); f.dateFormat = "h:mm a"
+        let lines = buckets.map { n, b in
+            "\(n): \(b.used) / \(b.limit) (\(Int((b.fraction * 100).rounded()))%), resets \(f.string(from: Date(timeIntervalSince1970: b.reset)))"
+        }
+        return (["GitHub API quota used this hour"] + lines).joined(separator: "\n")
+    }
+}
+
+// Reads the quota every 10 minutes. The rate_limit endpoint does not count against it.
+final class RateLimitMonitor {
+    private(set) var latest: RateLimit?
+    var onChange: (() -> Void)?
+    private var timer: Timer?
+
+    func start() {
+        fetch()
+        timer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.fetch() }
+        timer?.tolerance = 60
+    }
+
+    func fetch() {
+        DispatchQueue.global(qos: .utility).async {
+            guard let r = try? ghRun(["api", "rate_limit"]), r.status == 0,
+                  let rl = try? JSONDecoder().decode(RateLimit.self, from: r.out) else { return }
+            DispatchQueue.main.async { self.latest = rl; self.onChange?() }
+        }
+    }
 }
 
 // ─── Run Row View ────────────────────────────────────────────────────────────
@@ -2009,10 +2061,15 @@ class Footer: NSView {
         rb.frame = NSRect(x: 8, y: 8, width: 80, height: 24)
         addSubview(rb)
 
+        quota.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+        quota.frame = NSRect(x: 92, y: 11, width: 40, height: 16)
+        addSubview(quota)
+        showQuota((NSApp.delegate as? GHActionsBar)?.rateLimit.latest)
+
         let f = DateFormatter(); f.dateFormat = "h:mm:ss a"
         let ts = NSTextField(labelWithString: "Updated \(f.string(from: updated))")
         ts.font = .systemFont(ofSize: 10); ts.textColor = .secondaryLabelColor; ts.alignment = .center
-        ts.frame = NSRect(x: 90, y: 11, width: w - 230, height: 16)
+        ts.frame = NSRect(x: 134, y: 11, width: w - 274, height: 16)
         addSubview(ts)
 
         // Live updates: green = live, grey = polling, orange = relay error.
@@ -2036,6 +2093,14 @@ class Footer: NSView {
         addSubview(qb)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    let quota = NSTextField(labelWithString: "")
+
+    func showQuota(_ rl: RateLimit?) {
+        quota.stringValue = rl.map { "\($0.percent)%" } ?? ""
+        quota.textColor = rl?.color ?? .secondaryLabelColor
+        quota.toolTip = rl?.tooltip
+    }
 }
 
 // ─── Tab View (Actions + PRs) ────────────────────────────────────────────────
@@ -2466,6 +2531,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     let relayDeployer = RelayDeployer()
     let catalog = RepoCatalog(path: REPO_CACHE_PATH)
     var catalogTimer: Timer?
+    let rateLimit = RateLimitMonitor()
     lazy var relay: RelayClient = {
         let c = RelayClient(secrets: relayDeployer.secrets)
         c.sink = self
@@ -2528,6 +2594,10 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         }
         scheduleTimer()
         if relay.canRun { relay.start() }
+        rateLimit.onChange = { [weak self] in
+            ((self?.popover.contentViewController as? TabVC)?.footerView as? Footer)?.showQuota(self?.rateLimit.latest)
+        }
+        rateLimit.start()
 
         // New repos of a whole-owner pick start to track after a catalog refresh.
         NotificationCenter.default.addObserver(forName: RepoCatalog.changed, object: catalog, queue: .main) { [weak self] _ in

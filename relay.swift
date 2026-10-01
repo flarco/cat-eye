@@ -4,7 +4,6 @@ import Security
 
 // ─── Relay configuration ─────────────────────────────────────────────────────
 // Optional push path: GitHub webhooks → Cloudflare Worker "cat-eye-relay" → this Mac.
-// See docs/plans/live-updates-cloudflare.md.
 
 struct RelayConfig: Codable {
     var enabled = false

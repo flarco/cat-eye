@@ -196,7 +196,7 @@ On a second Mac, log in to the same Cloudflare account and click **Set up**. It 
 - **Privacy:** the relay keeps only repo names, event types and IDs. It does not log payloads. Each webhook is verified with an HMAC secret.
 - **Remove:** **Remove relay…** deletes the webhooks, the Worker and the Keychain items.
 
-The Worker source is in [`worker/`](worker/). Design: [`docs/plans/live-updates-cloudflare.md`](docs/plans/live-updates-cloudflare.md).
+The Worker source is in [`worker/`](worker/).
 
 ## Using the PRs tab
 

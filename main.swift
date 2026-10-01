@@ -151,6 +151,22 @@ final class IgnoredFailures {
 
 let IGNORED = IgnoredFailures()
 
+// Puts the workflows of one trigger (same commit, branch, event, actor) into one row.
+// A second run of a workflow already in a row starts a new row. This keeps repeat dispatches apart.
+func groupRuns(_ runs: [Run]) -> [[Run]] {
+    var groups: [[Run]] = []
+    var indexByKey: [String: Int] = [:]
+    for run in runs {
+        let key = "\(run.displayTitle)|\(run.headSha)|\(run.headBranch)|\(run.event)|\(run.actorLogin ?? "")"
+        if let i = indexByKey[key], !groups[i].contains(where: { $0.workflowName == run.workflowName }) {
+            groups[i].append(run)
+        } else {
+            indexByKey[key] = groups.count; groups.append([run])
+        }
+    }
+    return groups
+}
+
 struct PRAuthor: Decodable { let login: String }
 struct PRLabel: Decodable { let name: String; let color: String? }
 struct PR: Decodable {
@@ -884,6 +900,13 @@ func runSelfTest() {
     IGNORED.set([bad], ignored: false)
     check(Badge("main", maxChars: 15).subviews.compactMap { $0 as? NSTextField }.first?.stringValue == "main", "short branch is not cut")
     check(Badge("dependabot/npm/lodash-4.17", maxChars: 15).subviews.compactMap { $0 as? NSTextField }.first?.stringValue == "dependa\u{2026}sh-4.17", "long branch keeps both ends")
+    func dispatch(_ wf: String, _ sha: String) -> Run {
+        Run(id: 3, name: wf, displayTitle: "t", status: "completed", conclusion: "success",
+            headBranch: "main", headSha: sha, event: "workflow_dispatch", url: "u/\(wf)/\(sha)",
+            updatedAt: "", createdAt: "", startedAt: nil, number: 1, workflowName: wf, actorLogin: "a")
+    }
+    let rows = groupRuns([dispatch("Deploy", "s2"), dispatch("Deploy", "s1"), dispatch("Deploy", "s1"), dispatch("Build", "s1")])
+    check(rows.map(\.count) == [1, 1, 2], "dispatches on other commits or of the same workflow get their own row")
     let g = [("o/r", [run("feature-x", "in_progress"), run("main", "completed")])]
     FILTER_DEFAULT_BRANCHES = false
     check(hasActive(visibleGrouped(g)), "unfiltered: feature-branch run is active")
@@ -1927,8 +1950,16 @@ class Header: NSView {
         let short = repo.components(separatedBy: "/").last ?? repo
         let l = NSTextField(labelWithString: short.uppercased())
         l.font = .systemFont(ofSize: 11, weight: .bold); l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 12, y: 6, width: w - 130, height: 20)
+        l.frame = NSRect(x: 12, y: 6, width: w - 150, height: 20)
         addSubview(l)
+        let reload = NSButton(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh \(short)")!,
+                              target: nil, action: nil)
+        reload.isBordered = false; reload.contentTintColor = .secondaryLabelColor
+        reload.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        reload.frame = NSRect(x: w - 132, y: 6, width: 20, height: 20)
+        reload.toolTip = "Get the latest runs from GitHub"
+        reload.target = self; reload.action = #selector(refreshRepo(_:))
+        addSubview(reload)
         let link = NSTextField(labelWithString: "Open Actions")
         link.font = .systemFont(ofSize: 10, weight: .medium); link.textColor = .linkColor
         link.frame = NSRect(x: w - 105, y: 8, width: 93, height: 16); link.alignment = .right
@@ -1936,8 +1967,18 @@ class Header: NSView {
         let click = Clicker("https://github.com/\(repo)/actions")
         click.frame = NSRect(x: w - 110, y: 0, width: 110, height: HDR_H)
         addSubview(click)
+        self.repo = repo
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    private var repo = ""
+
+    // Polls GitHub for this repo at once, so a missed relay event does not hide new runs.
+    @objc func refreshRepo(_ sender: NSButton) {
+        guard let app = NSApp.delegate as? GHActionsBar else { return }
+        sender.isEnabled = false
+        app.refreshRepos([repo], includePRs: true, completedRuns: []) { _ in app.reloadList() }
+    }
 }
 
 class Clicker: NSView {
@@ -2362,15 +2403,7 @@ class TabVC: NSViewController {
                     if aActive != bActive { return aActive }
                     return false  // preserve API order otherwise
                 }
-                // Group runs from the same push (same commit message + branch + event + actor)
-                // into a single row. Different workflows triggered by one commit collapse.
-                var groups: [[Run]] = []
-                var indexByKey: [String: Int] = [:]
-                for run in sorted {
-                    let key = "\(run.displayTitle)|\(run.headBranch)|\(run.event)|\(run.actorLogin ?? "")"
-                    if let i = indexByKey[key] { groups[i].append(run) }
-                    else { indexByKey[key] = groups.count; groups.append([run]) }
-                }
+                let groups = groupRuns(sorted)
                 for group in groups {
                     let primary = RunRow.pickPrimary(group)
                     let key = primary.url

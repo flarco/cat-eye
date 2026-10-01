@@ -17,7 +17,7 @@ DEST=/Applications/CatEye.app
 # rsync --delete on the wrong target eats an unrelated app, so only write to a
 # real directory (not a symlink) that is already our bundle.
 if [ -d "$DEST" ] && [ ! -L "$DEST" ] &&
-   [ "$(defaults read "$DEST/Contents/Info" CFBundleIdentifier 2>/dev/null)" = "com.clintoncodewell.cateye" ]; then
+   [[ "$(defaults read "$DEST/Contents/Info" CFBundleIdentifier 2>/dev/null)" =~ ^com\.(flarco|clintoncodewell)\.cateye$ ]]; then
   rsync -a --delete CatEye.app/ "$DEST/"
   open "$DEST"
 else

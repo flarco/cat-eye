@@ -43,7 +43,7 @@ Cat Eye is built on three principles:
 ### General
 - **Tabbed interface** — switch between Actions, PRs and Insights
 - **Repo filter** — "All Repos" or pick a specific repo; persists across tabs
-- **Built-in setup** — login to GitHub and pick repos to track from the settings panel
+- **Built-in setup** — login to GitHub and pick repos to track from the settings panel. Repos show as a tree per owner. Select an organization to track all its repos, also the repos that it adds later. The repo list is cached and refreshes in the background once a day.
 - **Keyboard accessible** — navigate rows with Tab, activate with Return or Space
 - **Colour-blind friendly** — status colours use the Okabe-Ito colour-blind-safe palette, and every state also carries a shape or text signal (badge glyphs, spelled-out statuses, tooltips)
 - **Copy URL** — one-click copy of any run or PR URL to clipboard
@@ -64,12 +64,12 @@ Cat Eye is built on three principles:
 
 ## Installation
 
-> **Upgrading from 1.0.x:** the bundle identifier changed to `com.clintoncodewell.cateye`. macOS treats that as a new app, so you will be asked for notification permission again, and any old `CatEye.app` should be deleted. Your settings in `~/.config/cat-eye/config.json` carry over untouched.
+> **Upgrading from an older build:** the bundle identifier changed to `com.flarco.cateye`. macOS treats that as a new app, so you will be asked for notification permission again, and any old `CatEye.app` should be deleted. Your settings in `~/.config/cat-eye/config.json` carry over untouched.
 
 ### Option 1: Homebrew (recommended)
 
 ```bash
-brew tap clintoncodewell/tap
+brew tap flarco/tap
 brew install cat-eye
 ```
 
@@ -77,7 +77,7 @@ Then launch with `open $(brew --prefix)/CatEye.app`.
 
 ### Option 2: Download binary
 
-Grab `CatEye.zip` from the [latest release](https://github.com/clintoncodewell/cat-eye/releases), unzip, and double-click. On first launch, macOS will block it — right-click → Open → Open to bypass Gatekeeper (required for unsigned apps).
+Grab `CatEye.zip` from the [latest release](https://github.com/flarco/cat-eye/releases), unzip, and double-click. On first launch, macOS will block it — right-click → Open → Open to bypass Gatekeeper (required for unsigned apps).
 
 ### Option 3: Build from source
 
@@ -87,7 +87,7 @@ xcode-select --install   # Xcode Command Line Tools
 brew install gh           # GitHub CLI
 
 # Clone and build
-git clone https://github.com/clintoncodewell/cat-eye.git
+git clone https://github.com/flarco/cat-eye.git
 cd cat-eye
 ./build.sh
 
@@ -165,6 +165,31 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `pollActiveInterval` | `10` | Seconds between checks while the popover is open and a run is in progress |
 | `runsPerRepo` | `10` | Number of recent runs to fetch per repo |
 | `filterDefaultBranches` | `false` | Hide workflow runs from branches other than `main` or `develop` |
+| `sortByRecent` | `true` | Show repos with an active run first, then by newest run |
+| `relay` | none | Live updates settings, written by **Settings → Live updates** (see below) |
+
+## Live updates (optional)
+
+By default, Cat Eye polls GitHub. Live updates add a push path: GitHub sends webhooks to a small Cloudflare Worker in your own Cloudflare account, and the Worker tells each Mac about changes in about one second. Polling stays on as a slow fallback (every 10 minutes by default).
+
+Set it up from **Settings → Live updates → Set up**. The panel does these steps, and you can run each step again safely:
+
+1. Node.js 20 or later (installs with Homebrew if needed).
+2. A local copy of wrangler in `~/.config/cat-eye/relay`.
+3. Cloudflare login (`wrangler login` opens your browser).
+4. Deploy the `cat-eye-relay` Worker to `workers.dev`.
+5. Join this Mac. Each Mac gets its own token, kept in the Keychain and as a Worker secret.
+6. Install a webhook on each tracked repo (`gh` must have admin access to the repo; other repos stay on polling).
+7. Connect.
+
+On a second Mac, log in to the same Cloudflare account and click **Set up**. It joins the same relay. You do not need a pairing code.
+
+- **Cost:** the Cloudflare free plan is enough for up to about 1,000 events per hour.
+- **Retention:** the relay keeps events for 24 hours by default (1 hour to 30 days). A Mac that was offline reads the events it missed. After a longer gap, it does one full refresh.
+- **Privacy:** the relay keeps only repo names, event types and IDs. It does not log payloads. Each webhook is verified with an HMAC secret.
+- **Remove:** **Remove relay…** deletes the webhooks, the Worker and the Keychain items.
+
+The Worker source is in [`worker/`](worker/). Design: [`docs/plans/live-updates-cloudflare.md`](docs/plans/live-updates-cloudflare.md).
 
 ## Using the PRs tab
 
@@ -196,6 +221,7 @@ xcode-select --install
 - Fetches runs via `gh api repos/OWNER/REPO/actions/runs` and PRs via `gh pr list --search review-requested:@me`, for every configured repo, all concurrently.
 - The 10-second poll runs only while the popover is open. Closed, Cat Eye falls back to the normal interval — measured on a real machine, that took a long CI run from 1,148 GitHub API calls/hour down to 382.
 - PR actions (approve, comment, merge, close) call `gh pr review`, `gh pr comment`, `gh pr merge`, and `gh pr close` respectively.
+- With live updates on, a webhook event refreshes only the repo it is about, and the footer dot shows the relay state (green = live, grey = polling, orange = relay error).
 - Runs as a macOS accessory app (no Dock icon, no Cmd+Tab entry).
 - Notifications use the native `UserNotifications` framework — respects Do Not Disturb and Focus modes.
 
@@ -244,7 +270,7 @@ Cat Eye is a single Swift file compiled to a native binary. No runtime, no garba
 | **Spotlight name** | Cat Eye |
 | **Binary size** | ~380KB |
 | **Memory** | ~35 MB / 0.2% on 16GB Mac |
-| **Bundle ID** | `com.clintoncodewell.cateye` |
+| **Bundle ID** | `com.flarco.cateye` |
 
 ## Contributing
 

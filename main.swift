@@ -7,17 +7,23 @@ import os
 
 struct AppConfig: Codable {
     var repos: [String]
+    var orgs: [String]?
     var pollInterval: TimeInterval?
     var pollActiveInterval: TimeInterval?
     var runsPerRepo: Int?
     var filterDefaultBranches: Bool?
     var sortByRecent: Bool?
+    var relay: RelayConfig?
 }
 
 let CONFIG_DIR  = NSString(string: "~/.config/cat-eye").expandingTildeInPath
 let CONFIG_PATH = (CONFIG_DIR as NSString).appendingPathComponent("config.json")
+let REPO_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("repo-cache.json")
 
+// REPOS is what the app tracks: PICKED_REPOS plus every repo of PICKED_ORGS.
 var REPOS: [String] = []
+var PICKED_REPOS: [String] = []
+var PICKED_ORGS: [String] = []
 var POLL_NORMAL: TimeInterval = 30
 var POLL_ACTIVE: TimeInterval = 10
 var RUNS_PER_REPO: Int = 10
@@ -27,7 +33,7 @@ let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
 let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
-let log = Logger(subsystem: "com.clintoncodewell.cat-eye", category: "app")
+let log = Logger(subsystem: "com.flarco.cat-eye", category: "app")
 
 func isValidRepo(_ s: String) -> Bool {
     repoPattern.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
@@ -36,26 +42,30 @@ func isValidRepo(_ s: String) -> Bool {
 func loadConfig() {
     guard let data = FileManager.default.contents(atPath: CONFIG_PATH),
           let c = try? JSONDecoder().decode(AppConfig.self, from: data) else { return }
-    REPOS = c.repos.filter { isValidRepo($0) }
+    PICKED_REPOS = c.repos.filter { isValidRepo($0) }
+    PICKED_ORGS = c.orgs ?? []
+    REPOS = PICKED_REPOS
     POLL_NORMAL = max(5, c.pollInterval ?? 30)
     POLL_ACTIVE = max(5, c.pollActiveInterval ?? 10)
     RUNS_PER_REPO = min(max(1, c.runsPerRepo ?? 10), 100)
     FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
     SORT_BY_RECENT = c.sortByRecent ?? true
+    if let r = c.relay { RELAY = r }
 }
 
-func saveConfig(repos: [String]) {
+func saveConfig() {
     try? FileManager.default.createDirectory(atPath: CONFIG_DIR, withIntermediateDirectories: true)
-    let c = AppConfig(repos: repos.filter { isValidRepo($0) }, pollInterval: POLL_NORMAL,
+    let c = AppConfig(repos: PICKED_REPOS.filter { isValidRepo($0) },
+                      orgs: PICKED_ORGS.isEmpty ? nil : PICKED_ORGS, pollInterval: POLL_NORMAL,
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
-                      filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT)
+                      filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
+                      relay: RELAY)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
             try? pretty.write(to: URL(fileURLWithPath: CONFIG_PATH))
         }
     }
-    REPOS = repos
 }
 
 // Find gh CLI — hardcoded trusted paths only
@@ -152,11 +162,51 @@ enum PRAction: CustomStringConvertible {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-private let _fetchErrQ = DispatchQueue(label: "com.clintoncodewell.cat-eye.fetchErr")
+private let _fetchErrQ = DispatchQueue(label: "com.flarco.cat-eye.fetchErr")
 private var _lastFetchError: String? = nil
 var lastFetchError: String? {
     get { _fetchErrQ.sync { _lastFetchError } }
     set { _fetchErrQ.sync { _lastFetchError = newValue } }
+}
+
+struct GHResult {
+    let status: Int32
+    let out: Data
+    let err: String
+    var ok: Bool { status == 0 }
+}
+
+// Runs gh with optional stdin, so request bodies with secrets never appear in argv.
+func ghRun(_ args: [String], input: Data? = nil) throws -> GHResult {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: GH)
+    proc.arguments = args
+    proc.environment = ghEnv
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    proc.standardOutput = outPipe
+    proc.standardError = errPipe
+    let inPipe = input.map { _ in Pipe() }
+    if let p = inPipe { proc.standardInput = p } else { proc.standardInput = FileHandle.nullDevice }
+    try proc.run()
+    if let inPipe = inPipe, let input = input {
+        inPipe.fileHandleForWriting.write(input)
+        try? inPipe.fileHandleForWriting.close()
+    }
+    // Drain both pipes BEFORE waiting: a child that fills a 64KB pipe buffer
+    // would otherwise block forever inside waitUntilExit, stranding a worker
+    // thread per poll while new refreshes keep stacking up.
+    var errData = Data()
+    let errDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .utility).async {
+        errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        errDone.signal()
+    }
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    errDone.wait()
+    proc.waitUntilExit()
+    let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return GHResult(status: proc.terminationStatus, out: outData, err: errStr)
 }
 
 func ghShell(_ args: String...) -> Data? {
@@ -166,37 +216,17 @@ func ghShell(_ args: String...) -> Data? {
         lastFetchError = msg
         return nil
     }
-    let proc = Process()
-    proc.executableURL = URL(fileURLWithPath: GH)
-    proc.arguments = Array(args)
-    proc.environment = ghEnv
-    let outPipe = Pipe()
-    let errPipe = Pipe()
-    proc.standardOutput = outPipe
-    proc.standardError = errPipe
     do {
-        try proc.run()
-        // Drain both pipes BEFORE waiting: a child that fills a 64KB pipe buffer
-        // would otherwise block forever inside waitUntilExit, stranding a worker
-        // thread per poll while new refreshes keep stacking up.
-        var errData = Data()
-        let errDone = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .utility).async {
-            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            errDone.signal()
-        }
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        errDone.wait()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
-            let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let res = try ghRun(args)
+        guard res.ok else {
+            let errStr = res.err
             // Public on purpose: os_log redacts interpolated strings by default,
             // which turned every one of these into "gh <private> exited 1:
             // <private>" and made a whole night of failures undiagnosable.
             // Only the first two args: "api repos/x/y/actions/runs" or "pr review"
             // is all the diagnosis needs, and it keeps a `pr review -b <body>`
             // out of a log any process on the machine can read.
-            log.warning("gh \(args.prefix(2).joined(separator: " "), privacy: .public) exited \(proc.terminationStatus): \(errStr, privacy: .public)")
+            log.warning("gh \(args.prefix(2).joined(separator: " "), privacy: .public) exited \(res.status): \(errStr, privacy: .public)")
             let low = errStr.lowercased()
             // Order matters: gh's unauthenticated 403 reads "API rate limit
             // exceeded ... Authenticated requests get a higher rate limit",
@@ -218,7 +248,7 @@ func ghShell(_ args: String...) -> Data? {
             return nil
         }
         lastFetchError = nil
-        return outData
+        return res.out
     } catch {
         log.error("Failed to launch gh: \(error.localizedDescription)")
         lastFetchError = "Failed to run gh: \(error.localizedDescription)"
@@ -251,11 +281,18 @@ func ghStr(_ args: String...) -> String? {
     } catch { return nil }
 }
 
-func fetchRuns(repo: String) -> [Run] {
-    let jq = "[.workflow_runs[] | {id, name, displayTitle: .display_title, status, conclusion, headBranch: .head_branch, headSha: .head_sha, event, url: .html_url, updatedAt: .updated_at, createdAt: .created_at, startedAt: .run_started_at, number: .run_number, workflowName: .name, actorLogin: .actor.login}]"
-    guard let data = ghShell("api", "repos/\(repo)/actions/runs?per_page=\(RUNS_PER_REPO)", "--jq", jq)
-    else { return [] }
+let RUN_JQ = "{id, name, displayTitle: .display_title, status, conclusion, headBranch: .head_branch, headSha: .head_sha, event, url: .html_url, updatedAt: .updated_at, createdAt: .created_at, startedAt: .run_started_at, number: .run_number, workflowName: .name, actorLogin: .actor.login}"
+
+// nil means the fetch failed, which a targeted refresh must not treat as "no runs".
+func fetchRuns(repo: String) -> [Run]? {
+    guard let data = ghShell("api", "repos/\(repo)/actions/runs?per_page=\(RUNS_PER_REPO)", "--jq", "[.workflow_runs[] | \(RUN_JQ)]")
+    else { return nil }
     return (try? JSONDecoder().decode([Run].self, from: data)) ?? []
+}
+
+func fetchRun(repo: String, id: Int) -> Run? {
+    guard let data = ghShell("api", "repos/\(repo)/actions/runs/\(id)", "--jq", RUN_JQ) else { return nil }
+    return try? JSONDecoder().decode(Run.self, from: data)
 }
 
 // ─── Run Detail Fetching ─────────────────────────────────────────────────────
@@ -355,22 +392,6 @@ func executePRAction(repo: String, number: Int, action: PRAction, completion: @e
 }
 
 func getGHUser() -> String? { ghStr("api", "user", "--jq", ".login") }
-
-func fetchAvailableRepos() -> [String] {
-    guard let out = ghStr("repo", "list", "--limit", "100", "--json", "nameWithOwner", "--jq", ".[].nameWithOwner")
-    else { return [] }
-    var repos = out.split(separator: "\n").map(String.init)
-    // Also fetch org repos
-    if let orgOut = ghStr("api", "user/orgs", "--jq", ".[].login") {
-        for org in orgOut.split(separator: "\n") {
-            if let orgRepos = ghStr("repo", "list", String(org), "--limit", "50",
-                                    "--json", "nameWithOwner", "--jq", ".[].nameWithOwner") {
-                repos.append(contentsOf: orgRepos.split(separator: "\n").map(String.init))
-            }
-        }
-    }
-    return Array(Set(repos)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-}
 
 let isoFmt: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f
@@ -543,6 +564,13 @@ func sortedByRecent(_ g: [(String, [Run])]) -> [(String, [Run])] {
     }.map { $0.repo }
 }
 
+// Replaces the entries of the refreshed repos and keeps the order of `order`.
+func mergeGrouped<T>(_ old: [(String, [T])], _ fresh: [(String, [T])], order: [String]) -> [(String, [T])] {
+    var byRepo = Dictionary(old.map { ($0.0, $0.1) }, uniquingKeysWith: { a, _ in a })
+    for (repo, items) in fresh { byRepo[repo] = items }
+    return order.map { ($0, byRepo[$0] ?? []) }
+}
+
 // ─── Deploy Log & Weekly Report ──────────────────────────────────────────────
 // Append-only history of every completed workflow run we witness while polling.
 // Costs no extra gh calls — it reuses data already fetched each refresh. Feeds the
@@ -574,7 +602,7 @@ func isDeployWorkflow(_ name: String) -> Bool {
 
 final class DeployLog {
     static let shared = DeployLog()
-    private let q = DispatchQueue(label: "com.clintoncodewell.cat-eye.deploylog")
+    private let q = DispatchQueue(label: "com.flarco.cat-eye.deploylog")
     private var seen = Set<String>()
     private var loaded = false
 
@@ -836,6 +864,64 @@ func runSelfTest() {
                     ("o/busy", [runAt("2025-01-01T00:00:00Z", "in_progress")])]
     check(sortedByRecent(unsorted).map { $0.0 } == ["o/busy", "o/new", "o/old", "o/none"], "recent sort order")
 
+    // Live updates: partial refresh merge keeps the other repos and the REPOS order.
+    let oldG = [("o/a", [runAt("2026-01-01T00:00:00Z")]), ("o/b", [runAt("2026-01-02T00:00:00Z")])]
+    let merged = mergeGrouped(oldG, [("o/b", [])], order: ["o/a", "o/b", "o/c"])
+    check(merged.map { $0.0 } == ["o/a", "o/b", "o/c"], "merge order")
+    check(merged[0].1.count == 1 && merged[1].1.isEmpty && merged[2].1.isEmpty, "merge replaces only refreshed repos")
+
+    // detectTransitions(partial:) keeps the statuses of repos it did not refresh.
+    func runURL(_ url: String, _ status: String) -> Run {
+        Run(id: 1, name: "ci", displayTitle: "t", status: status, conclusion: "success",
+            headBranch: "main", headSha: "s", event: "push", url: url,
+            updatedAt: "", createdAt: "", startedAt: nil, number: 1, workflowName: "ci", actorLogin: nil)
+    }
+    let bar = GHActionsBar()
+    bar.grouped = [("o/a", [runURL("a1", "completed")]), ("o/b", [runURL("b1", "completed")])]
+    bar.detectTransitions(bar.grouped)
+    bar.firstLoad = false
+    bar.detectTransitions([("o/a", [runURL("a2", "completed")])], partial: true)
+    check(bar.prevStatuses["b1"] == "completed", "partial transitions keep other repos")
+    check(bar.prevStatuses["a2"] == "completed" && bar.prevStatuses["a1"] == nil, "partial transitions replace refreshed repo")
+
+    var ids = RecentIDs(capacity: 2)
+    ids.insert("x"); ids.insert("y"); ids.insert("x"); ids.insert("z")
+    check(!ids.contains("x") && ids.contains("y") && ids.contains("z"), "dedupe buffer evicts oldest")
+
+    var bo = Backoff()
+    let delays = (0..<8).map { _ in bo.next(jitter: 0) }
+    check(delays == [1, 2, 4, 8, 16, 32, 60, 60], "backoff \(delays)")
+    bo.reset()
+    check(bo.next(jitter: 0.2) == 1.2, "backoff jitter")
+
+    let deployOut = """
+    Total Upload: 13.02 KiB / gzip: 4.28 KiB
+    Uploaded cat-eye-relay (3.1 sec)
+    Deployed cat-eye-relay triggers (0.4 sec)
+      https://cat-eye-relay.fritz-1.workers.dev
+    Current Version ID: 0f1e
+    """
+    check(RelayDeployer.parseWorkerURL(deployOut) == "https://cat-eye-relay.fritz-1.workers.dev", "deploy URL parser")
+    check(RelayDeployer.parseWorkerURL("no url") == nil, "deploy URL parser without URL")
+    let who = RelayDeployer.parseWhoami("""
+    {"loggedIn": true, "email": "me@x.dev", "accounts": [{"id": "abc", "name": "Mine"}, {"id": "def", "name": "Work"}]}
+    """)
+    check(who?.email == "me@x.dev" && who?.accounts.map { $0.id } == ["abc", "def"], "whoami parser")
+    check(RelayDeployer.parseWhoami("{\"loggedIn\": false}") == nil, "whoami parser logged out")
+    check(RelayDeployer.parseSecretNames("""
+    [{"name": "DEVICE_AB12", "type": "secret_text"}, {"name": "WEBHOOK_SECRET", "type": "secret_text"}]
+    """) == ["DEVICE_AB12", "WEBHOOK_SECRET"], "secret list parser")
+
+    let token = String(repeating: "ab12", count: 16)
+    check(maskSecrets("put \(token) done") == "put •••• done", "secret masking")
+    check(maskSecrets("deploy abc123") == "deploy abc123", "masking leaves short hex")
+    check(stripANSI("\u{1B}[32mok\u{1B}[0m") == "ok", "ANSI stripping")
+
+    let noon = Date(timeIntervalSince1970: 86400 * 100 + 43200)
+    let q = WriteQuota(rowsToday: 40_000, now: noon)
+    check(q.projected == 80_000 && q.warn, "quota projection \(q.projected)")
+    check(!WriteQuota(rowsToday: 1_000, now: noon).warn, "quota no warning")
+
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
 
@@ -863,6 +949,10 @@ func prReviewColor(_ pr: PR) -> NSColor {
 
 func prRelativeTime(_ iso: String) -> String {
     guard let d = parseISO(iso) else { return "" }
+    return relativeTime(d)
+}
+
+func relativeTime(_ d: Date) -> String {
     let secs = -d.timeIntervalSinceNow
     if secs < 60 { return "just now" }
     if secs < 3600 { return "\(Int(secs/60))m ago" }
@@ -1920,6 +2010,13 @@ class Footer: NSView {
         ts.frame = NSRect(x: 90, y: 11, width: w - 230, height: 16)
         addSubview(ts)
 
+        // Live updates: green = live, grey = polling, orange = relay error.
+        if let (color, tip) = (NSApp.delegate as? GHActionsBar)?.relay.statusDot {
+            let dot = Dot(color: color, frame: NSRect(x: w - 124, y: 15, width: 10, height: 10))
+            dot.toolTip = tip
+            addSubview(dot)
+        }
+
         // Settings gear
         let gear = NSButton(frame: NSRect(x: w - 100, y: 8, width: 36, height: 24))
         if let img = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings") { gear.image = img }
@@ -2254,7 +2351,7 @@ class TabVC: NSViewController {
 
     @objc func toggleBranchFilter(_ sender: NSButton) {
         FILTER_DEFAULT_BRANCHES = (sender.state == .on)
-        saveConfig(repos: REPOS)
+        saveConfig()
         rebuildContent()
         let appDel = NSApp.delegate as? GHActionsBar
         appDel?.updateIcon()
@@ -2271,7 +2368,7 @@ class TabVC: NSViewController {
 
     @objc func toggleSortByRecent(_ sender: NSButton) {
         SORT_BY_RECENT = (sender.state == .on)
-        saveConfig(repos: REPOS)
+        saveConfig()
         rebuildContent()
     }
 
@@ -2291,269 +2388,47 @@ class TabVC: NSViewController {
 
 // ─── Settings View ───────────────────────────────────────────────────────────
 
-class SettingsVC: NSViewController {
-    var selected: Set<String>
-    var available: [String] = []
-    var username: String?
-    var checkboxes: [NSButton] = []
-    var repoScroll: NSScrollView?
-    var repoDoc: Flipped?
-    var statusLabel: NSTextField?
-    var addField: NSTextField?
-    var loadingLabel: NSTextField?
-
-    init(current: Set<String>) {
-        self.selected = current
-        super.init(nibName: nil, bundle: nil)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func loadView() {
-        let w = POP_W
-        let container = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: 500))
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.85).cgColor
-        var y: CGFloat = 0
-
-        // ── Nav bar ──
-        let nav = NSView(frame: NSRect(x: 0, y: 0, width: w, height: 44))
-        nav.wantsLayer = true; nav.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
-        let back = NSButton(title: "Back", target: NSApp.delegate, action: #selector(GHActionsBar.showList))
-        back.bezelStyle = .inline; back.font = .systemFont(ofSize: 12)
-        back.frame = NSRect(x: 8, y: 10, width: 70, height: 24)
-        nav.addSubview(back)
-        let tl = NSTextField(labelWithString: "SETTINGS")
-        tl.font = .systemFont(ofSize: 13, weight: .bold); tl.textColor = .labelColor; tl.alignment = .center
-        tl.frame = NSRect(x: 80, y: 12, width: w - 160, height: 20)
-        nav.addSubview(tl)
-        container.addSubview(nav); y += 44
-
-        // ── Separator ──
-        let s1 = sepLine(y: y, w: w); container.addSubview(s1); y += 0.5
-
-        // ── Account section ──
-        let accHdr = sectionHeader("GITHUB ACCOUNT", y: y, w: w)
-        container.addSubview(accHdr); y += 28
-
-        let accRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
-        let sl = NSTextField(labelWithString: "Checking...")
-        sl.font = .systemFont(ofSize: 12); sl.textColor = .secondaryLabelColor
-        sl.frame = NSRect(x: 16, y: 10, width: w - 180, height: 20)
-        accRow.addSubview(sl)
-        statusLabel = sl
-
-        let loginBtn = NSButton(title: "Login...", target: self, action: #selector(doLogin))
-        loginBtn.bezelStyle = .inline; loginBtn.font = .systemFont(ofSize: 11)
-        loginBtn.frame = NSRect(x: w - 160, y: 10, width: 64, height: 24)
-        loginBtn.tag = 1
-        accRow.addSubview(loginBtn)
-
-        let logoutBtn = NSButton(title: "Logout", target: self, action: #selector(doLogout))
-        logoutBtn.bezelStyle = .inline; logoutBtn.font = .systemFont(ofSize: 11)
-        logoutBtn.frame = NSRect(x: w - 88, y: 10, width: 64, height: 24)
-        logoutBtn.tag = 2
-        accRow.addSubview(logoutBtn)
-
-        container.addSubview(accRow); y += 40
-        let s2 = sepLine(y: y, w: w); container.addSubview(s2); y += 0.5
-
-        // ── Repos section ──
-        let repoHdr = sectionHeader("SELECT REPOS TO TRACK", y: y, w: w)
-        let refreshBtn = NSButton(title: "Refresh", target: self, action: #selector(fetchRepos))
-        refreshBtn.bezelStyle = .inline; refreshBtn.font = .systemFont(ofSize: 10)
-        refreshBtn.frame = NSRect(x: w - 80, y: 6, width: 68, height: 20)
-        repoHdr.addSubview(refreshBtn)
-        container.addSubview(repoHdr); y += 28
-
-        let ll = NSTextField(labelWithString: "Loading repos...")
-        ll.font = .systemFont(ofSize: 11); ll.textColor = .secondaryLabelColor
-        ll.frame = NSRect(x: 16, y: y + 8, width: 200, height: 16)
-        container.addSubview(ll)
-        loadingLabel = ll
-
-        let scrollH: CGFloat = 260
-        let rd = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: scrollH))
-        let rs = NSScrollView(frame: NSRect(x: 0, y: y, width: w, height: scrollH))
-        rs.hasVerticalScroller = true; rs.drawsBackground = false
-        rs.documentView = rd; rs.autohidesScrollers = true
-        container.addSubview(rs)
-        repoScroll = rs; repoDoc = rd
-        y += scrollH
-
-        let s3 = sepLine(y: y, w: w); container.addSubview(s3); y += 0.5
-
-        // ── Add repo manually ──
-        let addHdr = sectionHeader("ADD REPO MANUALLY", y: y, w: w)
-        container.addSubview(addHdr); y += 28
-
-        let addRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 36))
-        let tf = NSTextField(frame: NSRect(x: 16, y: 6, width: w - 110, height: 24))
-        tf.placeholderString = "owner/repo"
-        tf.font = .systemFont(ofSize: 12)
-        addRow.addSubview(tf)
-        addField = tf
-        let addBtn = NSButton(title: "Add", target: self, action: #selector(addManualRepo))
-        addBtn.bezelStyle = .inline; addBtn.font = .systemFont(ofSize: 11)
-        addBtn.frame = NSRect(x: w - 80, y: 6, width: 56, height: 24)
-        addRow.addSubview(addBtn)
-        container.addSubview(addRow); y += 36
-
-        let s4 = sepLine(y: y, w: w); container.addSubview(s4); y += 0.5
-
-        // ── Save button ──
-        let saveRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 48))
-        saveRow.wantsLayer = true; saveRow.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
-        let saveBtn = NSButton(title: "Save & Apply", target: self, action: #selector(doSave))
-        saveBtn.bezelStyle = .inline; saveBtn.font = .systemFont(ofSize: 12, weight: .semibold)
-        saveBtn.frame = NSRect(x: w / 2 - 60, y: 12, width: 120, height: 28)
-        saveRow.addSubview(saveBtn)
-        container.addSubview(saveRow); y += 48
-
-        container.frame.size.height = y
-        self.view = container
-        self.preferredContentSize = NSSize(width: w, height: min(y, POP_MAX_H))
-
-        // Load data in background
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let user = getGHUser()
-            let repos = fetchAvailableRepos()
-            DispatchQueue.main.async {
-                self?.username = user
-                self?.available = repos
-                self?.updateAuthUI()
-                self?.rebuildRepoList()
-            }
-        }
-    }
-
-    func sectionHeader(_ title: String, y: CGFloat, w: CGFloat) -> NSView {
-        let v = NSView(frame: NSRect(x: 0, y: y, width: w, height: 28))
-        v.wantsLayer = true; v.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.7).cgColor
+class SettingsHeader: NSView {
+    init(_ title: String, y: CGFloat, w: CGFloat) {
+        super.init(frame: NSRect(x: 0, y: y, width: w, height: 28))
+        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.7).cgColor
         let l = NSTextField(labelWithString: title)
         l.font = .systemFont(ofSize: 10, weight: .bold); l.textColor = .secondaryLabelColor
         l.frame = NSRect(x: 16, y: 6, width: w - 100, height: 16)
-        v.addSubview(l)
-        return v
+        addSubview(l)
     }
+    required init?(coder: NSCoder) { fatalError() }
+}
 
-    func sepLine(y: CGFloat, w: CGFloat) -> NSView {
-        let v = NSView(frame: NSRect(x: 0, y: y, width: w, height: 0.5))
-        v.wantsLayer = true; v.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        return v
+class SeparatorLine: NSView {
+    init(y: CGFloat, w: CGFloat) {
+        super.init(frame: NSRect(x: 0, y: y, width: w, height: 0.5))
+        wantsLayer = true; layer?.backgroundColor = NSColor.separatorColor.cgColor
     }
+    required init?(coder: NSCoder) { fatalError() }
+}
 
-    func updateAuthUI() {
-        guard let sl = statusLabel else { return }
-        if let user = username {
-            let attr = NSMutableAttributedString()
-            attr.append(NSAttributedString(string: "Authenticated as ", attributes: [
-                .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor,
-            ]))
-            attr.append(NSAttributedString(string: user, attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor,
-            ]))
-            sl.attributedStringValue = attr
-        } else {
-            // Distinguish "gh CLI missing" (infra) from "not authenticated" (user action).
-            if let err = lastFetchError, err.contains("not found") {
-                sl.stringValue = err
-            } else {
-                sl.stringValue = "Not authenticated — click Login"
-            }
-            sl.textColor = .systemRed
-        }
+// Back button plus the Repositories / Live updates tabs.
+class SettingsNav: NSView {
+    init(w: CGFloat, selected: Int) {
+        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 44))
+        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
+        let back = NSButton(title: "Back", target: NSApp.delegate, action: #selector(GHActionsBar.showList))
+        back.bezelStyle = .inline; back.font = .systemFont(ofSize: 12)
+        back.frame = NSRect(x: 8, y: 10, width: 70, height: 24)
+        addSubview(back)
+        let seg = NSSegmentedControl(labels: ["Repositories", "Live updates"], trackingMode: .selectOne,
+                                     target: self, action: #selector(tabChanged(_:)))
+        seg.selectedSegment = selected
+        seg.font = .systemFont(ofSize: 11, weight: .medium)
+        seg.frame = NSRect(x: w / 2 - 110, y: 10, width: 220, height: 24)
+        addSubview(seg)
     }
+    required init?(coder: NSCoder) { fatalError() }
 
-    func rebuildRepoList() {
-        guard let doc = repoDoc else { return }
-        loadingLabel?.isHidden = true
-        doc.subviews.forEach { $0.removeFromSuperview() }
-        checkboxes = []
-
-        // Merge available repos with currently selected (in case some aren't in the fetched list)
-        var allRepos = available
-        for r in selected { if !allRepos.contains(r) { allRepos.append(r) } }
-
-        let rowH: CGFloat = 26
-        var y: CGFloat = 4
-        for repo in allRepos {
-            let cb = NSButton(checkboxWithTitle: "  \(repo)", target: self, action: #selector(toggleRepo(_:)))
-            cb.font = .systemFont(ofSize: 12)
-            cb.state = selected.contains(repo) ? .on : .off
-            cb.frame = NSRect(x: 12, y: y, width: POP_W - 24, height: rowH)
-            cb.identifier = NSUserInterfaceItemIdentifier(repo)
-            doc.addSubview(cb)
-            checkboxes.append(cb)
-            y += rowH
-        }
-
-        if allRepos.isEmpty {
-            let l = NSTextField(labelWithString: username == nil ? "Login to see your repos" : "No repos found")
-            l.font = .systemFont(ofSize: 12); l.textColor = .secondaryLabelColor
-            l.frame = NSRect(x: 16, y: 8, width: 300, height: 20)
-            doc.addSubview(l)
-            y = 36
-        }
-
-        doc.frame.size.height = max(y + 4, repoScroll?.frame.height ?? 260)
-    }
-
-    @objc func toggleRepo(_ sender: NSButton) {
-        guard let repo = sender.identifier?.rawValue else { return }
-        if sender.state == .on { selected.insert(repo) } else { selected.remove(repo) }
-    }
-
-    @objc func addManualRepo() {
-        guard let text = addField?.stringValue.trimmingCharacters(in: .whitespaces),
-              !text.isEmpty, isValidRepo(text) else {
-            addField?.placeholderString = "Format: owner/repo (letters, numbers, hyphens)"
-            return
-        }
-        selected.insert(text)
-        if !available.contains(text) { available.append(text) }
-        addField?.stringValue = ""
-        rebuildRepoList()
-    }
-
-    @objc func fetchRepos() {
-        loadingLabel?.isHidden = false
-        loadingLabel?.stringValue = "Refreshing..."
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let user = getGHUser()
-            let repos = fetchAvailableRepos()
-            DispatchQueue.main.async {
-                self?.username = user
-                self?.available = repos
-                self?.updateAuthUI()
-                self?.rebuildRepoList()
-            }
-        }
-    }
-
-    @objc func doLogin() {
-        let script = "tell application \"Terminal\" to do script \"gh auth login --web -p https\""
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
-    }
-
-    @objc func doLogout() {
-        let script = "tell application \"Terminal\" to do script \"gh auth logout\""
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
-    }
-
-    @objc func doSave() {
-        let repos = Array(selected).sorted()
-        saveConfig(repos: repos)
-        (NSApp.delegate as? GHActionsBar)?.onConfigSaved()
+    @objc func tabChanged(_ sender: NSSegmentedControl) {
+        let app = NSApp.delegate as? GHActionsBar
+        sender.selectedSegment == 1 ? app?.showRelaySettings() : app?.showSettings()
     }
 }
 
@@ -2579,10 +2454,21 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     var appearanceObs: NSKeyValueObservation?
     var warnedStatusItemMissing = false
     var statusItemRecheckDone = false
+    let relayDeployer = RelayDeployer()
+    let catalog = RepoCatalog(path: REPO_CACHE_PATH)
+    var catalogTimer: Timer?
+    lazy var relay: RelayClient = {
+        let c = RelayClient(secrets: relayDeployer.secrets)
+        c.sink = self
+        return c
+    }()
+    // Targeted refreshes that arrive while another refresh runs.
+    var pendingPartial: (repos: Set<String>, prs: Bool, runs: [(String, Int)], dones: [(Bool) -> Void])?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         log.info("Cat Eye launching — repos: \(REPOS.count), poll: \(POLL_NORMAL)s/\(POLL_ACTIVE)s")
         loadConfig()
+        REPOS = catalog.resolve(picked: PICKED_REPOS, orgs: PICKED_ORGS)
         log.info("Config loaded — tracking \(REPOS.count) repos: \(REPOS.joined(separator: ", "))")
         ghIcon = loadGHIcon()
 
@@ -2632,6 +2518,17 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             refresh()
         }
         scheduleTimer()
+        if relay.canRun { relay.start() }
+
+        // New repos of a whole-owner pick start to track after a catalog refresh.
+        NotificationCenter.default.addObserver(forName: RepoCatalog.changed, object: catalog, queue: .main) { [weak self] _ in
+            guard let self = self, !self.catalog.refreshing else { return }
+            self.applyRepoSelection(reopen: false)
+        }
+        catalog.refreshIfStale()
+        catalogTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            self?.catalog.refreshIfStale()
+        }
     }
 
     // True when macOS actually placed the status item in a menu bar. A screen left
@@ -2692,10 +2589,16 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         // the menu bar icon only has to be roughly right, and 10s polling through a
         // long CI run cost a measured 1,148 REST calls/hour — 23% of the GitHub
         // budget — that nobody was looking at.
-        let interval = (popover.isShown && hasActive(visibleGrouped(grouped)))
-            ? POLL_ACTIVE : POLL_NORMAL
+        // A healthy relay pushes changes, so polling only reconciles.
+        let interval: TimeInterval
+        if relay.isHealthy {
+            interval = RELAY.reconcileInterval ?? 600
+        } else {
+            interval = (popover.isShown && hasActive(visibleGrouped(grouped))) ? POLL_ACTIVE : POLL_NORMAL
+        }
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
+            if self?.relay.isHealthy == true { self?.relay.sync() }
         }
         // Generous tolerance lets the system coalesce wakeups (and App Nap us)
         // instead of firing on an exact-deadline timer.
@@ -2725,11 +2628,11 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             guard let self = self else { return }
             var runRes = Array(repeating: (String, [Run])("", []), count: repos.count)
             var prRes = Array(repeating: (String, [PR])("", []), count: repos.count)
-            let collectQ = DispatchQueue(label: "com.clintoncodewell.cat-eye.collect")
+            let collectQ = DispatchQueue(label: "com.flarco.cat-eye.collect")
             var tasks: [() -> Void] = []
             for (i, repo) in repos.enumerated() {
                 tasks.append {
-                    let runs = fetchRuns(repo: repo)
+                    let runs = fetchRuns(repo: repo) ?? []
                     collectQ.sync { runRes[i] = (repo, runs) }
                 }
                 if includePRs {
@@ -2745,7 +2648,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             let elapsed = Date().timeIntervalSince(start)
             let totalRuns = runRes.reduce(0) { $0 + $1.1.count }
             let totalPRs = prRes.reduce(0) { $0 + $1.1.count }
-            log.info("Refresh done in \(String(format: "%.1f", elapsed))s — \(totalRuns) runs, \(totalPRs) PRs")
+            log.info("Refresh done in \(String(format: "%.1f", elapsed), privacy: .public)s — \(totalRuns) runs, \(totalPRs) PRs")
             DispatchQueue.main.async {
                 self.detectTransitions(runRes)
                 DeployLog.shared.record(runRes)
@@ -2763,11 +2666,104 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 let pending = self.pendingCompletion
                 self.pendingCompletion = nil
                 pending?()
+                self.runPendingPartial()
             }
         }
     }
 
-    func onConfigSaved() {
+    // Refreshes only the given repos and merges them into the current data.
+    // `done` gets false if a run fetch failed, so the relay does not ack those events.
+    func refreshRepos(_ repos: [String], includePRs: Bool, completedRuns: [(String, Int)],
+                      done: @escaping (Bool) -> Void) {
+        guard !refreshInFlight else {
+            var p = pendingPartial ?? (Set<String>(), false, [], [])
+            p.repos.formUnion(repos); p.prs = p.prs || includePRs
+            p.runs += completedRuns; p.dones.append(done)
+            pendingPartial = p
+            return
+        }
+        refreshInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var runRes = [(String, [Run])?](repeating: nil, count: repos.count)
+            var prRes = [(String, [PR])?](repeating: nil, count: repos.count)
+            let collectQ = DispatchQueue(label: "com.flarco.cat-eye.collect-partial")
+            var tasks: [() -> Void] = []
+            for (i, repo) in repos.enumerated() {
+                tasks.append {
+                    let runs = fetchRuns(repo: repo)
+                    collectQ.sync { runRes[i] = runs.map { (repo, $0) } }
+                }
+                if includePRs {
+                    tasks.append {
+                        let prs = fetchPRs(repo: repo)
+                        collectQ.sync { prRes[i] = (repo, prs) }
+                    }
+                }
+            }
+            DispatchQueue.concurrentPerform(iterations: tasks.count) { tasks[$0]() }
+            let fresh = runRes.compactMap { $0 }
+            // Insights backfill: a run that completed and already left the list.
+            var backfill: [(String, [Run])] = []
+            for (repo, id) in completedRuns {
+                let listed = fresh.first { $0.0 == repo }?.1.contains { $0.id == id } ?? false
+                if !listed, let run = fetchRun(repo: repo, id: id), run.status == "completed" {
+                    backfill.append((repo, [run]))
+                }
+            }
+            let ok = fresh.count == repos.count
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.detectTransitions(fresh, partial: true)
+                DeployLog.shared.record(fresh + backfill)
+                self.grouped = mergeGrouped(self.grouped, fresh, order: REPOS)
+                if includePRs { self.prGrouped = mergeGrouped(self.prGrouped, prRes.compactMap { $0 }, order: REPOS) }
+                self.lastUpdate = Date()
+                self.refreshInFlight = false
+                self.updateIcon()
+                self.scheduleTimer()
+                done(ok)
+                let pending = self.pendingCompletion
+                self.pendingCompletion = nil
+                pending?()
+                self.runPendingPartial()
+            }
+        }
+    }
+
+    func runPendingPartial() {
+        guard let p = pendingPartial else { return }
+        pendingPartial = nil
+        let repos = REPOS.filter { p.repos.contains($0) }
+        refreshRepos(repos, includePRs: p.prs, completedRuns: p.runs) { ok in p.dones.forEach { $0(ok) } }
+    }
+
+    // Resolves REPOS from the picks. `reopen` is for an explicit save from the settings.
+    func applyRepoSelection(reopen: Bool) {
+        let previous = REPOS
+        REPOS = catalog.resolve(picked: PICKED_REPOS, orgs: PICKED_ORGS)
+        if reopen { onConfigSaved(previous: previous); return }
+        guard REPOS != previous else { return }
+        log.info("Repo catalog changed the tracked repos: \(previous.count) -> \(REPOS.count)")
+        syncRelayRepos(previous: previous)
+        refresh(force: true)
+        scheduleTimer()
+    }
+
+    func syncRelayRepos(previous: [String]) {
+        if !RELAY.deviceID.isEmpty && !RELAY.workerURL.isEmpty {
+            relayDeployer.registerRepos()
+            let added = REPOS.filter { !previous.contains($0) }
+            let removed = previous.filter { !REPOS.contains($0) }
+            if !added.isEmpty {
+                let d = relayDeployer
+                d.perform("Install webhooks for new repos", { d.installHooks(repos: added) })
+            }
+            relayDeployer.pruneHooks(removed: removed)
+        }
+    }
+
+    func onConfigSaved(previous: [String]) {
+        syncRelayRepos(previous: previous)
         prevStatuses = [:]
         firstLoad = true
         grouped = []
@@ -2819,7 +2815,8 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
 
     // MARK: - Notifications
 
-    func detectTransitions(_ newGrouped: [(String, [Run])]) {
+    // `partial` means newGrouped holds only some repos: the others keep their entries.
+    func detectTransitions(_ newGrouped: [(String, [Run])], partial: Bool = false) {
         guard !firstLoad else {
             for run in newGrouped.flatMap({ $0.1 }) { prevStatuses[run.url] = run.status }
             return
@@ -2839,7 +2836,13 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                        body: "\(wf) on \(run.headBranch) \u{2014} \(runDuration(run))", id: "end-\(run.url)")
             }
         }
-        prevStatuses = [:]; for run in newRuns { prevStatuses[run.url] = run.status }
+        if partial {
+            let repos = Set(newGrouped.map { $0.0 })
+            for (repo, runs) in grouped where repos.contains(repo) { for r in runs { prevStatuses[r.url] = nil } }
+        } else {
+            prevStatuses = [:]
+        }
+        for run in newRuns { prevStatuses[run.url] = run.status }
     }
 
     func notify(title: String, body: String, id: String) {
@@ -2927,20 +2930,34 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             // Discard the stale view tree (its CGColors are baked in the OLD appearance).
             // Next show reconstructs under the new drawing context.
             let wasShownAsSettings = self.popover.contentViewController is SettingsVC
+            let wasShownAsRelay = self.popover.contentViewController is RelaySettingsVC
             let wasShown = self.popover.isShown
             self.popover.close()
             self.popover.contentViewController = nil
             if wasShown {
                 self.closeTime = .distantPast
                 if wasShownAsSettings { self.showSettings() }
+                else if wasShownAsRelay { self.showRelaySettings() }
                 else { self.toggle() }
             }
         }
     }
 
     @objc func showSettings() {
+        popover.behavior = .transient
         applySystemAppearance()
-        buildWithAppearance { self.popover.contentViewController = SettingsVC(current: Set(REPOS)) }
+        buildWithAppearance { self.popover.contentViewController = SettingsVC(catalog: catalog, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS)) }
+        if !popover.isShown {
+            closeTime = .distantPast
+            toggle()
+        }
+    }
+
+    @objc func showRelaySettings() {
+        applySystemAppearance()
+        // Login and installs leave the app, which would close a transient popover.
+        popover.behavior = .semitransient
+        buildWithAppearance { self.popover.contentViewController = RelaySettingsVC(deployer: relayDeployer, client: relay) }
         if !popover.isShown {
             closeTime = .distantPast
             toggle()
@@ -2948,6 +2965,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     }
 
     @objc func showList() {
+        popover.behavior = .transient
         applySystemAppearance()
         buildWithAppearance { self.popover.contentViewController = self.makeTabVC() }
     }
@@ -2965,8 +2983,25 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
 
     func popoverDidClose(_ notification: Notification) {
         closeTime = Date()
+        popover.behavior = .transient
         popover.contentViewController = nil  // Release settings view if open
         scheduleTimer()                      // nobody is watching: back to the slow cadence
+    }
+}
+
+extension GHActionsBar: RelaySink {
+    func relayRefresh(repos: [String], includePRs: Bool, completedRuns: [(String, Int)], done: @escaping (Bool) -> Void) {
+        refreshRepos(repos, includePRs: includePRs, completedRuns: completedRuns, done: done)
+    }
+
+    // A gap in the log: refresh every repo.
+    func relayFullRefresh(done: @escaping (Bool) -> Void) {
+        refreshRepos(REPOS, includePRs: true, completedRuns: [], done: done)
+    }
+
+    func relayStateChanged() {
+        scheduleTimer()
+        (popover?.contentViewController as? RelaySettingsVC)?.rebuild()
     }
 }
 

@@ -1,5 +1,5 @@
 # Build artifacts
-CatEye.app/Contents/MacOS/cat-eye
+CatEye.app/
 cat-eye
 *.o
 *.dSYM/

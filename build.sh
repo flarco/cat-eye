@@ -18,6 +18,9 @@ for arch in ${ARCHS:-$(uname -m)}; do
 done
 lipo -create "${BINS[@]}" -output CatEye.app/Contents/MacOS/cat-eye
 rm "${BINS[@]}"
+# AppIcon.icns comes from AppIcon.svg. See CONTRIBUTING.md to make it again.
+mkdir -p CatEye.app/Contents/Resources
+cp AppIcon.icns CatEye.app/Contents/Resources/AppIcon.icns
 # The relay Worker source. Cat Eye copies it to ~/.config/cat-eye/relay at setup.
 rm -rf CatEye.app/Contents/Resources/worker
 mkdir -p CatEye.app/Contents/Resources/worker

@@ -39,6 +39,19 @@ Each push to `main` by the owner starts `.github/workflows/release.yml`. The wor
 
 The signing secrets are in the `release` environment, which accepts the `main` branch only. Workflows from other people and from forks cannot use them.
 
+## App icon
+
+`AppIcon.svg` is the source of `AppIcon.icns`. After you change the SVG, make the icon again (this needs `brew install librsvg`):
+
+```bash
+mkdir -p AppIcon.iconset
+for s in 16 32 128 256 512; do
+  rsvg-convert -w $s -h $s AppIcon.svg -o AppIcon.iconset/icon_${s}x${s}.png
+  rsvg-convert -w $((s*2)) -h $((s*2)) AppIcon.svg -o AppIcon.iconset/icon_${s}x${s}@2x.png
+done
+iconutil -c icns AppIcon.iconset -o AppIcon.icns
+```
+
 ## Reporting bugs
 
 Open a GitHub issue with your macOS version, `gh --version` output, and steps to reproduce. Screenshots help — but please use demo data, not your real repo names.

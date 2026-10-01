@@ -11,6 +11,7 @@ struct AppConfig: Codable {
     var pollActiveInterval: TimeInterval?
     var runsPerRepo: Int?
     var filterDefaultBranches: Bool?
+    var sortByRecent: Bool?
 }
 
 let CONFIG_DIR  = NSString(string: "~/.config/cat-eye").expandingTildeInPath
@@ -21,6 +22,7 @@ var POLL_NORMAL: TimeInterval = 30
 var POLL_ACTIVE: TimeInterval = 10
 var RUNS_PER_REPO: Int = 10
 var FILTER_DEFAULT_BRANCHES: Bool = false
+var SORT_BY_RECENT: Bool = true
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
 let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -39,13 +41,14 @@ func loadConfig() {
     POLL_ACTIVE = max(5, c.pollActiveInterval ?? 10)
     RUNS_PER_REPO = min(max(1, c.runsPerRepo ?? 10), 100)
     FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
+    SORT_BY_RECENT = c.sortByRecent ?? true
 }
 
 func saveConfig(repos: [String]) {
     try? FileManager.default.createDirectory(atPath: CONFIG_DIR, withIntermediateDirectories: true)
     let c = AppConfig(repos: repos.filter { isValidRepo($0) }, pollInterval: POLL_NORMAL,
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
-                      filterDefaultBranches: FILTER_DEFAULT_BRANCHES)
+                      filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
@@ -528,6 +531,18 @@ func visibleGrouped(_ g: [(String, [Run])]) -> [(String, [Run])] {
     g.map { ($0.0, visibleRuns($0.1)) }
 }
 
+// Repos with an active run come first, then by newest visible run. Repos without runs go last.
+func sortedByRecent(_ g: [(String, [Run])]) -> [(String, [Run])] {
+    func latest(_ runs: [Run]) -> Date {
+        visibleRuns(runs).compactMap { parseISO($0.createdAt) }.max() ?? .distantPast
+    }
+    let keyed = g.map { (repo: $0, active: hasActive([($0.0, visibleRuns($0.1))]), latest: latest($0.1)) }
+    return keyed.sorted { a, b in
+        if a.active != b.active { return a.active }
+        return a.latest > b.latest
+    }.map { $0.repo }
+}
+
 // ─── Deploy Log & Weekly Report ──────────────────────────────────────────────
 // Append-only history of every completed workflow run we witness while polling.
 // Costs no extra gh calls — it reuses data already fetched each refresh. Feeds the
@@ -808,6 +823,18 @@ func runSelfTest() {
     check(visibleGrouped(g)[0].1.count == 1, "filtered: only default-branch rows visible")
     check(!hasActive(visibleGrouped(g)), "filtered: hidden run must not force the fast poll")
     FILTER_DEFAULT_BRANCHES = false
+
+    func runAt(_ created: String, _ status: String = "completed") -> Run {
+        Run(id: 1, name: "ci", displayTitle: "t", status: status, conclusion: nil,
+            headBranch: "main", headSha: "s", event: "push", url: "u",
+            updatedAt: created, createdAt: created, startedAt: nil, number: 1,
+            workflowName: "ci", actorLogin: nil)
+    }
+    let unsorted = [("o/old", [runAt("2026-01-01T00:00:00Z")]),
+                    ("o/none", []),
+                    ("o/new", [runAt("2026-03-01T00:00:00Z")]),
+                    ("o/busy", [runAt("2025-01-01T00:00:00Z", "in_progress")])]
+    check(sortedByRecent(unsorted).map { $0.0 } == ["o/busy", "o/new", "o/old", "o/none"], "recent sort order")
 
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
@@ -1110,18 +1137,12 @@ class RunRow: NSView {
         trackingArea = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
         addTrackingArea(trackingArea!)
     }
-    override func mouseEntered(with event: NSEvent) {
+    // Scrolling moves rows under a still pointer, so hover follows the real pointer position.
+    override func mouseEntered(with event: NSEvent) { animateHover() }
+    override func mouseExited(with event: NSEvent) { animateHover() }
+    func animateHover() {
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            ctx.allowsImplicitAnimation = true
-            layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor
-        }
-    }
-    override func mouseExited(with event: NSEvent) {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15
-            ctx.allowsImplicitAnimation = true
-            layer?.backgroundColor = restingColor
+            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; syncHover()
         }
     }
     override func mouseDown(with event: NSEvent) {
@@ -1135,6 +1156,13 @@ class RunRow: NSView {
         guard bounds.contains(loc) else { return }
         for sub in subviews where sub is NSButton { if sub.frame.contains(loc) { return } }
         onToggle?()
+    }
+
+    func syncHover() {
+        guard let win = window else { return }
+        // visibleRect can extend past the row, so intersect it with bounds.
+        let inside = bounds.intersection(visibleRect).contains(convert(win.mouseLocationOutsideOfEventStream, from: nil))
+        layer?.backgroundColor = inside ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor : restingColor
     }
 
     // Keyboard accessibility
@@ -1313,17 +1341,23 @@ class RunDetailView: Flipped {
 
 class PRRow: NSView {
     let urlStr: String
+    let expanded: Bool
     var onToggle: (() -> Void)?
     var trackingArea: NSTrackingArea?
 
     init(_ pr: PR, repo: String, w: CGFloat, expanded: Bool) {
         self.urlStr = pr.url
+        self.expanded = expanded
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: PR_ROW_H))
         wantsLayer = true
-        if expanded { layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.1).cgColor }
+        layer?.backgroundColor = restingColor
         build(pr, repo: repo, w: w)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    var restingColor: CGColor? {
+        expanded ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.1).cgColor : nil
+    }
 
     func build(_ pr: PR, repo: String, w: CGFloat) {
         let pad: CGFloat = 12, iconSz: CGFloat = 20
@@ -1427,15 +1461,11 @@ class PRRow: NSView {
         trackingArea = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
         addTrackingArea(trackingArea!)
     }
-    override func mouseEntered(with event: NSEvent) {
+    override func mouseEntered(with event: NSEvent) { animateHover() }
+    override func mouseExited(with event: NSEvent) { animateHover() }
+    func animateHover() {
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true
-            layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor
-        }
-    }
-    override func mouseExited(with event: NSEvent) {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; layer?.backgroundColor = nil
+            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; syncHover()
         }
     }
     override func mouseDown(with event: NSEvent) {
@@ -1443,12 +1473,19 @@ class PRRow: NSView {
     }
     override func mouseUp(with event: NSEvent) {
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; layer?.backgroundColor = nil
+            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; layer?.backgroundColor = restingColor
         }
         let loc = convert(event.locationInWindow, from: nil)
         guard bounds.contains(loc) else { return }
         for sub in subviews where sub is NSButton { if sub.frame.contains(loc) { return } }
         onToggle?()
+    }
+
+    func syncHover() {
+        guard let win = window else { return }
+        // visibleRect can extend past the row, so intersect it with bounds.
+        let inside = bounds.intersection(visibleRect).contains(convert(win.mouseLocationOutsideOfEventStream, from: nil))
+        layer?.backgroundColor = inside ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor : restingColor
     }
 
     // Keyboard accessibility
@@ -1618,12 +1655,18 @@ class PRDetailView: NSView {
 // ─── Shared Views ────────────────────────────────────────────────────────────
 
 class Badge: NSView {
-    let text: String
     init(_ text: String, maxWidth: CGFloat = .greatestFiniteMagnitude) {
-        self.text = text
-        let a: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)]
-        let sz = (text as NSString).size(withAttributes: a)
-        super.init(frame: NSRect(x: 0, y: 0, width: min(sz.width + 14, maxWidth), height: 20))
+        let l = NSTextField(labelWithString: text)
+        l.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
+        l.textColor = .secondaryLabelColor
+        l.alignment = .center
+        l.lineBreakMode = .byTruncatingMiddle
+        l.maximumNumberOfLines = 1
+        let sz = l.intrinsicContentSize
+        let w = min(ceil(sz.width) + 14, maxWidth)
+        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 20))
+        l.frame = NSRect(x: 7, y: (20 - sz.height) / 2, width: w - 14, height: sz.height)
+        addSubview(l)
         toolTip = text
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -1634,18 +1677,6 @@ class Badge: NSView {
         // dark fill in light mode, light fill in dark mode.
         NSColor.labelColor.withAlphaComponent(0.08).setFill(); p.fill()
         NSColor.separatorColor.setStroke(); p.lineWidth = 0.5; p.stroke()
-        // Middle truncation keeps both ends of long branch names readable.
-        let ps = NSMutableParagraphStyle()
-        ps.lineBreakMode = .byTruncatingMiddle; ps.alignment = .center
-        let a: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .medium),
-            .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: ps,
-        ]
-        let sz = (text as NSString).size(withAttributes: a)
-        let textRect = NSRect(x: 7, y: (bounds.height - sz.height) / 2,
-                              width: bounds.width - 14, height: sz.height)
-        (text as NSString).draw(in: textRect, withAttributes: a)
     }
 }
 
@@ -1956,6 +1987,14 @@ class TabVC: NSViewController {
             cb.frame = NSRect(x: 246, y: 8, width: 104, height: 20)
             cb.toolTip = "Hide workflow runs from branches other than main or develop"
             topBar.addSubview(cb)
+
+            let sortCB = NSButton(checkboxWithTitle: "Recent first",
+                                  target: self, action: #selector(toggleSortByRecent(_:)))
+            sortCB.font = .systemFont(ofSize: 11)
+            sortCB.state = SORT_BY_RECENT ? .on : .off
+            sortCB.frame = NSRect(x: 352, y: 8, width: 100, height: 20)
+            sortCB.toolTip = "Show repos with the newest runs at the top"
+            topBar.addSubview(sortCB)
         }
 
         let repoFilter = NSPopUpButton(frame: NSRect(x: w - 200, y: 6, width: 188, height: 24), pullsDown: false)
@@ -1980,6 +2019,9 @@ class TabVC: NSViewController {
         doc.wantsLayer = true
         doc.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.85).cgColor
         scrollView.documentView = doc
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(scrolled),
+                                               name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
         container.addSubview(scrollView)
 
         container.addSubview(footer)
@@ -2023,8 +2065,8 @@ class TabVC: NSViewController {
     }
 
     func filteredGrouped() -> [(String, [Run])] {
-        guard let sel = selectedRepo else { return grouped }
-        return grouped.filter { $0.0 == sel }
+        let data = selectedRepo.map { sel in grouped.filter { $0.0 == sel } } ?? grouped
+        return SORT_BY_RECENT ? sortedByRecent(data) : data
     }
 
     func filteredPRs() -> [(String, [PR])] {
@@ -2218,6 +2260,19 @@ class TabVC: NSViewController {
         appDel?.updateIcon()
         // Cadence follows visibility too, so filtering a branch out stops the fast poll.
         appDel?.scheduleTimer()
+    }
+
+    @objc func scrolled(_ note: Notification) {
+                for row in doc.subviews {
+            (row as? RunRow)?.syncHover()
+            (row as? PRRow)?.syncHover()
+        }
+    }
+
+    @objc func toggleSortByRecent(_ sender: NSButton) {
+        SORT_BY_RECENT = (sender.state == .on)
+        saveConfig(repos: REPOS)
+        rebuildContent()
     }
 
     @objc func repoChanged(_ sender: NSPopUpButton) {

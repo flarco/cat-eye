@@ -921,6 +921,11 @@ func runSelfTest() {
     let q = WriteQuota(rowsToday: 40_000, now: noon)
     check(q.projected == 80_000 && q.warn, "quota projection \(q.projected)")
     check(!WriteQuota(rowsToday: 1_000, now: noon).warn, "quota no warning")
+    let repos = ["O/Hooked", "O/Bare", "O/Denied", "O/Waiting"]
+    let sts: [String: HookStatus] = ["O/Denied": .pollingOnly("x"), "O/Waiting": .waiting]
+    check(RelayDeployer.unhooked(repos, hooked: nil, statuses: sts).isEmpty, "unhooked unknown before health")
+    check(RelayDeployer.unhooked(repos, hooked: ["o/hooked", "o/denied"], statuses: sts) == ["O/Bare", "O/Denied"],
+          "unhooked repos")
 
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
@@ -2438,7 +2443,11 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var timer: Timer?
+    var fallbackTimer: Timer?
+    var lastFallbackPRRefresh = Date.distantPast
     var isPulsing = false
+    struct IconKey: Equatable { let color: NSColor; let badge: String?; let active: Bool }
+    var iconKey: IconKey?
     var refreshInFlight = false
     var pendingCompletion: (() -> Void)?
     var lastPRRefresh = Date.distantPast
@@ -2583,8 +2592,10 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     // MARK: - Polling
 
     func scheduleTimer() {
-        timer?.invalidate()
-        guard !REPOS.isEmpty else { return }
+        guard !REPOS.isEmpty else {
+            timer?.invalidate(); fallbackTimer?.invalidate()
+            return
+        }
         // The fast cadence exists for the person reading the popover. With it shut,
         // the menu bar icon only has to be roughly right, and 10s polling through a
         // long CI run cost a measured 1,148 REST calls/hour — 23% of the GitHub
@@ -2594,15 +2605,47 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         if relay.isHealthy {
             interval = RELAY.reconcileInterval ?? 600
         } else {
-            interval = (popover.isShown && hasActive(visibleGrouped(grouped))) ? POLL_ACTIVE : POLL_NORMAL
+            interval = pollInterval(grouped)
         }
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.refresh()
-            if self?.relay.isHealthy == true { self?.relay.sync() }
+        // Each refresh calls this. Keep a timer with the same interval, or frequent
+        // refreshes push the reconcile out forever.
+        if timer?.isValid != true || timer?.timeInterval != interval {
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+                self?.refresh()
+                if self?.relay.isHealthy == true { self?.relay.sync() }
+            }
+            // Generous tolerance lets the system coalesce wakeups (and App Nap us)
+            // instead of firing on an exact-deadline timer.
+            timer?.tolerance = interval * 0.2
         }
-        // Generous tolerance lets the system coalesce wakeups (and App Nap us)
-        // instead of firing on an exact-deadline timer.
-        timer?.tolerance = interval * 0.2
+        scheduleFallbackTimer()
+    }
+
+    func pollInterval(_ g: [(String, [Run])]) -> TimeInterval {
+        (popover.isShown && hasActive(visibleGrouped(g))) ? POLL_ACTIVE : POLL_NORMAL
+    }
+
+    // Repos without a webhook get no relay events. Poll them at the normal cadence.
+    func scheduleFallbackTimer() {
+        let repos = relay.isHealthy ? relayDeployer.unhookedRepos(REPOS) : []
+        guard !repos.isEmpty else {
+            fallbackTimer?.invalidate(); fallbackTimer = nil
+            return
+        }
+        let interval = pollInterval(grouped.filter { repos.contains($0.0) })
+        guard fallbackTimer?.isValid != true || fallbackTimer?.timeInterval != interval else { return }
+        fallbackTimer?.invalidate()
+        log.info("Polling \(repos.count, privacy: .public) repos without a webhook every \(Int(interval), privacy: .public)s")
+        fallbackTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let repos = self.relayDeployer.unhookedRepos(REPOS)
+            guard !repos.isEmpty else { return }
+            let prs = Date().timeIntervalSince(self.lastFallbackPRRefresh) >= POLL_NORMAL * 0.9
+            if prs { self.lastFallbackPRRefresh = Date() }
+            self.refreshRepos(repos, includePRs: prs, completedRuns: []) { _ in }
+        }
+        fallbackTimer?.tolerance = interval * 0.2
     }
 
     func refresh(force: Bool = false, completion: (() -> Void)? = nil) {
@@ -2756,7 +2799,9 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             let removed = previous.filter { !REPOS.contains($0) }
             if !added.isEmpty {
                 let d = relayDeployer
-                d.perform("Install webhooks for new repos", { d.installHooks(repos: added) })
+                d.perform("Install webhooks for new repos", { d.installHooks(repos: added) }) { [weak self] _ in
+                    d.refreshHookedRepos { self?.scheduleTimer() }
+                }
             }
             relayDeployer.pruneHooks(removed: removed)
         }
@@ -2780,17 +2825,19 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     func updateIcon() {
         let shown = visibleGrouped(grouped)
         let (color, badge, label) = overallStatus(shown)
+        let active = hasActive(shown)
         statusItem.button?.toolTip = "Cat Eye \u{2014} \(label)"
-        if hasActive(shown) { startAnimation(color, badge: badge) }
-        else {
-            stopAnimation()
-            statusItem.button?.image = statusBadgedIcon(ghIcon, color: color, badge: badge)
-        }
+        // Setting the image redraws the item on each display, which fires the appearance
+        // observer again. Without this check the two loop and use a full CPU core.
+        let key = IconKey(color: color, badge: badge, active: active)
+        guard key != iconKey else { return }
+        iconKey = key
+        statusItem.button?.image = statusBadgedIcon(ghIcon, color: color, badge: badge)
+        if active { startAnimation() } else { stopAnimation() }
     }
 
-    func startAnimation(_ color: NSColor, badge: String?) {
+    func startAnimation() {
         guard let btn = statusItem.button else { return }
-        btn.image = statusBadgedIcon(ghIcon, color: color, badge: badge)
         guard !isPulsing else { return }
         isPulsing = true
         // Breathing pulse via Core Animation: runs entirely in the render server,
@@ -2926,6 +2973,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.applySystemAppearance()
+            self.iconKey = nil
             self.updateIcon()
             // Discard the stale view tree (its CGColors are baked in the OLD appearance).
             // Next show reconstructs under the new drawing context.
@@ -3001,6 +3049,7 @@ extension GHActionsBar: RelaySink {
 
     func relayStateChanged() {
         scheduleTimer()
+        if relay.state == .live { relayDeployer.refreshHookedRepos { [weak self] in self?.scheduleTimer() } }
         (popover?.contentViewController as? RelaySettingsVC)?.rebuild()
     }
 }

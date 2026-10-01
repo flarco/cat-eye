@@ -666,6 +666,34 @@ final class RelayDeployer {
         return false
     }
 
+    // Repos with a hook on the relay. Nil until the first health read. Main thread only.
+    private(set) var hookedRepos: Set<String>?
+
+    func refreshHookedRepos(done: @escaping () -> Void) {
+        let api = self.api
+        work.async {
+            guard case .success(let h) = api.health() else { return }
+            let hooked = Set(h.hooks.filter { $0.hookId != nil }.map { $0.repo })
+            DispatchQueue.main.async { self.hookedRepos = hooked; done() }
+        }
+    }
+
+    // Repos that get no webhook events, so they still need the normal poll.
+    func unhookedRepos(_ repos: [String]) -> [String] {
+        Self.unhooked(repos, hooked: hookedRepos, statuses: hooks.statuses)
+    }
+
+    static func unhooked(_ repos: [String], hooked: Set<String>?, statuses: [String: HookStatus]) -> [String] {
+        guard let hooked = hooked else { return [] }
+        return repos.filter {
+            switch statuses[$0] {
+            case .pollingOnly?, .error?: return true
+            case .live?, .waiting?: return false
+            default: return !hooked.contains($0.lowercased())
+            }
+        }
+    }
+
     func registerRepos() {
         let api = self.api, repos = REPOS
         work.async { _ = api.registerSelf(name: Host.current().localizedName ?? "Mac", repos: repos) }

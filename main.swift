@@ -123,7 +123,33 @@ struct Run: Decodable {
     let number: Int
     let workflowName: String?
     let actorLogin: String?
+    var attempt: Int? = nil
+
+    var isFailure: Bool { status == "completed" && conclusion == "failure" }
 }
+
+// Failed runs the user chose to ignore. They do not turn the menu bar icon red.
+// The key holds the attempt, so a re-run that fails again shows red again.
+final class IgnoredFailures {
+    private let defaultsKey = "ignoredFailures"
+    private var keys: [String]
+
+    init() { keys = UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [] }
+
+    static func key(_ r: Run) -> String { "\(r.url)#\(r.attempt ?? 1)" }
+
+    func contains(_ r: Run) -> Bool { keys.contains(IgnoredFailures.key(r)) }
+
+    func set(_ runs: [Run], ignored: Bool) {
+        let ks = runs.map(IgnoredFailures.key)
+        keys.removeAll { ks.contains($0) }
+        if ignored { keys += ks }
+        keys = Array(keys.suffix(500))
+        UserDefaults.standard.set(keys, forKey: defaultsKey)
+    }
+}
+
+let IGNORED = IgnoredFailures()
 
 struct PRAuthor: Decodable { let login: String }
 struct PRLabel: Decodable { let name: String; let color: String? }
@@ -284,7 +310,7 @@ func ghStr(_ args: String...) -> String? {
     } catch { return nil }
 }
 
-let RUN_JQ = "{id, name, displayTitle: .display_title, status, conclusion, headBranch: .head_branch, headSha: .head_sha, event, url: .html_url, updatedAt: .updated_at, createdAt: .created_at, startedAt: .run_started_at, number: .run_number, workflowName: .name, actorLogin: .actor.login}"
+let RUN_JQ = "{id, name, displayTitle: .display_title, status, conclusion, headBranch: .head_branch, headSha: .head_sha, event, url: .html_url, updatedAt: .updated_at, createdAt: .created_at, startedAt: .run_started_at, number: .run_number, workflowName: .name, actorLogin: .actor.login, attempt: .run_attempt}"
 
 // nil means the fetch failed, which a targeted refresh must not treat as "no runs".
 func fetchRuns(repo: String) -> [Run]? {
@@ -532,7 +558,7 @@ func overallStatus(_ g: [(String, [Run])]) -> (color: NSColor, badge: String?, l
         let wf = ($0.workflowName ?? $0.name).lowercased()
         return wf.contains("deploy") || wf.contains("smoke")
     }
-    if let top = (key.isEmpty ? all : key).first, top.conclusion == "failure" {
+    if let top = (key.isEmpty ? all : key).first, top.isFailure, !IGNORED.contains(top) {
         return (C_FAILURE, "xmark.circle.fill", "Run failed")
     }
     return (C_SUCCESS, "checkmark.circle.fill", "All runs passing")
@@ -847,6 +873,17 @@ func runSelfTest() {
             updatedAt: "", createdAt: "", startedAt: nil, number: 1,
             workflowName: "ci", actorLogin: nil)
     }
+    let bad = Run(id: 2, name: "ci", displayTitle: "t", status: "completed",
+                  conclusion: "failure", headBranch: "main", headSha: "s", event: "push", url: "u/selftest-ignore",
+                  updatedAt: "", createdAt: "", startedAt: nil, number: 2, workflowName: "ci", actorLogin: nil, attempt: 1)
+    check(overallStatus([("o/r", [bad])]).color == C_FAILURE, "failed run turns the icon red")
+    IGNORED.set([bad], ignored: true)
+    check(overallStatus([("o/r", [bad])]).color == C_SUCCESS, "ignored failure does not turn the icon red")
+    var again = bad; again.attempt = 2
+    check(!IGNORED.contains(again), "a new attempt is not ignored")
+    IGNORED.set([bad], ignored: false)
+    check(Badge("main", maxChars: 15).subviews.compactMap { $0 as? NSTextField }.first?.stringValue == "main", "short branch is not cut")
+    check(Badge("dependabot/npm/lodash-4.17", maxChars: 15).subviews.compactMap { $0 as? NSTextField }.first?.stringValue == "dependa\u{2026}sh-4.17", "long branch keeps both ends")
     let g = [("o/r", [run("feature-x", "in_progress"), run("main", "completed")])]
     FILTER_DEFAULT_BRANCHES = false
     check(hasActive(visibleGrouped(g)), "unfiltered: feature-branch run is active")
@@ -1081,13 +1118,17 @@ final class RateLimitMonitor {
 
 class RunRow: NSView {
     let urlStr: String
+    let repo: String
+    let group: [Run]
     let expanded: Bool
     var onToggle: (() -> Void)?
     var trackingArea: NSTrackingArea?
 
-    init(group: [Run], history: [Run], w: CGFloat, expanded: Bool = false) {
+    init(repo: String, group: [Run], history: [Run], w: CGFloat, expanded: Bool = false) {
         let primary = RunRow.pickPrimary(group)
         self.urlStr = primary.url
+        self.repo = repo
+        self.group = group
         self.expanded = expanded
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: ROW_H))
         wantsLayer = true
@@ -1106,7 +1147,7 @@ class RunRow: NSView {
         let inProg = group.filter { $0.status == "in_progress" }
         if let r = inProg.max(by: { runElapsed($0) < runElapsed($1) }) { return r }
         if let r = group.first(where: { $0.status == "queued" }) { return r }
-        if let r = group.first(where: { $0.status == "completed" && $0.conclusion == "failure" }) { return r }
+        if let r = group.first(where: { $0.isFailure && !IGNORED.contains($0) }) { return r }
         return group[0]
     }
 
@@ -1118,9 +1159,10 @@ class RunRow: NSView {
         let textW = rightX - textX - 8     // leave 8px gap before the right column
 
         let iv = NSImageView(frame: NSRect(x: pad, y: (ROW_H - iconSz) / 2, width: iconSz, height: iconSz))
-        let statusDesc = statusText(primary)
+        let ignored = IGNORED.contains(primary)
+        let statusDesc = statusText(primary) + (ignored ? " (ignored)" : "")
         if let img = NSImage(systemSymbolName: sfName(primary), accessibilityDescription: statusDesc) {
-            iv.image = img; iv.contentTintColor = sfColor(primary)
+            iv.image = img; iv.contentTintColor = ignored ? .systemGray : sfColor(primary)
             iv.symbolConfiguration = .init(pointSize: 14, weight: .semibold)
         }
         iv.toolTip = statusDesc
@@ -1148,9 +1190,9 @@ class RunRow: NSView {
         }
 
         if !primary.headBranch.isEmpty {
-            // Branch gets its own badge: middle truncation keeps both ends of long
-            // dependabot-style names visible, and the tooltip shows the full name.
-            let bb = Badge(primary.headBranch, maxWidth: 200)
+            // Branch gets its own badge. Names over 15 characters keep both ends,
+            // and the tooltip shows the full name.
+            let bb = Badge(primary.headBranch, maxChars: 15)
             bb.frame.origin = NSPoint(x: subX, y: 4)
             addSubview(bb)
             subX += bb.frame.width + 6
@@ -1212,8 +1254,8 @@ class RunRow: NSView {
             }
             // Spell out non-success outcomes so state is readable without colour.
             let concl = primary.conclusion ?? ""
-            let word: String? = ["failure": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"][concl]
-            let failed = concl == "failure"
+            let word: String? = ignored ? "Ignored" : ["failure": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"][concl]
+            let failed = concl == "failure" && !ignored
             let dur = lbl(word.map { "\($0) \u{00B7} \(durText)" } ?? durText,
                           .systemFont(ofSize: 10, weight: failed ? .semibold : .regular),
                           failed ? C_FAILURE : .secondaryLabelColor)
@@ -1240,6 +1282,49 @@ class RunRow: NSView {
     }
 
     @objc func openURL() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
+
+    // Right-click menu. Only completed runs can be re-run.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let m = NSMenu()
+        let done = group.filter { $0.status == "completed" }
+        let failed = group.filter { $0.isFailure }
+        func item(_ title: String, _ action: Selector, _ runs: [Run], into menu: NSMenu? = nil) {
+            let i = NSMenuItem(title: title, action: runs.isEmpty ? nil : action, keyEquivalent: "")
+            i.target = self; i.representedObject = runs
+            (menu ?? m).addItem(i)
+        }
+        if group.count > 1 {
+            item("Re-run all workflows", #selector(rerun(_:)), done)
+            item("Re-run failed jobs", #selector(rerunFailed(_:)), failed)
+            let one = NSMenu()
+            for r in group {
+                let wf = r.workflowName ?? r.name
+                item("\(wf) #\(r.number)", #selector(rerun(_:)), r.status == "completed" ? [r] : [], into: one)
+                if r.isFailure { item("\(wf) #\(r.number): failed jobs", #selector(rerunFailed(_:)), [r], into: one) }
+            }
+            let sub = NSMenuItem(title: "Re-run one workflow", action: nil, keyEquivalent: "")
+            sub.submenu = one
+            m.addItem(sub)
+        } else {
+            item("Re-run workflow", #selector(rerun(_:)), done)
+            item("Re-run failed jobs", #selector(rerunFailed(_:)), failed)
+        }
+        m.addItem(.separator())
+        let allIgnored = !failed.isEmpty && failed.allSatisfy { IGNORED.contains($0) }
+        item(allIgnored ? "Stop ignoring failure" : "Ignore failure", #selector(toggleIgnore(_:)), failed)
+        m.addItem(.separator())
+        item("Open on GitHub", #selector(openURL), group)
+        item("Copy URL", #selector(copyURL(_:)), group)
+        return m
+    }
+
+    @objc func rerun(_ sender: NSMenuItem) { app?.rerun(repo: repo, runs: sender.representedObject as? [Run] ?? [], failedOnly: false) }
+    @objc func rerunFailed(_ sender: NSMenuItem) { app?.rerun(repo: repo, runs: sender.representedObject as? [Run] ?? [], failedOnly: true) }
+    @objc func toggleIgnore(_ sender: NSMenuItem) {
+        let runs = sender.representedObject as? [Run] ?? []
+        app?.setIgnored(runs, ignored: !runs.allSatisfy { IGNORED.contains($0) })
+    }
+    var app: GHActionsBar? { NSApp.delegate as? GHActionsBar }
 
     func lbl(_ text: String, _ font: NSFont, _ color: NSColor = .labelColor) -> NSTextField {
         let l = NSTextField(labelWithString: text)
@@ -1548,8 +1633,8 @@ class PRRow: NSView {
         sub.lineBreakMode = .byTruncatingTail; sub.maximumNumberOfLines = 1
         addSubview(sub)
 
-        // Branch badge — middle truncation + tooltip instead of a hard prefix cut
-        let badge = Badge(pr.headRefName, maxWidth: textW * 0.5 - 8)
+        // Branch badge: names over 15 characters keep both ends, the tooltip shows the full name
+        let badge = Badge(pr.headRefName, maxChars: 15, maxWidth: textW * 0.5 - 8)
         badge.frame.origin = NSPoint(x: textX + textW * 0.5, y: 8)
         addSubview(badge)
 
@@ -1805,15 +1890,20 @@ class PRDetailView: NSView {
 // ─── Shared Views ────────────────────────────────────────────────────────────
 
 class Badge: NSView {
-    init(_ text: String, maxWidth: CGFloat = .greatestFiniteMagnitude) {
-        let l = NSTextField(labelWithString: text)
+    /// Text longer than `maxChars` keeps its first and last characters around an ellipsis.
+    init(_ text: String, maxChars: Int = .max, maxWidth: CGFloat = .greatestFiniteMagnitude) {
+        let half = (maxChars - 1) / 2
+        let shown = text.count > maxChars ? "\(text.prefix(half))\u{2026}\(text.suffix(half))" : text
+        let l = NSTextField(labelWithString: shown)
         l.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
         l.textColor = .secondaryLabelColor
         l.alignment = .center
         l.lineBreakMode = .byTruncatingMiddle
         l.maximumNumberOfLines = 1
+        // The label cell needs a few points more than its intrinsic width, or it truncates.
         let sz = l.intrinsicContentSize
-        let w = min(ceil(sz.width) + 14, maxWidth)
+        let textW = ceil(sz.width) + 4
+        let w = min(textW + 14, maxWidth)
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: 20))
         l.frame = NSRect(x: 7, y: (20 - sz.height) / 2, width: w - 14, height: sz.height)
         addSubview(l)
@@ -2285,7 +2375,7 @@ class TabVC: NSViewController {
                     let primary = RunRow.pickPrimary(group)
                     let key = primary.url
                     let isExpanded = expandedRun == key
-                    let row = RunRow(group: group, history: visible, w: w, expanded: isExpanded)
+                    let row = RunRow(repo: repo, group: group, history: visible, w: w, expanded: isExpanded)
                     row.onToggle = { [weak self] in
                         guard let self = self else { return }
                         self.expandedRun = self.expandedRun == key ? nil : key
@@ -2940,6 +3030,44 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         guard isPulsing else { return }
         isPulsing = false
         statusItem.button?.layer?.removeAnimation(forKey: "cat-eye.pulse")
+    }
+
+    // MARK: - Run actions
+
+    func rerun(repo: String, runs: [Run], failedOnly: Bool) {
+        guard !runs.isEmpty else { return }
+        let endpoint = failedOnly ? "rerun-failed-jobs" : "rerun"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let errors = runs.compactMap { r -> String? in
+                let res = try? ghRun(["api", "-X", "POST", "repos/\(repo)/actions/runs/\(r.id)/\(endpoint)"])
+                return res?.ok == true ? nil : "\(r.workflowName ?? r.name): \(res?.err ?? "gh did not run")"
+            }
+            DispatchQueue.main.async {
+                if errors.isEmpty {
+                    log.info("Re-run (\(endpoint)) requested for \(runs.count) run(s) in \(repo)")
+                } else {
+                    log.error("Re-run failed in \(repo): \(errors.joined(separator: "; "))")
+                    self.notify(title: repo, subtitle: "Re-run failed", body: errors.joined(separator: "\n"),
+                                id: "rerun-\(UUID().uuidString)")
+                }
+                // GitHub queues the new attempt a moment after the request.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self.refreshRepos([repo], includePRs: false, completedRuns: []) { _ in self.reloadList() }
+                }
+            }
+        }
+    }
+
+    func setIgnored(_ runs: [Run], ignored: Bool) {
+        IGNORED.set(runs, ignored: ignored)
+        updateIcon()
+        (popover.contentViewController as? TabVC)?.rebuildContent()
+    }
+
+    // The run list holds a snapshot of the data, so show fresh data with a new list.
+    func reloadList() {
+        guard popover.isShown, popover.contentViewController is TabVC else { return }
+        buildWithAppearance { popover.contentViewController = makeTabVC() }
     }
 
     // MARK: - Notifications

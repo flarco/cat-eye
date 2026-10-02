@@ -25,7 +25,7 @@ Cat Eye is built on three principles:
 - **Per-run details** — workflow name, run number, branch badge, timestamps, and duration
 - **Expandable run rows** — click a run to expand it inline: failed runs show the exact failure annotations (job/step + message), successful runs show the full commit message and durations, in-progress runs show live elapsed time and per-workflow status
 - **Calculated ETA** — estimates remaining time for running actions based on historical durations
-- **macOS notifications** — alerts when actions start, pass, or fail — click the notification to open the popover
+- **macOS notifications** — alerts for the run events you choose: starts, passes, failures, cancellations, and other endings — click a notification to open the popover
 
 ### Pull Requests Tab
 - **Review queue** — shows PRs where your review is requested, across all tracked repos
@@ -154,7 +154,14 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
     "pollInterval": 30,
     "pollActiveInterval": 10,
     "runsPerRepo": 10,
-    "filterDefaultBranches": false
+    "filterDefaultBranches": false,
+    "notifications": {
+        "started": true,
+        "succeeded": true,
+        "failed": true,
+        "cancelled": true,
+        "other": true
+    }
 }
 ```
 
@@ -169,6 +176,7 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `oneRowPerWorkflow` | `true` | Show only the latest run of each workflow on each branch |
 | `repoColors` | (set by the app) | The palette slot (0–11) of each repo chip. The app gives each new repo the least used slot. Change a number to change a color |
 | `autoUpdate` | `true` | Install new releases automatically, written by **Settings → Updates** |
+| `notifications` | all `true` | macOS notification switches in **Settings → Notifications**. `failed` includes timeouts and startup failures; `other` covers skipped and other completed conclusions |
 | `relay` | none | Live updates settings, written by **Settings → Live updates** (see below) |
 
 ## Updates

@@ -17,6 +17,29 @@ struct AppConfig: Codable {
     var repoColors: [String: Int]?
     var autoUpdate: Bool?
     var relay: RelayConfig?
+    var notifications: NotificationSettings?
+}
+
+// Which transition events create macOS notifications. Omitted legacy config
+// fields keep the previous behavior: notify for every start and completion.
+struct NotificationSettings: Codable {
+    var started = true
+    var succeeded = true
+    var failed = true
+    var cancelled = true
+    var other = true
+
+    init() {}
+
+    // Hand-written config files may omit individual switches.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? true
+        succeeded = try c.decodeIfPresent(Bool.self, forKey: .succeeded) ?? true
+        failed = try c.decodeIfPresent(Bool.self, forKey: .failed) ?? true
+        cancelled = try c.decodeIfPresent(Bool.self, forKey: .cancelled) ?? true
+        other = try c.decodeIfPresent(Bool.self, forKey: .other) ?? true
+    }
 }
 
 let CONFIG_DIR  = NSString(string: "~/.config/cat-eye").expandingTildeInPath
@@ -35,6 +58,7 @@ var SORT_BY_RECENT: Bool = true
 var ONE_ROW_PER_WORKFLOW: Bool = true
 var REPO_COLORS: [String: Int] = [:]
 var AUTO_UPDATE: Bool = true
+var NOTIFICATIONS = NotificationSettings()
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
 let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -59,6 +83,7 @@ func loadConfig() {
     ONE_ROW_PER_WORKFLOW = c.oneRowPerWorkflow ?? true
     REPO_COLORS = c.repoColors ?? [:]
     AUTO_UPDATE = c.autoUpdate ?? true
+    if let n = c.notifications { NOTIFICATIONS = n }
     if let r = c.relay { RELAY = r }
 }
 
@@ -69,7 +94,8 @@ func saveConfig() {
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
                       oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW,
-                      repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE, relay: RELAY)
+                      repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE,
+                      relay: RELAY, notifications: NOTIFICATIONS)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
@@ -3313,13 +3339,16 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 let wf = run.workflowName ?? run.name
                 if run.status == "in_progress" && old != "in_progress" {
                     log.info("Transition: \(wf) on \(run.headBranch) → in_progress (was \(old ?? "new"))")
-                    notify(title: repo, subtitle: "\u{25B6}\u{FE0F} Action Started", body: "\(wf) on \(run.headBranch)", id: "start-\(run.url)")
+                    if NOTIFICATIONS.started {
+                        notify(title: repo, subtitle: "\u{25B6}\u{FE0F} Action Started", body: "\(wf) on \(run.headBranch)", id: "start-\(run.url)")
+                    }
                 }
                 if run.status == "completed" && (old == "in_progress" || old == "queued") {
-                    let ok = run.conclusion == "success"
                     log.info("Transition: \(wf) on \(run.headBranch) → \(run.conclusion ?? "unknown") (was \(old ?? "new"))")
-                    notify(title: repo, subtitle: ok ? "\u{2705} Action Passed" : "\u{274C} Action Failed",
-                           body: "\(wf) on \(run.headBranch) \u{2014} \(runDuration(run))", id: "end-\(run.url)")
+                    if let ending = notificationEnding(run) {
+                        notify(title: repo, subtitle: ending,
+                               body: "\(wf) on \(run.headBranch) \u{2014} \(runDuration(run))", id: "end-\(run.url)")
+                    }
                 }
             }
         }
@@ -3330,6 +3359,20 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             prevStatuses = [:]
         }
         for run in newRuns { prevStatuses[run.url] = run.status }
+    }
+
+    // Returns nil when the user has disabled notifications for this conclusion.
+    func notificationEnding(_ run: Run) -> String? {
+        switch run.conclusion ?? "" {
+        case "success":
+            return NOTIFICATIONS.succeeded ? "\u{2705} Action Passed" : nil
+        case "failure", "timed_out", "startup_failure":
+            return NOTIFICATIONS.failed ? "\u{274C} Action Failed" : nil
+        case "cancelled":
+            return NOTIFICATIONS.cancelled ? "\u{1F6AB} Action Cancelled" : nil
+        default:
+            return NOTIFICATIONS.other ? "\u{26AA} Action Completed" : nil
+        }
     }
 
     func notify(title: String, subtitle: String, body: String, id: String) {

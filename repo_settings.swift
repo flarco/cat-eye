@@ -77,6 +77,33 @@ final class SettingsVC: NSViewController {
         container.addSubview(dispRow); y += 36
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
+        // ── Notifications section ──
+        container.addSubview(SettingsHeader("NOTIFICATIONS", y: y, w: w)); y += 28
+        let notifyRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 36))
+        let notifyOptions: [(title: String, key: String, state: Bool)] = [
+            ("Started", "started", NOTIFICATIONS.started),
+            ("Passed", "succeeded", NOTIFICATIONS.succeeded),
+            ("Failed", "failed", NOTIFICATIONS.failed),
+            ("Cancelled", "cancelled", NOTIFICATIONS.cancelled),
+            ("Other endings", "other", NOTIFICATIONS.other),
+        ]
+        var notifyX: CGFloat = 16
+        for option in notifyOptions {
+            let cb = NSButton(checkboxWithTitle: option.title, target: self,
+                              action: #selector(toggleNotification(_:)))
+            cb.font = .systemFont(ofSize: 12)
+            cb.identifier = NSUserInterfaceItemIdentifier(option.key)
+            cb.state = option.state ? .on : .off
+            cb.sizeToFit()
+            cb.frame.origin = NSPoint(x: notifyX, y: 8)
+            if option.key == "failed" { cb.toolTip = "Failures, timeouts, and startup failures" }
+            if option.key == "other" { cb.toolTip = "Skipped and other completed conclusions" }
+            notifyRow.addSubview(cb)
+            notifyX += ceil(cb.frame.width) + 18
+        }
+        container.addSubview(notifyRow); y += 36
+        container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
+
         // ── Updates section ──
         container.addSubview(SettingsHeader("UPDATES", y: y, w: w)); y += 28
         let updRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
@@ -119,7 +146,8 @@ final class SettingsVC: NSViewController {
         refreshAllBtn = refreshBtn
         container.addSubview(repoHdr); y += 28
 
-        let scrollH: CGFloat = 320
+        // The notification switches add a row; keep the whole panel within its popover height.
+        let scrollH: CGFloat = 260
         let rd = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: scrollH))
         let rs = NSScrollView(frame: NSRect(x: 0, y: y, width: w, height: scrollH))
         rs.hasVerticalScroller = true; rs.drawsBackground = false
@@ -206,6 +234,19 @@ final class SettingsVC: NSViewController {
 
     @objc func toggleOneRow(_ sender: NSButton) {
         ONE_ROW_PER_WORKFLOW = sender.state == .on
+        saveConfig()
+    }
+
+    @objc func toggleNotification(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        switch sender.identifier?.rawValue {
+        case "started": NOTIFICATIONS.started = enabled
+        case "succeeded": NOTIFICATIONS.succeeded = enabled
+        case "failed": NOTIFICATIONS.failed = enabled
+        case "cancelled": NOTIFICATIONS.cancelled = enabled
+        case "other": NOTIFICATIONS.other = enabled
+        default: return
+        }
         saveConfig()
     }
 

@@ -348,8 +348,24 @@ struct RunFailure {
     let messages: [String]   // exact annotation messages from the checks API
 }
 
-struct RunJobStep: Decodable { let name: String; let conclusion: String? }
-struct RunJob: Decodable { let id: Int; let name: String; let conclusion: String?; let steps: [RunJobStep]? }
+struct RunJobStep: Decodable {
+    let name: String
+    let status: String?
+    let conclusion: String?
+    let startedAt: String?
+    let completedAt: String?
+}
+struct RunJob: Decodable {
+    let id: Int
+    let name: String
+    let status: String?
+    let conclusion: String?
+    let url: String?
+    let startedAt: String?
+    let completedAt: String?
+    let runnerName: String?
+    let steps: [RunJobStep]?
+}
 struct CheckAnnotation: Decodable {
     let message: String?
     let path: String?
@@ -360,6 +376,7 @@ struct CheckAnnotation: Decodable {
 // Lazily-fetched run detail data. Main-thread access only.
 var commitMsgCache: [String: String] = [:]       // head sha → full commit message
 var failureCache: [Int: [RunFailure]] = [:]      // run id → failure summaries (stable once completed)
+var jobsCache: [Int: (updatedAt: String, jobs: [RunJob])] = [:]  // run id → jobs at that run update
 var detailFetchInFlight = Set<String>()
 
 func fetchCommitMessage(repo: String, sha: String) -> String? {
@@ -370,13 +387,17 @@ func fetchCommitMessage(repo: String, sha: String) -> String? {
     return s
 }
 
-// The failure message GitHub shows in its annotations box: list the run's jobs,
-// and for each failed job pull its check-run annotations (a job's id IS its
-// check-run id) plus the name of the step that failed.
-func fetchRunFailures(repo: String, runId: Int) -> [RunFailure] {
-    let jq = "[.jobs[] | {id, name, conclusion, steps: [.steps[]? | {name, conclusion}]}]"
-    guard let data = ghShell("api", "repos/\(repo)/actions/runs/\(runId)/jobs?per_page=50", "--jq", jq),
-          let jobs = try? JSONDecoder().decode([RunJob].self, from: data) else { return [] }
+func fetchRunJobs(repo: String, runId: Int) -> [RunJob]? {
+    let step = "{name, status, conclusion, startedAt: .started_at, completedAt: .completed_at}"
+    let jq = "[.jobs[] | {id, name, status, conclusion, url: .html_url, startedAt: .started_at, " +
+        "completedAt: .completed_at, runnerName: .runner_name, steps: [.steps[]? | \(step)]}]"
+    guard let data = ghShell("api", "repos/\(repo)/actions/runs/\(runId)/jobs?per_page=100", "--jq", jq) else { return nil }
+    return try? JSONDecoder().decode([RunJob].self, from: data)
+}
+
+// The failure message GitHub shows in its annotations box: for each failed job, pull its
+// check-run annotations (a job's id IS its check-run id) plus the name of the step that failed.
+func fetchRunFailures(repo: String, jobs: [RunJob]) -> [RunFailure] {
     var out: [RunFailure] = []
     for job in jobs where job.conclusion == "failure" {
         if out.count >= 3 { break }
@@ -598,10 +619,24 @@ func visibleGrouped(_ g: [(String, [Run])]) -> [(String, [Run])] {
 }
 
 // Repos with an active run come first, then by newest visible run. Repos without runs go last.
-func sortedByRecent(_ g: [(String, [Run])]) -> [(String, [Run])] {
-    func latest(_ runs: [Run]) -> Date {
-        visibleRuns(runs).compactMap { parseISO($0.createdAt) }.max() ?? .distantPast
+// A running or queued run is active now. A finished run was last active when it completed.
+func lastActivity(_ r: Run) -> Date {
+    if r.status != "completed" { return Date() }
+    return parseISO(r.updatedAt) ?? parseISO(r.createdAt) ?? .distantPast
+}
+
+// Newest first, one run for each row. Active runs come first.
+func byLastActivity(_ runs: [Run]) -> [Run] {
+    runs.sorted { a, b in
+        let aActive = a.status != "completed", bActive = b.status != "completed"
+        if aActive != bActive { return aActive }
+        if aActive { return (parseISO(a.createdAt) ?? .distantPast) > (parseISO(b.createdAt) ?? .distantPast) }
+        return lastActivity(a) > lastActivity(b)
     }
+}
+
+func sortedByRecent(_ g: [(String, [Run])]) -> [(String, [Run])] {
+    func latest(_ runs: [Run]) -> Date { visibleRuns(runs).map(lastActivity).max() ?? .distantPast }
     let keyed = g.map { (repo: $0, active: hasActive([($0.0, visibleRuns($0.1))]), latest: latest($0.1)) }
     return keyed.sorted { a, b in
         if a.active != b.active { return a.active }
@@ -907,6 +942,18 @@ func runSelfTest() {
     }
     let rows = groupRuns([dispatch("Deploy", "s2"), dispatch("Deploy", "s1"), dispatch("Deploy", "s1"), dispatch("Build", "s1")])
     check(rows.map(\.count) == [1, 1, 2], "dispatches on other commits or of the same workflow get their own row")
+    func done(_ wf: String, _ created: String, _ updated: String) -> Run {
+        Run(id: 4, name: wf, displayTitle: "t", status: "completed", conclusion: "success",
+            headBranch: "main", headSha: "s", event: "push", url: "u/\(wf)",
+            updatedAt: updated, createdAt: created, startedAt: nil, number: 1, workflowName: wf, actorLogin: nil)
+    }
+    let order = byLastActivity([done("old", "2026-10-01T10:00:00Z", "2026-10-01T12:00:00Z"),
+                                done("new", "2026-10-01T11:00:00Z", "2026-10-01T11:30:00Z"),
+                                run("main", "in_progress")])
+    check(order.map { $0.workflowName ?? "" } == ["ci", "old", "new"], "recent first sorts by completion time, active on top")
+    let log = "2026-10-01T23:14:09.48Z FAIL\tpkg\t300s\n2026-10-01T23:14:11.29Z ##[error]Process completed with exit code 1.\n" +
+        "2026-10-01T23:14:11.32Z Post job cleanup.\n"
+    check(JobLogs.errorSnippet(log) == "FAIL\tpkg\t300s\n##[error]Process completed with exit code 1.", "log snippet ends at the error")
     let g = [("o/r", [run("feature-x", "in_progress"), run("main", "completed")])]
     FILTER_DEFAULT_BRANCHES = false
     check(hasActive(visibleGrouped(g)), "unfiltered: feature-branch run is active")
@@ -1535,7 +1582,12 @@ class RunDetailView: Flipped {
             st.alignment = .right
             st.frame = NSRect(x: pad + contentW - 150, y: y, width: 150, height: 15)
             addSubview(st)
+            let open = Clicker(run.url)
+            open.frame = NSRect(x: pad, y: y, width: contentW, height: 15)
+            open.toolTip = "Open the workflow run on GitHub"
+            addSubview(open)
             y += 18
+            y = layoutJobChips(run, repo: repo, x: pad + 19, y: y, w: contentW - 19)
         }
         if group.count > 8 {
             wrapped("+ \(group.count - 8) more workflows", .systemFont(ofSize: 10), .tertiaryLabelColor, maxH: 14)
@@ -1593,6 +1645,27 @@ class RunDetailView: Flipped {
     required init?(coder: NSCoder) { fatalError() }
 
     @objc func openGH() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
+
+    // Wraps the run's job chips in rows. Returns the y below the last row.
+    private func layoutJobChips(_ run: Run, repo: String, x: CGFloat, y: CGFloat, w: CGFloat) -> CGFloat {
+        guard let jobs = jobsCache[run.id]?.jobs else {
+            let l = NSTextField(labelWithString: "Loading jobs\u{2026}")
+            l.font = .systemFont(ofSize: 10); l.textColor = .tertiaryLabelColor
+            l.frame = NSRect(x: x, y: y, width: w, height: 14)
+            addSubview(l)
+            return y + 18
+        }
+        let notes = Dictionary((failureCache[run.id] ?? []).map { ($0.job, $0.messages) }, uniquingKeysWith: { a, _ in a })
+        var cx = x, cy = y
+        for job in jobs {
+            let chip = JobChip(job: job, notes: notes[job.name] ?? [], maxW: w)
+            if cx > x && cx + chip.frame.width > x + w { cx = x; cy += JobChip.height + 4 }
+            chip.frame.origin = NSPoint(x: cx, y: cy)
+            addSubview(chip)
+            cx += chip.frame.width + 4
+        }
+        return jobs.isEmpty ? y : cy + JobChip.height + 8
+    }
 }
 
 // ─── PR Row View ─────────────────────────────────────────────────────────────
@@ -2295,7 +2368,7 @@ class TabVC: NSViewController {
             sortCB.font = .systemFont(ofSize: 11)
             sortCB.state = SORT_BY_RECENT ? .on : .off
             sortCB.frame = NSRect(x: 352, y: 8, width: 100, height: 20)
-            sortCB.toolTip = "Show repos with the newest runs at the top"
+            sortCB.toolTip = "Show each run in its own row, newest first. Turn off to group the workflows of one commit."
             topBar.addSubview(sortCB)
         }
 
@@ -2403,7 +2476,7 @@ class TabVC: NSViewController {
                     if aActive != bActive { return aActive }
                     return false  // preserve API order otherwise
                 }
-                let groups = groupRuns(sorted)
+                let groups = SORT_BY_RECENT ? byLastActivity(visible).map { [$0] } : groupRuns(sorted)
                 for group in groups {
                     let primary = RunRow.pickPrimary(group)
                     let key = primary.url
@@ -2434,18 +2507,27 @@ class TabVC: NSViewController {
         let sha = primary.headSha
         let needMsg = !sha.isEmpty && commitMsgCache[sha] == nil
         let needFails = group.filter { $0.conclusion == "failure" && failureCache[$0.id] == nil }
-        guard needMsg || !needFails.isEmpty else { return }
+        let needJobs = group.filter { jobsCache[$0.id]?.updatedAt != $0.updatedAt }
+        guard needMsg || !needFails.isEmpty || !needJobs.isEmpty else { return }
         guard !detailFetchInFlight.contains(key) else { return }
         detailFetchInFlight.insert(key)
         let fallbackMsg = primary.displayTitle
+        let cachedJobs = jobsCache.mapValues(\.jobs)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let msg = needMsg ? fetchCommitMessage(repo: repo, sha: sha) : nil
+            var jobs: [(Run, [RunJob])] = []
+            for r in needJobs { if let j = fetchRunJobs(repo: repo, runId: r.id) { jobs.append((r, j)) } }
             var fails: [(Int, [RunFailure])] = []
-            for r in needFails { fails.append((r.id, fetchRunFailures(repo: repo, runId: r.id))) }
+            for r in needFails {
+                guard let j = jobs.first(where: { $0.0.id == r.id })?.1 ?? cachedJobs[r.id] else { continue }
+                fails.append((r.id, fetchRunFailures(repo: repo, jobs: j)))
+            }
             DispatchQueue.main.async {
                 if commitMsgCache.count > 300 { commitMsgCache.removeAll() }
                 if failureCache.count > 200 { failureCache.removeAll() }
+                if jobsCache.count > 200 { jobsCache.removeAll() }
                 if needMsg { commitMsgCache[sha] = msg ?? fallbackMsg }
+                for (r, j) in jobs { jobsCache[r.id] = (r.updatedAt, j) }
                 for (id, f) in fails { failureCache[id] = f }
                 detailFetchInFlight.remove(key)
                 guard let self = self, self.expandedRun == key else { return }

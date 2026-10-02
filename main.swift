@@ -1284,7 +1284,7 @@ class RunRow: NSView {
 
         if showRepo {
             let short = repo.components(separatedBy: "/").last ?? repo
-            let rb = Badge(short, maxChars: 15, tint: repoColor(repo))
+            let rb = Badge(short, maxChars: 22, tint: repoColor(repo))
             rb.toolTip = repo
             rb.frame.origin = NSPoint(x: subX, y: 4)
             addSubview(rb)

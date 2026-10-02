@@ -1286,24 +1286,24 @@ class RunRow: NSView {
 
         let anyActive = group.contains { $0.status == "in_progress" || $0.status == "queued" }
         if anyActive {
-            let elapsed = runElapsed(primary)
             let started = lbl(fmtStartedAt(startedISO), .systemFont(ofSize: 10.5), .secondaryLabelColor)
             started.alignment = .right
             started.frame = NSRect(x: rightX, y: ROW_H - 23, width: rightW, height: 14)
             addSubview(started)
 
-            let el = lbl("\(fmtDuration(elapsed)) elapsed",
-                         .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium), C_RUNNING)
+            let el = LiveLabel.make(.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium), C_RUNNING) {
+                "\(fmtDuration(runElapsed(primary))) elapsed"
+            }
             el.alignment = .right
             el.frame = NSRect(x: rightX, y: 22, width: rightW, height: 14)
             addSubview(el)
 
-            var etaText = "estimating..."
-            if let est = estimatedTotal(for: primary, history: history) {
-                let rem = max(0, est - elapsed)
-                etaText = rem > 0 ? "~\(fmtDuration(rem)) remaining" : "finishing..."
+            let est = estimatedTotal(for: primary, history: history)
+            let eta = LiveLabel.make(.monospacedDigitSystemFont(ofSize: 10, weight: .regular), .secondaryLabelColor) {
+                guard let est = est else { return "estimating..." }
+                let rem = max(0, est - runElapsed(primary))
+                return rem > 0 ? "~\(fmtDuration(rem)) remaining" : "finishing..."
             }
-            let eta = lbl(etaText, .systemFont(ofSize: 10), .secondaryLabelColor)
             eta.alignment = .right
             eta.frame = NSRect(x: rightX, y: 6, width: rightW, height: 14)
             addSubview(eta)
@@ -1512,13 +1512,15 @@ class RunDetailView: Flipped {
             y += h + 4
         }
 
-        func infoLine(_ name: String, _ value: String, _ valueColor: NSColor = .labelColor) {
+        func infoLine(_ name: String, _ value: @autoclosure @escaping () -> String, _ valueColor: NSColor = .labelColor,
+                      live: Bool = false) {
             let n = NSTextField(labelWithString: name)
             n.font = .systemFont(ofSize: 10.5); n.textColor = .tertiaryLabelColor
             n.frame = NSRect(x: pad, y: y, width: 80, height: 15)
             addSubview(n)
-            let v = NSTextField(labelWithString: value)
-            v.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .medium); v.textColor = valueColor
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
+            let v = live ? LiveLabel.make(font, valueColor, value) : NSTextField(labelWithString: value())
+            v.font = font; v.textColor = valueColor
             v.frame = NSRect(x: pad + 84, y: y, width: contentW - 84, height: 15)
             v.isSelectable = true
             addSubview(v)
@@ -1548,7 +1550,7 @@ class RunDetailView: Flipped {
             infoLine("Completed", timestampFmt.string(from: e))
             if let s = groupStart { infoLine("Duration", fmtDuration(e.timeIntervalSince(s))) }
         } else {
-            infoLine("Elapsed", fmtDuration(runElapsed(primary)), C_RUNNING)
+            infoLine("Elapsed", fmtDuration(runElapsed(primary)), C_RUNNING, live: true)
         }
         if let est = estimatedTotal(for: primary, history: history) {
             infoLine("Expected", "~\(fmtDuration(est))")
@@ -1570,15 +1572,14 @@ class RunDetailView: Flipped {
             name.lineBreakMode = .byTruncatingTail; name.maximumNumberOfLines = 1
             name.frame = NSRect(x: pad + 19, y: y, width: contentW - 19 - 155, height: 15)
             addSubview(name)
-            let stText: String
-            switch run.status {
-            case "completed": stText = "\(statusText(run)) \u{00B7} \(runDuration(run))"
-            case "in_progress": stText = "\(fmtDuration(runElapsed(run))) elapsed"
-            default: stText = statusText(run)
+            let st = LiveLabel.make(.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                                    run.conclusion == "failure" ? C_FAILURE : .secondaryLabelColor) {
+                switch run.status {
+                case "completed": return "\(statusText(run)) \u{00B7} \(runDuration(run))"
+                case "in_progress": return "\(fmtDuration(runElapsed(run))) elapsed"
+                default: return statusText(run)
+                }
             }
-            let st = NSTextField(labelWithString: stText)
-            st.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-            st.textColor = run.conclusion == "failure" ? C_FAILURE : .secondaryLabelColor
             st.alignment = .right
             st.frame = NSRect(x: pad + contentW - 150, y: y, width: 150, height: 15)
             addSubview(st)
@@ -2086,6 +2087,32 @@ class EmptyRow: NSView {
 }
 
 class Flipped: NSView { override var isFlipped: Bool { true } }
+
+// A label that recomputes its text every second while it is in a window.
+final class LiveLabel: NSTextField {
+    var text: (() -> String)? { didSet { tick() } }
+    private var timer: Timer?
+
+    static func make(_ font: NSFont, _ color: NSColor, _ text: @escaping () -> String) -> LiveLabel {
+        let l = LiveLabel(labelWithString: "")
+        l.font = font; l.textColor = color; l.maximumNumberOfLines = 1
+        l.text = text
+        return l
+    }
+
+    private func tick() { if let t = text { stringValue = t() } }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        timer?.invalidate(); timer = nil
+        guard window != nil else { return }
+        tick()
+        // The common mode keeps it ticking while the list scrolls.
+        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+}
 
 class LoadingRow: NSView {
     init(w: CGFloat) {

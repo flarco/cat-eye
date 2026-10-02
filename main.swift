@@ -14,6 +14,7 @@ struct AppConfig: Codable {
     var filterDefaultBranches: Bool?
     var sortByRecent: Bool?
     var oneRowPerWorkflow: Bool?
+    var repoColors: [String: Int]?
     var autoUpdate: Bool?
     var relay: RelayConfig?
 }
@@ -32,6 +33,7 @@ var RUNS_PER_REPO: Int = 10
 var FILTER_DEFAULT_BRANCHES: Bool = false
 var SORT_BY_RECENT: Bool = true
 var ONE_ROW_PER_WORKFLOW: Bool = true
+var REPO_COLORS: [String: Int] = [:]
 var AUTO_UPDATE: Bool = true
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
@@ -55,6 +57,7 @@ func loadConfig() {
     FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
     SORT_BY_RECENT = c.sortByRecent ?? true
     ONE_ROW_PER_WORKFLOW = c.oneRowPerWorkflow ?? true
+    REPO_COLORS = c.repoColors ?? [:]
     AUTO_UPDATE = c.autoUpdate ?? true
     if let r = c.relay { RELAY = r }
 }
@@ -65,7 +68,8 @@ func saveConfig() {
                       orgs: PICKED_ORGS.isEmpty ? nil : PICKED_ORGS, pollInterval: POLL_NORMAL,
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
-                      oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW, autoUpdate: AUTO_UPDATE, relay: RELAY)
+                      oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW,
+                      repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE, relay: RELAY)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
@@ -1056,6 +1060,8 @@ func runSelfTest() {
     check(rl?.percent == 72 && rl?.color == C_QUEUED, "rate limit uses the fullest of REST and GraphQL")
     check(RelayDeployer.unhooked(repos, hooked: ["o/hooked", "o/denied"], statuses: sts) == ["O/Bare", "O/Denied"],
           "unhooked repos")
+    REPO_COLORS = ["o/a": 3, "o/b": 0]
+    check(repoColor("o/a") == REPO_PALETTE[3], "repo color keeps its slot")
 
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
@@ -1276,6 +1282,16 @@ class RunRow: NSView {
             subRemaining -= chip.frame.width + 6
         }
 
+        if showRepo {
+            let short = repo.components(separatedBy: "/").last ?? repo
+            let rb = Badge(short, maxChars: 15, tint: repoColor(repo))
+            rb.toolTip = repo
+            rb.frame.origin = NSPoint(x: subX, y: 4)
+            addSubview(rb)
+            subX += rb.frame.width + 6
+            subRemaining -= rb.frame.width + 6
+        }
+
         if !primary.headBranch.isEmpty {
             // Branch gets its own badge. Names over 15 characters keep both ends,
             // and the tooltip shows the full name.
@@ -1287,10 +1303,9 @@ class RunRow: NSView {
         }
 
         let wf = primary.workflowName ?? primary.name
-        let repoPart = showRepo ? "\(repo.components(separatedBy: "/").last ?? repo) \u{00B7} " : ""
-        let prefix = repoPart + (group.count > 1
+        let prefix = group.count > 1
             ? "\(group.count) workflows"
-            : "\(wf) #\(primary.number)")
+            : "\(wf) #\(primary.number)"
         let sub = lbl("\(prefix) \u{00B7} \(primary.event)\(actor)",
                       .systemFont(ofSize: 11), .secondaryLabelColor)
         sub.frame = NSRect(x: subX, y: 6, width: subRemaining, height: 16)
@@ -2006,12 +2021,14 @@ class PRDetailView: NSView {
 
 class Badge: NSView {
     /// Text longer than `maxChars` keeps its first and last characters around an ellipsis.
-    init(_ text: String, maxChars: Int = .max, maxWidth: CGFloat = .greatestFiniteMagnitude) {
+    let tint: NSColor?
+    init(_ text: String, maxChars: Int = .max, maxWidth: CGFloat = .greatestFiniteMagnitude, tint: NSColor? = nil) {
+        self.tint = tint
         let half = (maxChars - 1) / 2
         let shown = text.count > maxChars ? "\(text.prefix(half))\u{2026}\(text.suffix(half))" : text
         let l = NSTextField(labelWithString: shown)
         l.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
-        l.textColor = .secondaryLabelColor
+        l.textColor = tint == nil ? .secondaryLabelColor : .labelColor
         l.alignment = .center
         l.lineBreakMode = .byTruncatingMiddle
         l.maximumNumberOfLines = 1
@@ -2028,11 +2045,41 @@ class Badge: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let r = bounds.insetBy(dx: 0.5, dy: 0.5)
         let p = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
+        if let t = tint {
+            t.withAlphaComponent(0.22).setFill(); p.fill()
+            t.withAlphaComponent(0.6).setStroke(); p.lineWidth = 0.5; p.stroke()
+            return
+        }
         // Inverse-of-background fill so the badge is visible in both modes:
         // dark fill in light mode, light fill in dark mode.
         NSColor.labelColor.withAlphaComponent(0.08).setFill(); p.fill()
         NSColor.separatorColor.setStroke(); p.lineWidth = 0.5; p.stroke()
     }
+}
+
+let REPO_PALETTE: [NSColor] = [
+    (0.36, 0.55, 0.95), (0.93, 0.45, 0.25), (0.30, 0.75, 0.45), (0.75, 0.45, 0.90),
+    (0.95, 0.75, 0.20), (0.20, 0.75, 0.80), (0.92, 0.40, 0.60), (0.55, 0.70, 0.25),
+    (0.60, 0.50, 0.40), (0.45, 0.45, 0.85), (0.95, 0.55, 0.45), (0.40, 0.60, 0.65),
+].map { NSColor(srgbRed: $0.0, green: $0.1, blue: $0.2, alpha: 1) }
+
+/// Gives each new repo the least used palette slot. The config keeps the slots, so colors stay the same.
+func assignRepoColors(_ repos: [String]) {
+    let new = repos.filter { REPO_COLORS[$0] == nil }
+    guard !new.isEmpty else { return }
+    var uses = [Int](repeating: 0, count: REPO_PALETTE.count)
+    for i in REPO_COLORS.values { uses[i % uses.count] += 1 }
+    for r in new {
+        let i = uses.indices.min { uses[$0] < uses[$1] }!
+        REPO_COLORS[r] = i
+        uses[i] += 1
+    }
+    saveConfig()
+}
+
+func repoColor(_ repo: String) -> NSColor {
+    assignRepoColors([repo])
+    return REPO_PALETTE[REPO_COLORS[repo]! % REPO_PALETTE.count]
 }
 
 class Header: NSView {
@@ -2820,6 +2867,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         log.info("Cat Eye launching — repos: \(REPOS.count), poll: \(POLL_NORMAL)s/\(POLL_ACTIVE)s")
         loadConfig()
         REPOS = catalog.resolve(picked: PICKED_REPOS, orgs: PICKED_ORGS)
+        assignRepoColors(REPOS)
         log.info("Config loaded — tracking \(REPOS.count) repos: \(REPOS.joined(separator: ", "))")
         ghIcon = loadGHIcon()
 
@@ -3135,6 +3183,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     func applyRepoSelection(reopen: Bool) {
         let previous = REPOS
         REPOS = catalog.resolve(picked: PICKED_REPOS, orgs: PICKED_ORGS)
+        assignRepoColors(REPOS)
         if reopen { onConfigSaved(previous: previous); return }
         guard REPOS != previous else { return }
         log.info("Repo catalog changed the tracked repos: \(previous.count) -> \(REPOS.count)")

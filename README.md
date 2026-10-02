@@ -165,8 +165,9 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `pollActiveInterval` | `10` | Seconds between checks while the popover is open and a run is in progress |
 | `runsPerRepo` | `10` | Number of recent runs to fetch per repo |
 | `filterDefaultBranches` | `false` | Hide workflow runs from branches other than `main` or `develop` |
-| `sortByRecent` | `true` | Show the runs of all repos in one list, newest first. Active runs come first. Set to `false` to show each repo in its own section and to group the workflows of one commit in one row |
+| `sortByRecent` | `true` | Show the runs of all repos in one list, newest first. Active runs come first. Each row has a colored chip with the repo name. Set to `false` to show each repo in its own section and to group the workflows of one commit in one row |
 | `oneRowPerWorkflow` | `true` | Show only the latest run of each workflow on each branch |
+| `repoColors` | (set by the app) | The palette slot (0–11) of each repo chip. The app gives each new repo the least used slot. Change a number to change a color |
 | `autoUpdate` | `true` | Install new releases automatically, written by **Settings → Updates** |
 | `relay` | none | Live updates settings, written by **Settings → Live updates** (see below) |
 

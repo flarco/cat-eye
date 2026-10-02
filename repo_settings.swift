@@ -65,6 +65,18 @@ final class SettingsVC: NSViewController {
         container.addSubview(accRow); y += 40
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
+        // ── Display section ──
+        container.addSubview(SettingsHeader("DISPLAY", y: y, w: w)); y += 28
+        let dispRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 36))
+        let one = NSButton(checkboxWithTitle: "One row per workflow (latest run on each branch)",
+                           target: self, action: #selector(toggleOneRow(_:)))
+        one.font = .systemFont(ofSize: 12)
+        one.state = ONE_ROW_PER_WORKFLOW ? .on : .off
+        one.frame = NSRect(x: 16, y: 8, width: w - 32, height: 20)
+        dispRow.addSubview(one)
+        container.addSubview(dispRow); y += 36
+        container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
+
         // ── Updates section ──
         container.addSubview(SettingsHeader("UPDATES", y: y, w: w)); y += 28
         let updRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
@@ -190,6 +202,11 @@ final class SettingsVC: NSViewController {
         updateLabel?.toolTip = updateLabel?.stringValue
         if case .ready = updater.state { updateBtn?.title = "Restart now" } else { updateBtn?.title = "Check now" }
         updateBtn?.isEnabled = !updater.busy
+    }
+
+    @objc func toggleOneRow(_ sender: NSButton) {
+        ONE_ROW_PER_WORKFLOW = sender.state == .on
+        saveConfig()
     }
 
     @objc func toggleAutoUpdate(_ sender: NSButton) {

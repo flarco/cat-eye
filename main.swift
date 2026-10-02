@@ -13,6 +13,7 @@ struct AppConfig: Codable {
     var runsPerRepo: Int?
     var filterDefaultBranches: Bool?
     var sortByRecent: Bool?
+    var oneRowPerWorkflow: Bool?
     var autoUpdate: Bool?
     var relay: RelayConfig?
 }
@@ -30,6 +31,7 @@ var POLL_ACTIVE: TimeInterval = 10
 var RUNS_PER_REPO: Int = 10
 var FILTER_DEFAULT_BRANCHES: Bool = false
 var SORT_BY_RECENT: Bool = true
+var ONE_ROW_PER_WORKFLOW: Bool = true
 var AUTO_UPDATE: Bool = true
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
@@ -52,6 +54,7 @@ func loadConfig() {
     RUNS_PER_REPO = min(max(1, c.runsPerRepo ?? 10), 100)
     FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
     SORT_BY_RECENT = c.sortByRecent ?? true
+    ONE_ROW_PER_WORKFLOW = c.oneRowPerWorkflow ?? true
     AUTO_UPDATE = c.autoUpdate ?? true
     if let r = c.relay { RELAY = r }
 }
@@ -62,7 +65,7 @@ func saveConfig() {
                       orgs: PICKED_ORGS.isEmpty ? nil : PICKED_ORGS, pollInterval: POLL_NORMAL,
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
-                      autoUpdate: AUTO_UPDATE, relay: RELAY)
+                      oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW, autoUpdate: AUTO_UPDATE, relay: RELAY)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
@@ -625,14 +628,20 @@ func lastActivity(_ r: Run) -> Date {
     return parseISO(r.updatedAt) ?? parseISO(r.createdAt) ?? .distantPast
 }
 
-// Newest first, one run for each row. Active runs come first.
-func byLastActivity(_ runs: [Run]) -> [Run] {
-    runs.sorted { a, b in
-        let aActive = a.status != "completed", bActive = b.status != "completed"
-        if aActive != bActive { return aActive }
-        if aActive { return (parseISO(a.createdAt) ?? .distantPast) > (parseISO(b.createdAt) ?? .distantPast) }
-        return lastActivity(a) > lastActivity(b)
-    }
+// Newest first. Active runs come first.
+func newerActivity(_ a: Run, _ b: Run) -> Bool {
+    let aActive = a.status != "completed", bActive = b.status != "completed"
+    if aActive != bActive { return aActive }
+    if aActive { return (parseISO(a.createdAt) ?? .distantPast) > (parseISO(b.createdAt) ?? .distantPast) }
+    return lastActivity(a) > lastActivity(b)
+}
+
+func byLastActivity(_ runs: [Run]) -> [Run] { runs.sorted(by: newerActivity) }
+
+// The newest run of each workflow on each branch. `runs` is newest first, as the API returns it.
+func latestPerWorkflow(_ runs: [Run]) -> [Run] {
+    var seen = Set<String>()
+    return runs.filter { seen.insert("\($0.workflowName ?? $0.name)|\($0.headBranch)").inserted }
 }
 
 func sortedByRecent(_ g: [(String, [Run])]) -> [(String, [Run])] {
@@ -951,6 +960,12 @@ func runSelfTest() {
                                 done("new", "2026-10-01T11:00:00Z", "2026-10-01T11:30:00Z"),
                                 run("main", "in_progress")])
     check(order.map { $0.workflowName ?? "" } == ["ci", "old", "new"], "recent first sorts by completion time, active on top")
+    let latest = latestPerWorkflow([dispatch("Deploy", "s2"), dispatch("Deploy", "s1"), dispatch("Build", "s1")])
+    check(latest.map(\.headSha) == ["s2", "s1"], "one row per workflow keeps the newest run")
+    let chipJob = RunJob(id: 1, name: "release-linux-amd64", status: "completed", conclusion: "success", url: nil,
+                         startedAt: nil, completedAt: nil, runnerName: nil, steps: nil)
+    check((JobChip(job: chipJob, notes: [], maxW: 400).subviews.first as? NSTextField)?.stringValue == "release\u{2026}x-amd64",
+          "long job names keep both ends")
     let log = "2026-10-01T23:14:09.48Z FAIL\tpkg\t300s\n2026-10-01T23:14:11.29Z ##[error]Process completed with exit code 1.\n" +
         "2026-10-01T23:14:11.32Z Post job cleanup.\n"
     check(JobLogs.errorSnippet(log) == "FAIL\tpkg\t300s\n##[error]Process completed with exit code 1.", "log snippet ends at the error")
@@ -1191,15 +1206,17 @@ class RunRow: NSView {
     let repo: String
     let group: [Run]
     let expanded: Bool
+    let showRepo: Bool
     var onToggle: (() -> Void)?
     var trackingArea: NSTrackingArea?
 
-    init(repo: String, group: [Run], history: [Run], w: CGFloat, expanded: Bool = false) {
+    init(repo: String, group: [Run], history: [Run], w: CGFloat, expanded: Bool = false, showRepo: Bool = false) {
         let primary = RunRow.pickPrimary(group)
         self.urlStr = primary.url
         self.repo = repo
         self.group = group
         self.expanded = expanded
+        self.showRepo = showRepo
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: ROW_H))
         wantsLayer = true
         layer?.backgroundColor = restingColor
@@ -1270,9 +1287,10 @@ class RunRow: NSView {
         }
 
         let wf = primary.workflowName ?? primary.name
-        let prefix = group.count > 1
+        let repoPart = showRepo ? "\(repo.components(separatedBy: "/").last ?? repo) \u{00B7} " : ""
+        let prefix = repoPart + (group.count > 1
             ? "\(group.count) workflows"
-            : "\(wf) #\(primary.number)"
+            : "\(wf) #\(primary.number)")
         let sub = lbl("\(prefix) \u{00B7} \(primary.event)\(actor)",
                       .systemFont(ofSize: 11), .secondaryLabelColor)
         sub.frame = NSRect(x: subX, y: 6, width: subRemaining, height: 16)
@@ -2488,6 +2506,20 @@ class TabVC: NSViewController {
         if loading && data.isEmpty {
             rows.append(LoadingRow(w: w)); return rows
         }
+        if SORT_BY_RECENT {
+            if let sel = selectedRepo { rows.append(Header(sel, w: w)) }
+            let items = data.flatMap { repo, runs in
+                let visible = visibleRuns(runs)
+                return shownRuns(visible).map { (repo: repo, run: $0, history: visible) }
+            }.sorted { newerActivity($0.run, $1.run) }
+            for it in items {
+                appendRun(&rows, repo: it.repo, group: [it.run], history: it.history, w: w, showRepo: selectedRepo == nil)
+            }
+            if items.isEmpty {
+                rows.append(EmptyRow(FILTER_DEFAULT_BRANCHES ? "No recent runs on main or develop" : "No recent runs", w: w))
+            }
+            return rows
+        }
         for (repo, runs) in data {
             rows.append(Header(repo, w: w))
             let visible = visibleRuns(runs)
@@ -2497,34 +2529,39 @@ class TabVC: NSViewController {
                     : "No recent runs"
                 rows.append(EmptyRow(msg, w: w))
             } else {
-                let sorted = visible.sorted { a, b in
+                let sorted = shownRuns(visible).sorted { a, b in
                     let aActive = a.status == "in_progress" || a.status == "queued"
                     let bActive = b.status == "in_progress" || b.status == "queued"
                     if aActive != bActive { return aActive }
                     return false  // preserve API order otherwise
                 }
-                let groups = SORT_BY_RECENT ? byLastActivity(visible).map { [$0] } : groupRuns(sorted)
-                for group in groups {
-                    let primary = RunRow.pickPrimary(group)
-                    let key = primary.url
-                    let isExpanded = expandedRun == key
-                    let row = RunRow(repo: repo, group: group, history: visible, w: w, expanded: isExpanded)
-                    row.onToggle = { [weak self] in
-                        guard let self = self else { return }
-                        self.expandedRun = self.expandedRun == key ? nil : key
-                        self.rebuildContent()
-                    }
-                    rows.append(row)
-                    if isExpanded {
-                        ensureRunDetail(repo: repo, group: group, key: key)
-                        rows.append(RunDetailView(group: group, primary: primary, repo: repo,
-                                                  history: visible, w: w))
-                    }
+                for group in groupRuns(sorted) {
+                    appendRun(&rows, repo: repo, group: group, history: visible, w: w, showRepo: false)
                 }
             }
         }
         if rows.isEmpty { rows.append(EmptyRow("No actions to show", w: w)) }
         return rows
+    }
+
+    func shownRuns(_ visible: [Run]) -> [Run] { ONE_ROW_PER_WORKFLOW ? latestPerWorkflow(visible) : visible }
+
+    // Adds the row for a run group, and its detail view when it is expanded.
+    func appendRun(_ rows: inout [NSView], repo: String, group: [Run], history: [Run], w: CGFloat, showRepo: Bool) {
+        let primary = RunRow.pickPrimary(group)
+        let key = primary.url
+        let isExpanded = expandedRun == key
+        let row = RunRow(repo: repo, group: group, history: history, w: w, expanded: isExpanded, showRepo: showRepo)
+        row.onToggle = { [weak self] in
+            guard let self = self else { return }
+            self.expandedRun = self.expandedRun == key ? nil : key
+            self.rebuildContent()
+        }
+        rows.append(row)
+        if isExpanded {
+            ensureRunDetail(repo: repo, group: group, key: key)
+            rows.append(RunDetailView(group: group, primary: primary, repo: repo, history: history, w: w))
+        }
     }
 
     // Fetch commit message + failure annotations for an expanded run in the

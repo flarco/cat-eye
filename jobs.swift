@@ -12,10 +12,14 @@ final class JobChip: NSView {
         self.job = job
         self.notes = notes
         let color = JobChip.color(job)
-        let l = NSTextField(labelWithString: job.name)
+        // Up to 15 characters show in full. A longer name keeps both ends, so "release-linux-amd64" and "-arm64" differ.
+        let maxChars = 15, half = (maxChars - 1) / 2
+        let shown = job.name.count > maxChars ? "\(job.name.prefix(half))\u{2026}\(job.name.suffix(half))" : job.name
+        let l = NSTextField(labelWithString: shown)
         l.font = .systemFont(ofSize: 10, weight: .medium); l.textColor = color
-        l.lineBreakMode = .byTruncatingTail
-        let w = min(ceil(l.intrinsicContentSize.width) + 14, min(maxW, 220))
+        l.lineBreakMode = .byClipping
+        // The label cell needs a few points more than its intrinsic width, or it truncates.
+        let w = min(ceil(l.intrinsicContentSize.width) + 4 + 14, maxW)
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: JobChip.height))
         wantsLayer = true
         layer?.cornerRadius = JobChip.height / 2

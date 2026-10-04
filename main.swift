@@ -624,13 +624,9 @@ func overallStatus(_ g: [(String, [Run])]) -> (color: NSColor, badge: String?, l
     if all.contains(where: { $0.status == "in_progress" || $0.status == "queued" }) {
         return (C_RUNNING, "hourglass.circle.fill", "Run in progress")
     }
-    let key = all.filter {
-        let wf = ($0.workflowName ?? $0.name).lowercased()
-        return wf.contains("deploy") || wf.contains("smoke")
-    }
-    if let top = (key.isEmpty ? all : key).first, top.isFailure, !IGNORED.contains(top) {
-        return (C_FAILURE, "xmark.circle.fill", "Run failed")
-    }
+    // A failure counts until a newer run of the same workflow on the same branch replaces it.
+    let failed = g.flatMap { latestPerWorkflow($0.1) }.contains { $0.isFailure && !IGNORED.contains($0) }
+    if failed { return (C_FAILURE, "xmark.circle.fill", "Run failed") }
     return (C_SUCCESS, "checkmark.circle.fill", "All runs passing")
 }
 
@@ -972,6 +968,14 @@ func runSelfTest() {
     var again = bad; again.attempt = 2
     check(!IGNORED.contains(again), "a new attempt is not ignored")
     IGNORED.set([bad], ignored: false)
+    func passed(_ wf: String) -> Run {
+        Run(id: 5, name: wf, displayTitle: "t", status: "completed", conclusion: "success", headBranch: "main",
+            headSha: "s", event: "push", url: "u/selftest-\(wf)", updatedAt: "", createdAt: "", startedAt: nil,
+            number: 3, workflowName: wf, actorLogin: nil)
+    }
+    let other = passed("deploy")
+    check(overallStatus([("o/a", [other]), ("o/r", [passed("ci"), bad])]).color == C_SUCCESS, "a newer pass of the workflow clears the failure")
+    check(overallStatus([("o/a", [other]), ("o/r", [bad])]).color == C_FAILURE, "a failure in any repo turns the icon red")
     check(Badge("main", maxChars: 15).subviews.compactMap { $0 as? NSTextField }.first?.stringValue == "main", "short branch is not cut")
     check(Badge("dependabot/npm/lodash-4.17", maxChars: 15).subviews.compactMap { $0 as? NSTextField }.first?.stringValue == "dependa\u{2026}sh-4.17", "long branch keeps both ends")
     func dispatch(_ wf: String, _ sha: String) -> Run {

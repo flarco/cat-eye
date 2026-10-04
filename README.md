@@ -248,12 +248,12 @@ Colours come from the [Okabe-Ito colour-blind-safe palette](https://jfly.uni-koe
 
 | Icon | Badge | Meaning |
 |------|-------|---------|
-| Bluish green | Checkmark | All recent key runs passing |
-| Vermillion | Cross | Most recent deploy/test run failed |
+| Bluish green | Checkmark | The latest run of each workflow passed |
+| Vermillion | Cross | The latest run of a workflow failed |
 | Sky blue (pulsing) | Hourglass | A run is currently in progress |
 | Gray | — | No data or no repos configured |
 
-Prioritizes **deploy** and **smoke test** workflows for overall status, so Dependabot noise won't turn your icon red.
+Each workflow on each branch counts. A newer run of the same workflow replaces an old failure. To keep a failure from turning the icon red, ignore that run. To skip feature branches, select **Default only**.
 
 ## Troubleshooting
 

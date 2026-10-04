@@ -1329,13 +1329,16 @@ class RunRow: NSView {
         }
 
         let wf = primary.workflowName ?? primary.name
-        let prefix = group.count > 1
-            ? "\(group.count) workflows"
-            : "\(wf) #\(primary.number)"
-        let sub = lbl("\(prefix) \u{00B7} \(primary.event)\(actor)",
-                      .systemFont(ofSize: 11), .secondaryLabelColor)
+        let name = group.count > 1 ? "\(group.count) workflows" : wf
+        let number = group.count > 1 ? "" : " #\(primary.number)"
+        let sub = NSTextField(labelWithString: "")
+        let subAttr = NSMutableAttributedString(string: name, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.labelColor])
+        subAttr.append(NSAttributedString(string: "\(number) \u{00B7} \(primary.event)\(actor)", attributes: [
+            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
+        sub.attributedStringValue = subAttr
         sub.frame = NSRect(x: subX, y: 6, width: subRemaining, height: 16)
-        sub.lineBreakMode = .byTruncatingTail
+        sub.lineBreakMode = .byTruncatingTail; sub.maximumNumberOfLines = 1
         sub.toolTip = sub.stringValue
         addSubview(sub)
 
@@ -2142,7 +2145,7 @@ class Header: NSView {
     @objc func refreshRepo(_ sender: NSButton) {
         guard let app = NSApp.delegate as? GHActionsBar else { return }
         sender.isEnabled = false
-        app.refreshRepos([repo], includePRs: true, completedRuns: []) { _ in app.reloadList() }
+        app.refreshRepos([repo], includePRs: true, completedRuns: []) { _ in }
     }
 }
 
@@ -2391,9 +2394,8 @@ class Footer: NSView {
         addSubview(quota)
         showQuota((NSApp.delegate as? GHActionsBar)?.rateLimit.latest)
 
-        let f = DateFormatter(); f.dateFormat = "h:mm:ss a"
-        let version = (NSApp.delegate as? GHActionsBar).map { "v\($0.updater.current) · " } ?? ""
-        let ts = NSTextField(labelWithString: "\(version)Updated \(f.string(from: updated))")
+        let ts = stamp
+        showUpdated(updated)
         ts.font = .systemFont(ofSize: 10); ts.textColor = .secondaryLabelColor; ts.alignment = .center
         ts.frame = NSRect(x: 134, y: 11, width: w - 274, height: 16)
         addSubview(ts)
@@ -2421,6 +2423,13 @@ class Footer: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     let quota = NSTextField(labelWithString: "")
+    let stamp = NSTextField(labelWithString: "")
+
+    func showUpdated(_ updated: Date) {
+        let f = DateFormatter(); f.dateFormat = "h:mm:ss a"
+        let version = (NSApp.delegate as? GHActionsBar).map { "v\($0.updater.current) · " } ?? ""
+        stamp.stringValue = "\(version)Updated \(f.string(from: updated))"
+    }
 
     func showQuota(_ rl: RateLimit?) {
         quota.stringValue = rl.map { "\($0.percent)%" } ?? ""
@@ -2434,10 +2443,10 @@ class Footer: NSView {
 let TAB_H: CGFloat = 36
 
 class TabVC: NSViewController {
-    let grouped: [(String, [Run])]
-    let prGrouped: [(String, [PR])]
-    let updated: Date
-    let loading: Bool
+    var grouped: [(String, [Run])]
+    var prGrouped: [(String, [PR])]
+    var updated: Date
+    var loading: Bool
     var selectedTab: Int
     var selectedRepo: String?
     var expandedPR: String?
@@ -2521,6 +2530,20 @@ class TabVC: NSViewController {
         footerView = footer
         self.view = container
         rebuildContent()
+    }
+
+    // Shows fresh data in the open panel. Keeps the expanded row and the scroll position.
+    func update(grouped: [(String, [Run])], prGrouped: [(String, [PR])], updated: Date, loading: Bool) {
+        self.grouped = grouped; self.prGrouped = prGrouped
+        self.updated = updated; self.loading = loading
+        guard isViewLoaded else { return }
+        (footerView as? Footer)?.showUpdated(updated)
+        let origin = scrollView.contentView.bounds.origin
+        JobSummary.close()  // the rebuild removes its chip
+        rebuildContent()
+        let maxY = max(0, doc.frame.height - scrollView.contentView.bounds.height)
+        scrollView.contentView.scroll(to: NSPoint(x: origin.x, y: min(origin.y, maxY)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     func rebuildContent() {
@@ -3129,6 +3152,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 self.firstLoad = false
                 self.refreshInFlight = false
                 self.updateIcon()
+                self.reloadList()
                 self.scheduleTimer()
                 completion?()
                 let pending = self.pendingCompletion
@@ -3188,6 +3212,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 self.lastUpdate = Date()
                 self.refreshInFlight = false
                 self.updateIcon()
+                self.reloadList()
                 self.scheduleTimer()
                 done(ok)
                 let pending = self.pendingCompletion
@@ -3306,7 +3331,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 }
                 // GitHub queues the new attempt a moment after the request.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                    self.refreshRepos([repo], includePRs: false, completedRuns: []) { _ in self.reloadList() }
+                    self.refreshRepos([repo], includePRs: false, completedRuns: []) { _ in }
                 }
             }
         }
@@ -3318,10 +3343,9 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         (popover.contentViewController as? TabVC)?.rebuildContent()
     }
 
-    // The run list holds a snapshot of the data, so show fresh data with a new list.
     func reloadList() {
-        guard popover.isShown, popover.contentViewController is TabVC else { return }
-        buildWithAppearance { popover.contentViewController = makeTabVC() }
+        guard popover.isShown, let vc = popover.contentViewController as? TabVC else { return }
+        vc.update(grouped: grouped, prGrouped: prGrouped, updated: lastUpdate, loading: firstLoad)
     }
 
     // MARK: - Notifications

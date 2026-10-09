@@ -207,25 +207,15 @@ final class SecretStore {
     static let deviceToken = "DEVICE_TOKEN"
     static let webhookSecret = "WEBHOOK_SECRET"
     let service = "com.flarco.cat-eye.relay"
-    // Items from builds before the bundle ID change. They move to `service` on first read.
-    let legacyService = "com.clintoncodewell.cat-eye.relay"
 
-    private func query(_ key: String, service: String? = nil) -> [String: Any] {
+    private func query(_ key: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service ?? self.service,
+         kSecAttrService as String: service,
          kSecAttrAccount as String: key]
     }
 
     func get(_ key: String) -> String? {
-        if let v = read(query(key)) { return v }
-        guard let v = read(query(key, service: legacyService)) else { return nil }
-        set(key, v)
-        SecItemDelete(query(key, service: legacyService) as CFDictionary)
-        return v
-    }
-
-    private func read(_ query: [String: Any]) -> String? {
-        var q = query
+        var q = query(key)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: AnyObject?
@@ -246,7 +236,6 @@ final class SecretStore {
 
     func delete(_ key: String) {
         SecItemDelete(query(key) as CFDictionary)
-        SecItemDelete(query(key, service: legacyService) as CFDictionary)
     }
 }
 

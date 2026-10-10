@@ -1,6 +1,6 @@
 # Contributing to Cat Eye
 
-Thanks for your interest! Cat Eye is intentionally small: a single Swift file, zero dependencies beyond macOS and the `gh` CLI. Contributions that keep it that way are very welcome.
+Thanks for your interest! Cat Eye is intentionally small: native Swift, zero dependencies beyond macOS and the `gh` CLI. Contributions that keep it that way are very welcome.
 
 ## Getting started
 
@@ -21,7 +21,7 @@ CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./build.sh
 
 ## Guidelines
 
-- **Keep it lean.** No external packages, no frameworks beyond AppKit, UserNotifications and Network. The app lives in `main.swift`. The repo picker is in `repo_catalog.swift` and `repo_settings.swift`. The optional live updates code is in `relay.swift` and `relay_settings.swift`, and the Cloudflare Worker is in `worker/`.
+- **Keep it lean.** No external packages, no frameworks beyond AppKit, UserNotifications and Network. The app is split across Swift files: `main.swift` for the app delegate, plus one file per tab, settings page, and the project data layer. Repo picking is in `repo_catalog.swift` and `actions_settings.swift`. Live updates are in `relay.swift` and `relay_settings.swift`. The Cloudflare Worker is in `worker/`.
 - **Security matters.** The app shells out to `gh` only via hardcoded trusted paths with an allowlisted environment, and validates all repo input. Don't weaken these.
 - **Accessibility matters.** Status is never conveyed by colour alone (we use the Okabe-Ito palette plus shape/text signals). New UI should follow the same rule and stay keyboard-navigable.
 - **No telemetry, no GitHub tokens.** GitHub auth goes through the `gh` CLI, and Cloudflare auth goes through wrangler. The only secrets Cat Eye keeps are the relay device token and webhook secret. They stay in the Keychain and go to `gh` and `wrangler` on stdin, never in argv.

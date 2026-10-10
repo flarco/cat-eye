@@ -3,106 +3,6 @@ import QuartzCore
 import UserNotifications
 import os
 
-// ─── Configuration ───────────────────────────────────────────────────────────
-
-struct AppConfig: Codable {
-    var repos: [String]
-    var orgs: [String]?
-    var pollInterval: TimeInterval?
-    var pollActiveInterval: TimeInterval?
-    var runsPerRepo: Int?
-    var filterDefaultBranches: Bool?
-    var sortByRecent: Bool?
-    var oneRowPerWorkflow: Bool?
-    var repoColors: [String: Int]?
-    var autoUpdate: Bool?
-    var relay: RelayConfig?
-    var notifications: NotificationSettings?
-}
-
-// Which transition events create macOS notifications. Omitted legacy config
-// fields keep the previous behavior: notify for every start and completion.
-struct NotificationSettings: Codable {
-    var started = true
-    var succeeded = true
-    var failed = true
-    var cancelled = true
-    var other = true
-
-    init() {}
-
-    // Hand-written config files may omit individual switches.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        started = try c.decodeIfPresent(Bool.self, forKey: .started) ?? true
-        succeeded = try c.decodeIfPresent(Bool.self, forKey: .succeeded) ?? true
-        failed = try c.decodeIfPresent(Bool.self, forKey: .failed) ?? true
-        cancelled = try c.decodeIfPresent(Bool.self, forKey: .cancelled) ?? true
-        other = try c.decodeIfPresent(Bool.self, forKey: .other) ?? true
-    }
-}
-
-let CONFIG_DIR  = NSString(string: "~/.config/cat-eye").expandingTildeInPath
-let CONFIG_PATH = (CONFIG_DIR as NSString).appendingPathComponent("config.json")
-let REPO_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("repo-cache.json")
-
-// REPOS is what the app tracks: PICKED_REPOS plus every repo of PICKED_ORGS.
-var REPOS: [String] = []
-var PICKED_REPOS: [String] = []
-var PICKED_ORGS: [String] = []
-var POLL_NORMAL: TimeInterval = 30
-var POLL_ACTIVE: TimeInterval = 10
-var RUNS_PER_REPO: Int = 10
-var FILTER_DEFAULT_BRANCHES: Bool = false
-var SORT_BY_RECENT: Bool = true
-var ONE_ROW_PER_WORKFLOW: Bool = true
-var REPO_COLORS: [String: Int] = [:]
-var AUTO_UPDATE: Bool = true
-var NOTIFICATIONS = NotificationSettings()
-let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
-
-let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
-
-let log = Logger(subsystem: "com.flarco.cat-eye", category: "app")
-
-func isValidRepo(_ s: String) -> Bool {
-    repoPattern.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
-}
-
-func loadConfig() {
-    guard let data = FileManager.default.contents(atPath: CONFIG_PATH),
-          let c = try? JSONDecoder().decode(AppConfig.self, from: data) else { return }
-    PICKED_REPOS = c.repos.filter { isValidRepo($0) }
-    PICKED_ORGS = c.orgs ?? []
-    REPOS = PICKED_REPOS
-    POLL_NORMAL = max(5, c.pollInterval ?? 30)
-    POLL_ACTIVE = max(5, c.pollActiveInterval ?? 10)
-    RUNS_PER_REPO = min(max(1, c.runsPerRepo ?? 10), 100)
-    FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
-    SORT_BY_RECENT = c.sortByRecent ?? true
-    ONE_ROW_PER_WORKFLOW = c.oneRowPerWorkflow ?? true
-    REPO_COLORS = c.repoColors ?? [:]
-    AUTO_UPDATE = c.autoUpdate ?? true
-    if let n = c.notifications { NOTIFICATIONS = n }
-    if let r = c.relay { RELAY = r }
-}
-
-func saveConfig() {
-    try? FileManager.default.createDirectory(atPath: CONFIG_DIR, withIntermediateDirectories: true)
-    let c = AppConfig(repos: PICKED_REPOS.filter { isValidRepo($0) },
-                      orgs: PICKED_ORGS.isEmpty ? nil : PICKED_ORGS, pollInterval: POLL_NORMAL,
-                      pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
-                      filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
-                      oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW,
-                      repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE,
-                      relay: RELAY, notifications: NOTIFICATIONS)
-    if let data = try? JSONEncoder().encode(c) {
-        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {
-            try? pretty.write(to: URL(fileURLWithPath: CONFIG_PATH))
-        }
-    }
-}
 
 // Find gh CLI — hardcoded trusted paths only
 let GH: String = {
@@ -686,227 +586,6 @@ func mergeGrouped<T>(_ old: [(String, [T])], _ fresh: [(String, [T])], order: [S
     return order.map { ($0, byRepo[$0] ?? []) }
 }
 
-// ─── Deploy Log & Weekly Report ──────────────────────────────────────────────
-// Append-only history of every completed workflow run we witness while polling.
-// Costs no extra gh calls — it reuses data already fetched each refresh. Feeds the
-// Insights tab (last-7-days vs prior-7 stats + heuristics) and a markdown export
-// you can paste into an AI agent to act on.
-
-let DEPLOY_LOG_PATH = (CONFIG_DIR as NSString).appendingPathComponent("deploys.jsonl")
-
-struct DeployRecord: Codable {
-    let repo: String
-    let workflow: String
-    let title: String
-    let branch: String
-    let event: String
-    let conclusion: String
-    let actor: String
-    let url: String
-    let number: Int
-    let startedAt: String?
-    let completedAt: String
-    let durationSec: Double
-    let loggedAt: String
-}
-
-func isDeployWorkflow(_ name: String) -> Bool {
-    let n = name.lowercased()
-    return n.contains("deploy") || n.contains("release") || n.contains("smoke")
-}
-
-final class DeployLog {
-    static let shared = DeployLog()
-    private let q = DispatchQueue(label: "com.flarco.cat-eye.deploylog")
-    private var seen = Set<String>()
-    private var loaded = false
-
-    // Dedup on url+conclusion so a re-run that flips failure→success logs both events
-    // (honest for flakiness insights) while stable polls of the same result don't dup.
-    private func key(_ url: String, _ conclusion: String) -> String { "\(url)|\(conclusion)" }
-
-    private func readRaw() -> String {
-        (try? String(contentsOfFile: DEPLOY_LOG_PATH, encoding: .utf8)) ?? ""
-    }
-
-    private func ensureLoaded() {
-        guard !loaded else { return }
-        loaded = true
-        for r in DeployLog.parse(readRaw()) { seen.insert(key(r.url, r.conclusion)) }
-    }
-
-    static func parse(_ raw: String) -> [DeployRecord] {
-        let dec = JSONDecoder()
-        return raw.split(separator: "\n").compactMap {
-            guard let d = $0.data(using: .utf8) else { return nil }
-            return try? dec.decode(DeployRecord.self, from: d)
-        }
-    }
-
-    // Append newly-seen completed runs. Safe to call every refresh.
-    func record(_ grouped: [(String, [Run])]) {
-        q.async {
-            self.ensureLoaded()
-            let now = isoFmt.string(from: Date())
-            let enc = JSONEncoder()
-            var lines: [String] = []
-            for (repo, runs) in grouped {
-                for r in runs where r.status == "completed" {
-                    let concl = r.conclusion ?? "unknown"
-                    let k = self.key(r.url, concl)
-                    if self.seen.contains(k) { continue }
-                    self.seen.insert(k)
-                    var dur = 0.0
-                    if let s = parseISO(r.startedAt) ?? parseISO(r.createdAt),
-                       let e = parseISO(r.updatedAt) { dur = max(0, e.timeIntervalSince(s)) }
-                    let rec = DeployRecord(repo: repo, workflow: r.workflowName ?? r.name,
-                        title: r.displayTitle, branch: r.headBranch, event: r.event,
-                        conclusion: concl, actor: r.actorLogin ?? "", url: r.url, number: r.number,
-                        startedAt: r.startedAt, completedAt: r.updatedAt, durationSec: dur, loggedAt: now)
-                    if let d = try? enc.encode(rec), let s = String(data: d, encoding: .utf8) {
-                        lines.append(s)
-                    }
-                }
-            }
-            guard !lines.isEmpty else { return }
-            try? FileManager.default.createDirectory(atPath: CONFIG_DIR, withIntermediateDirectories: true)
-            let text = lines.joined(separator: "\n") + "\n"
-            if let h = FileHandle(forWritingAtPath: DEPLOY_LOG_PATH) {
-                h.seekToEndOfFile()
-                if let d = text.data(using: .utf8) { h.write(d) }
-                try? h.close()
-            } else {
-                try? text.write(toFile: DEPLOY_LOG_PATH, atomically: true, encoding: .utf8)
-            }
-            log.info("DeployLog: appended \(lines.count) record(s)")
-        }
-    }
-
-    func all() -> [DeployRecord] { DeployLog.parse(q.sync { readRaw() }) }
-}
-// ponytail: log file + in-memory seen-set grow unbounded; fine for a personal tool
-// (~300B/record). Add rotation/pruning only if it ever gets large.
-
-struct WFStat {
-    let workflow: String
-    var isDeploy = false
-    var total = 0
-    var success = 0
-    var failure = 0
-    var durations: [Double] = []
-    var failRate: Double { total > 0 ? Double(failure) / Double(total) : 0 }
-    var avgDuration: Double? { durations.isEmpty ? nil : durations.reduce(0, +) / Double(durations.count) }
-}
-
-struct WindowStats {
-    var total = 0, success = 0, failure = 0, cancelled = 0, other = 0
-    var durations: [Double] = []
-    var deployTotal = 0, deploySuccess = 0, deployFailure = 0
-    var deployDurations: [Double] = []
-    var byWorkflow: [String: WFStat] = [:]
-    var branchFailures: [String: Int] = [:]
-
-    var passRate: Double? { let d = success + failure; return d > 0 ? Double(success) / Double(d) : nil }
-    var deployPassRate: Double? { let d = deploySuccess + deployFailure; return d > 0 ? Double(deploySuccess) / Double(d) : nil }
-    var avgDuration: Double? { durations.isEmpty ? nil : durations.reduce(0, +) / Double(durations.count) }
-}
-
-func recordsInWindow(_ recs: [DeployRecord], from: Date, to: Date) -> [DeployRecord] {
-    recs.filter {
-        guard let d = parseISO($0.completedAt) else { return false }
-        return d >= from && d < to
-    }
-}
-
-func computeWindow(_ recs: [DeployRecord]) -> WindowStats {
-    var s = WindowStats()
-    for r in recs {
-        s.total += 1
-        let dep = isDeployWorkflow(r.workflow)
-        if dep { s.deployTotal += 1 }
-        switch r.conclusion {
-        case "success":
-            s.success += 1; if dep { s.deploySuccess += 1 }
-        case "failure":
-            s.failure += 1; if dep { s.deployFailure += 1 }
-            s.branchFailures[r.branch, default: 0] += 1
-        case "cancelled": s.cancelled += 1
-        default: s.other += 1
-        }
-        if r.durationSec > 0 {
-            s.durations.append(r.durationSec)
-            if dep { s.deployDurations.append(r.durationSec) }
-        }
-        var wf = s.byWorkflow[r.workflow] ?? WFStat(workflow: r.workflow)
-        wf.isDeploy = dep
-        wf.total += 1
-        if r.conclusion == "success" { wf.success += 1 }
-        if r.conclusion == "failure" { wf.failure += 1 }
-        if r.durationSec > 0 { wf.durations.append(r.durationSec) }
-        s.byWorkflow[r.workflow] = wf
-    }
-    return s
-}
-
-func pct(_ x: Double) -> String { "\(Int((x * 100).rounded()))%" }
-
-func generateInsights(this t: WindowStats, last l: WindowStats) -> [String] {
-    var out: [String] = []
-    if let p = t.passRate {
-        var s = "Pass rate \(pct(p)) (\(t.success)/\(t.success + t.failure) runs)"
-        if let lp = l.passRate {
-            let d = (p - lp) * 100
-            if abs(d) >= 1 { s += String(format: ", %@%.0f pts vs prior week", d >= 0 ? "up " : "down ", abs(d)) }
-        }
-        out.append(s + ".")
-    }
-    let failing = t.byWorkflow.values.filter { $0.total >= 3 && $0.failure > 0 }.sorted { $0.failRate > $1.failRate }
-    if let w = failing.first, w.failRate >= 0.2 {
-        out.append("\(w.workflow) failed \(pct(w.failRate)) of \(w.total) runs — your top failure source. Look at flaky steps, add retries, or gate it.")
-    }
-    let slow = t.byWorkflow.values.filter { ($0.avgDuration ?? 0) > 0 }.max { ($0.avgDuration ?? 0) < ($1.avgDuration ?? 0) }
-    if let w = slow, let a = w.avgDuration, a > 300 {
-        out.append("\(w.workflow) is your slowest at \(fmtDuration(a)) avg — consider caching dependencies or splitting jobs.")
-    }
-    if t.failure >= 3, let top = t.branchFailures.max(by: { $0.value < $1.value }), top.value >= 2 {
-        let share = Double(top.value) / Double(t.failure)
-        if share >= 0.5 { out.append("\(pct(share)) of failures were on `\(top.key)` (\(top.value) of \(t.failure)).") }
-    }
-    if l.total > 0 {
-        let d = t.total - l.total
-        out.append("\(t.total) runs this week (\(d >= 0 ? "+" : "")\(d) vs prior).")
-    }
-    if let a = t.avgDuration, let b = l.avgDuration, abs(a - b) >= 5 {
-        out.append("Avg run time \(fmtDuration(a)) (\(a <= b ? "down " : "up ")\(fmtDuration(abs(a - b))) vs prior).")
-    }
-    if out.isEmpty { out.append("Not enough history yet — keep Cat Eye running and check back after a few days.") }
-    return out
-}
-
-func buildAIReport(this t: WindowStats, last l: WindowStats, insights: [String], thisRecs: [DeployRecord]) -> String {
-    func cell(_ s: String?) -> String { s ?? "—" }
-    var md = "# Cat Eye — Weekly Deploy Report\n\nWindow: last 7 days vs the 7 days before.\n\n## Summary\n\n"
-    md += "| Metric | This week | Prior week |\n|---|---|---|\n"
-    md += "| Runs | \(t.total) | \(l.total) |\n"
-    md += "| Pass rate | \(cell(t.passRate.map(pct))) | \(cell(l.passRate.map(pct))) |\n"
-    md += "| Failures | \(t.failure) | \(l.failure) |\n"
-    md += "| Avg duration | \(cell(t.avgDuration.map(fmtDuration))) | \(cell(l.avgDuration.map(fmtDuration))) |\n"
-    md += "| Deploy/smoke runs | \(t.deployTotal) | \(l.deployTotal) |\n"
-    md += "| Deploy pass rate | \(cell(t.deployPassRate.map(pct))) | \(cell(l.deployPassRate.map(pct))) |\n\n"
-    md += "## Per-workflow (this week)\n\n| Workflow | Runs | Failures | Fail % | Avg duration |\n|---|---|---|---|---|\n"
-    for w in t.byWorkflow.values.sorted(by: { $0.total > $1.total }) {
-        md += "| \(w.workflow)\(w.isDeploy ? " (deploy)" : "") | \(w.total) | \(w.failure) | \(pct(w.failRate)) | \(cell(w.avgDuration.map(fmtDuration))) |\n"
-    }
-    md += "\n## Insights\n\n"
-    for i in insights { md += "- \(i)\n" }
-    let fails = thisRecs.filter { $0.conclusion == "failure" }
-    if !fails.isEmpty {
-        md += "\n## Failed runs (this week)\n\n"
-        for f in fails.prefix(50) { md += "- \(f.workflow) on `\(f.branch)` (\(f.event)) — \(f.url)\n" }
-    }
-    md += "\n---\nTask for the agent: analyze the above and propose concrete, prioritized changes to the CI/CD config, tooling, or code that would cut failures and speed up runs. Favor high-impact, low-effort fixes.\n"
-    return md
-}
 
 func textHeight(_ s: String, font: NSFont, width: CGFloat) -> CGFloat {
     let r = (s as NSString).boundingRect(
@@ -1088,50 +767,116 @@ func runSelfTest() {
         "graphql":{"limit":5000,"used":100,"reset":1},"search":{"limit":30,"used":30,"reset":1}}}
         """.utf8))
     check(rl?.percent == 72 && rl?.color == C_QUEUED, "rate limit uses the fullest of REST and GraphQL")
+    check(rl?.footerLabel == "REST 72% · GQL 2%", "footer shows REST and GraphQL \(rl?.footerLabel ?? "")")
     check(RelayDeployer.unhooked(repos, hooked: ["o/hooked", "o/denied"], statuses: sts) == ["O/Bare", "O/Denied"],
           "unhooked repos")
     REPO_COLORS = ["o/a": 3, "o/b": 0]
     check(repoColor("o/a") == REPO_PALETTE[3], "repo color keeps its slot")
 
+    check(StatusOption(id: "1", name: "Done", color: "GREEN").category == .done, "done category")
+    check(StatusOption(id: "1", name: "Closed", color: "GREEN").category == .done, "closed category")
+    check(StatusOption(id: "1", name: "Shipped", color: "GREEN").category == .done, "shipped category")
+    check(StatusOption(id: "1", name: "Blocked", color: "RED").category == .blocked, "blocked category")
+    check(StatusOption(id: "1", name: "In review", color: "PURPLE").category == .review, "review category")
+    check(StatusOption(id: "1", name: "In progress", color: "YELLOW").category == .progress, "progress category")
+    check(StatusOption(id: "1", name: "Doing", color: "YELLOW").category == .progress, "doing category")
+    check(StatusOption(id: "1", name: "Backlog", color: "GRAY").category == .todo, "todo category")
+
+    func projectItem(_ id: String, status: String?, fields: [String: String] = [:], assignees: [String] = [],
+                     author: String? = "bea", comments: Int = 0, last: CommentRef? = nil) -> ProjectItem {
+        ProjectItem(id: id, contentId: "C\(id)", kind: .issue, title: "Item \(id)", url: "https://example/\(id)",
+                    repo: "o/r", number: 1, state: "OPEN", statusOptionId: status, fields: fields,
+                    assignees: assignees, labels: [], author: author, updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                    commentCount: comments, lastComment: last, mentionsMe: false)
+    }
+    let todoOpt = StatusOption(id: "s1", name: "Todo", color: "GRAY")
+    let doingOpt = StatusOption(id: "s2", name: "In progress", color: "YELLOW")
+    func projectSnap(_ items: [ProjectItem]) -> ProjectSnapshot {
+        let summary = ProjectSummary(ref: ProjectRef(owner: "acme", number: 4), nodeId: "PVT_1", title: "Board",
+                                     url: "https://github.com/orgs/acme/projects/4", closed: false,
+                                     itemCount: items.count, ownerKind: .org)
+        return ProjectSnapshot(summary: summary, statusFieldId: "F", statusOptions: [todoOpt, doingOpt],
+                               items: items, fetchedAt: Date(timeIntervalSince1970: 1_700_000_100))
+    }
+    check(ProjectStore.diff(nil, projectSnap([projectItem("a", status: "s1")])).isEmpty, "first snapshot is quiet")
+    let before = projectSnap([projectItem("a", status: "s1", fields: ["Priority": "Low"], assignees: ["ada"])])
+    let comment = CommentRef(id: "c1", author: "grace", createdAt: Date(timeIntervalSince1970: 1_700_000_050), url: "https://example/c1")
+    let after = projectSnap([
+        projectItem("a", status: "s2", fields: ["Priority": "High"], assignees: ["ada", "grace"], comments: 2, last: comment),
+        projectItem("b", status: "s1"),
+    ])
+    let changes = ProjectStore.diff(before, after)
+    func changed(_ id: String, _ match: (ItemChange) -> Bool) -> Bool {
+        changes.contains { $0.itemId == id && match($0.1) }
+    }
+    check(changed("b") { if case .added = $0 { return true }; return false }, "diff added")
+    check(changed("a") { if case .status(let from, let to) = $0 { return from == "Todo" && to == "In progress" }; return false }, "diff status")
+    check(changed("a") { if case .field(let name, let from, let to) = $0 { return name == "Priority" && from == "Low" && to == "High" }; return false }, "diff field")
+    check(changed("a") { if case .assigned(let who) = $0 { return who == "grace" }; return false }, "diff assigned")
+    check(changed("a") { if case .comments(let n, let last) = $0 { return n == 2 && last.id == "c1" }; return false }, "diff comments")
+    let removed = ProjectStore.diff(after, projectSnap([projectItem("b", status: "s1")]))
+    check(removed.contains { $0.itemId == "a" && $0.1 == .removed }, "diff removed")
+
+    var notes: [(title: String, subtitle: String, body: String, id: String)] = []
+    let notifier = ProjectNotifier(me: { "ada" }, post: { notes.append(($0, $1, $2, $3)) })
+    var clock = Date(timeIntervalSince1970: 1_000_000)
+    notifier.now = { clock }
+    let mine = projectSnap([projectItem("a", status: "s1", assignees: ["ada"])])
+    let theirs = projectSnap([projectItem("b", status: "s1", assignees: ["bea"])])
+    let settings = ProjectNotificationSettings()
+    notifier.handle([("a", .mention)], in: mine, settings: settings)
+    notifier.handle([("b", .mention)], in: theirs, settings: settings)
+    check(notes.count == 1 && notes[0].id == "project:a", "mention only on my items")
+    notes = []
+    notifier.handle([("b", .status(from: "Todo", to: "Done"))], in: theirs, settings: settings)
+    notifier.handle([("a", .status(from: "Todo", to: "Done"))], in: mine, settings: settings)
+    check(notes.count == 1, "status notifies my items only by default")
+    notes = []
+    notifier.handle([("b", .added)], in: theirs, settings: settings)
+    check(notes.count == 1, "added notifies any item")
+    notes = []
+    clock = clock.addingTimeInterval(180)
+    notifier.handle([("b", .assigned("Ada"))], in: theirs, settings: settings)
+    notifier.handle([("b", .assigned("bea"))], in: theirs, settings: settings)
+    check(notes.count == 1 && notes[0].body == "Assigned Ada", "assigned notifies only me")
+    notes = []
+    let own = ItemChange.comments(new: 1, last: CommentRef(id: "c", author: "Ada", createdAt: clock, url: "u"))
+    notifier.handle([("a", own)], in: mine, settings: settings)
+    check(notes.isEmpty, "own comments are skipped")
+    notifier.handle([("a", .field(name: "Priority", from: "Low", to: "High"))], in: mine, settings: settings)
+    check(notes.isEmpty, "other fields stay quiet")
+    notes = []
+    notifier.handle([("a", .status(from: "Todo", to: "In progress"))], in: mine, settings: settings)
+    clock = clock.addingTimeInterval(60)
+    notifier.handle([("a", .closed)], in: mine, settings: settings)
+    check(notes.count == 2 && notes[0].id == notes[1].id, "grouped notification keeps one id")
+    check(notes[1].body.contains("Status") && notes[1].body.contains("Closed"), "grouped body \(notes[1].body)")
+    clock = clock.addingTimeInterval(180)
+    notifier.handle([("a", .reopened)], in: mine, settings: settings)
+    check(notes[2].body == "Reopened", "a new window after 2 minutes")
+
+    func relayEvent(_ json: String) -> RelayEvent {
+        try! JSONDecoder().decode(RelayEvent.self, from: Data(json.utf8))
+    }
+    let plan = relayApplyPlan([
+        relayEvent(#"{"seq":1,"deliveryId":"a","repo":"o/kept","kind":"workflow_run","action":"completed","runId":9}"#),
+        relayEvent(#"{"seq":2,"deliveryId":"b","repo":"","kind":"projects_v2_item","projectId":"PVT_1","itemId":"PVTI_1"}"#),
+        relayEvent(#"{"seq":3,"deliveryId":"c","repo":"acme/app","kind":"issues","issueNumber":4}"#),
+        relayEvent(#"{"seq":4,"deliveryId":"d","repo":"o/other","kind":"pull_request","prNumber":3}"#),
+    ], knownRepos: ["O/Kept"])
+    check(plan.repos == ["O/Kept"] && plan.completedRuns.count == 1
+            && plan.completedRuns[0].0 == "O/Kept" && plan.completedRuns[0].1 == 9, "relay plan keeps known repos")
+    check(plan.includePRs, "pull request events refresh PRs")
+    check(plan.projectNodeIds == ["PVT_1"] && plan.issues.count == 1
+            && plan.issues[0].repo == "acme/app" && plan.issues[0].number == 4, "relay plan splits project events")
+
+    let oldConfig = #"{"repos":["o/r"],"pollInterval":30}"#.data(using: .utf8)!
+    let decoded = try? JSONDecoder().decode(AppConfig.self, from: oldConfig)
+    check(decoded?.projects == nil && decoded?.repos == ["o/r"], "old config without projects decodes")
+
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
 
-// ─── PR Helpers ──────────────────────────────────────────────────────────────
-
-func prReviewIcon(_ pr: PR) -> String {
-    if pr.isDraft { return "pencil.circle" }
-    switch pr.reviewDecision ?? "" {
-    case "APPROVED": return "checkmark.circle.fill"
-    case "CHANGES_REQUESTED": return "xmark.circle.fill"
-    case "REVIEW_REQUIRED": return "circle.badge.questionmark"
-    default: return "circle.dashed"
-    }
-}
-
-func prReviewColor(_ pr: PR) -> NSColor {
-    if pr.isDraft { return .systemGray }
-    switch pr.reviewDecision ?? "" {
-    case "APPROVED": return C_SUCCESS
-    case "CHANGES_REQUESTED": return C_FAILURE
-    case "REVIEW_REQUIRED": return C_QUEUED
-    default: return .secondaryLabelColor
-    }
-}
-
-func prRelativeTime(_ iso: String) -> String {
-    guard let d = parseISO(iso) else { return "" }
-    return relativeTime(d)
-}
-
-func relativeTime(_ d: Date) -> String {
-    let secs = -d.timeIntervalSinceNow
-    if secs < 60 { return "just now" }
-    if secs < 3600 { return "\(Int(secs/60))m ago" }
-    if secs < 86400 { return "\(Int(secs/3600))h ago" }
-    return "\(Int(secs/86400))d ago"
-}
-
-let PR_ROW_H: CGFloat = 56
 
 // ─── Icon ────────────────────────────────────────────────────────────────────
 
@@ -1156,32 +901,46 @@ func tintedIcon(_ base: NSImage?, _ color: NSColor) -> NSImage {
 
 // Menu bar icon with a small status glyph (check / cross / hourglass) punched into
 // the bottom-right corner — the shape conveys state independently of the tint colour.
-func statusBadgedIcon(_ base: NSImage?, color: NSColor, badge: String?) -> NSImage {
+func statusBadgedIcon(_ base: NSImage?, color: NSColor, badge: String?, dot: Bool = false) -> NSImage {
     guard let base = base else { return NSImage() }
     let sz = base.size
     let img = NSImage(size: sz, flipped: false) { rect in
         base.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
         color.set()
         rect.fill(using: .sourceAtop)
-        guard let name = badge,
-              let sym = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return true }
-        let b: CGFloat = 10
-        let bRect = NSRect(x: sz.width - b, y: 0, width: b, height: b)
-        // Punch a clear ring so the badge separates from the cat silhouette.
-        if let ctx = NSGraphicsContext.current?.cgContext {
-            ctx.saveGState()
-            ctx.setBlendMode(.destinationOut)
-            NSColor.black.set()
-            NSBezierPath(ovalIn: bRect.insetBy(dx: -1.5, dy: -1.5)).fill()
-            ctx.restoreGState()
+        if let name = badge, let sym = NSImage(systemSymbolName: name, accessibilityDescription: nil) {
+            let b: CGFloat = 10
+            let bRect = NSRect(x: sz.width - b, y: 0, width: b, height: b)
+            // Punch a clear ring so the badge separates from the cat silhouette.
+            if let ctx = NSGraphicsContext.current?.cgContext {
+                ctx.saveGState()
+                ctx.setBlendMode(.destinationOut)
+                NSColor.black.set()
+                NSBezierPath(ovalIn: bRect.insetBy(dx: -1.5, dy: -1.5)).fill()
+                ctx.restoreGState()
+            }
+            let tinted = NSImage(size: bRect.size, flipped: false) { r in
+                sym.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1.0)
+                color.set()
+                r.fill(using: .sourceAtop)
+                return true
+            }
+            tinted.draw(in: bRect, from: .zero, operation: .sourceOver, fraction: 1.0)
         }
-        let tinted = NSImage(size: bRect.size, flipped: false) { r in
-            sym.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1.0)
-            color.set()
-            r.fill(using: .sourceAtop)
-            return true
+        // A blue dot for unread project items. The CI color keeps priority; the dot only adds information.
+        if dot {
+            let d: CGFloat = 5
+            let dRect = NSRect(x: sz.width - d - 0.5, y: sz.height - d - 0.5, width: d, height: d)
+            if let ctx = NSGraphicsContext.current?.cgContext {
+                ctx.saveGState()
+                ctx.setBlendMode(.destinationOut)
+                NSColor.black.set()
+                NSBezierPath(ovalIn: dRect.insetBy(dx: -1.2, dy: -1.2)).fill()
+                ctx.restoreGState()
+            }
+            C_RUNNING.setFill()
+            NSBezierPath(ovalIn: dRect).fill()
         }
-        tinted.draw(in: bRect, from: .zero, operation: .sourceOver, fraction: 1.0)
         return true
     }
     img.isTemplate = false
@@ -1204,6 +963,14 @@ struct RateLimit: Decodable {
     var fraction: Double { buckets.map { $0.bucket.fraction }.max() ?? 0 }
     var percent: Int { Int((fraction * 100).rounded()) }
     var color: NSColor { fraction >= 0.9 ? C_FAILURE : fraction >= 0.7 ? C_QUEUED : .secondaryLabelColor }
+
+    // REST and GraphQL sit side by side. The colour still follows the fuller bucket.
+    var footerLabel: String {
+        buckets.map { name, bucket in
+            let short = name == "GraphQL" ? "GQL" : name
+            return "\(short) \(Int((bucket.fraction * 100).rounded()))%"
+        }.joined(separator: " · ")
+    }
 
     var tooltip: String {
         let f = DateFormatter(); f.dateFormat = "h:mm a"
@@ -1235,1232 +1002,66 @@ final class RateLimitMonitor {
     }
 }
 
-// ─── Run Row View ────────────────────────────────────────────────────────────
 
-class RunRow: NSView {
-    let urlStr: String
-    let repo: String
-    let group: [Run]
-    let expanded: Bool
-    let showRepo: Bool
-    var onToggle: (() -> Void)?
-    var trackingArea: NSTrackingArea?
+// ─── Tab View ────────────────────────────────────────────────────────────────
 
-    init(repo: String, group: [Run], history: [Run], w: CGFloat, expanded: Bool = false, showRepo: Bool = false) {
-        let primary = RunRow.pickPrimary(group)
-        self.urlStr = primary.url
-        self.repo = repo
-        self.group = group
-        self.expanded = expanded
-        self.showRepo = showRepo
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: ROW_H))
-        wantsLayer = true
-        layer?.backgroundColor = restingColor
-        build(group: group, primary: primary, history: history, w: w)
-    }
-    required init?(coder: NSCoder) { fatalError() }
+enum Tab: Int, CaseIterable {
+    case actions, prs, projects, insights
 
-    var restingColor: CGColor? {
-        expanded ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.1).cgColor : nil
-    }
-
-    // Pick the run that drives the status icon, click target, and elapsed/ETA.
-    // Priority: in_progress (longest-running) > queued > completed-failure > anything else.
-    static func pickPrimary(_ group: [Run]) -> Run {
-        let inProg = group.filter { $0.status == "in_progress" }
-        if let r = inProg.max(by: { runElapsed($0) < runElapsed($1) }) { return r }
-        if let r = group.first(where: { $0.status == "queued" }) { return r }
-        if let r = group.first(where: { $0.isFailure && !IGNORED.contains($0) }) { return r }
-        return group[0]
-    }
-
-    func build(group: [Run], primary: Run, history: [Run], w: CGFloat) {
-        let pad: CGFloat = 12, iconSz: CGFloat = 20
-        let textX = pad + iconSz + 10, linkW: CGFloat = 28, copyW: CGFloat = 28
-        let rightW: CGFloat = 165          // fixed allocation for start time + duration
-        let rightX = w - rightW - linkW - copyW - 8
-        let textW = rightX - textX - 8     // leave 8px gap before the right column
-
-        let iv = NSImageView(frame: NSRect(x: pad, y: (ROW_H - iconSz) / 2, width: iconSz, height: iconSz))
-        let ignored = IGNORED.contains(primary)
-        let statusDesc = statusText(primary) + (ignored ? " (ignored)" : "")
-        if let img = NSImage(systemSymbolName: sfName(primary), accessibilityDescription: statusDesc) {
-            iv.image = img; iv.contentTintColor = ignored ? .systemGray : sfColor(primary)
-            iv.symbolConfiguration = .init(pointSize: 14, weight: .semibold)
-        }
-        iv.toolTip = statusDesc
-        addSubview(iv)
-
-        let title = lbl(primary.displayTitle, .systemFont(ofSize: 12.5, weight: .semibold))
-        title.frame = NSRect(x: textX, y: ROW_H - 24, width: textW, height: 18)
-        title.lineBreakMode = .byTruncatingTail
-        title.toolTip = primary.displayTitle
-        addSubview(title)
-
-        // Subtitle: branch badge + event + actor. For groups, the workflow list collapses to
-        // "N workflows" and a small stack chip with a (done/total) progress counter sits at the front.
-        let actor = primary.actorLogin.map { " by \($0)" } ?? ""
-        var subX = textX
-        var subRemaining = textW
-
-        if group.count > 1 {
-            let done = group.filter { $0.status == "completed" }.count
-            let chip = makeGroupChip(done: done, total: group.count)
-            chip.frame.origin = NSPoint(x: subX, y: 6)
-            addSubview(chip)
-            subX += chip.frame.width + 6
-            subRemaining -= chip.frame.width + 6
-        }
-
-        if showRepo {
-            let short = repo.components(separatedBy: "/").last ?? repo
-            let rb = Badge(short, maxChars: 22, tint: repoColor(repo))
-            rb.toolTip = repo
-            rb.frame.origin = NSPoint(x: subX, y: 4)
-            addSubview(rb)
-            subX += rb.frame.width + 6
-            subRemaining -= rb.frame.width + 6
-        }
-
-        if !primary.headBranch.isEmpty {
-            // Branch gets its own badge. Names over 15 characters keep both ends,
-            // and the tooltip shows the full name.
-            let bb = Badge(primary.headBranch, maxChars: 15)
-            bb.frame.origin = NSPoint(x: subX, y: 4)
-            addSubview(bb)
-            subX += bb.frame.width + 6
-            subRemaining -= bb.frame.width + 6
-        }
-
-        let wf = primary.workflowName ?? primary.name
-        let name = group.count > 1 ? "\(group.count) workflows" : wf
-        let number = group.count > 1 ? "" : " #\(primary.number)"
-        let sub = NSTextField(labelWithString: "")
-        let subAttr = NSMutableAttributedString(string: name, attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.labelColor])
-        subAttr.append(NSAttributedString(string: "\(number) \u{00B7} \(primary.event)\(actor)", attributes: [
-            .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]))
-        sub.attributedStringValue = subAttr
-        sub.frame = NSRect(x: subX, y: 6, width: subRemaining, height: 16)
-        sub.lineBreakMode = .byTruncatingTail; sub.maximumNumberOfLines = 1
-        sub.toolTip = sub.stringValue
-        addSubview(sub)
-
-        // Time column. For groups: earliest start, longest elapsed (driven by primary).
-        let groupStart = group.compactMap { parseISO($0.startedAt) ?? parseISO($0.createdAt) }.min()
-        let startedISO: String? = groupStart.map { isoFmt.string(from: $0) } ?? (primary.startedAt ?? primary.createdAt)
-
-        let anyActive = group.contains { $0.status == "in_progress" || $0.status == "queued" }
-        if anyActive {
-            let started = lbl(fmtStartedAt(startedISO), .systemFont(ofSize: 10.5), .secondaryLabelColor)
-            started.alignment = .right
-            started.frame = NSRect(x: rightX, y: ROW_H - 23, width: rightW, height: 14)
-            addSubview(started)
-
-            let el = LiveLabel.make(.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium), C_RUNNING) {
-                "\(fmtDuration(runElapsed(primary))) elapsed"
-            }
-            el.alignment = .right
-            el.frame = NSRect(x: rightX, y: 22, width: rightW, height: 14)
-            addSubview(el)
-
-            let est = estimatedTotal(for: primary, history: history)
-            let eta = LiveLabel.make(.monospacedDigitSystemFont(ofSize: 10, weight: .regular), .secondaryLabelColor) {
-                guard let est = est else { return "estimating..." }
-                let rem = max(0, est - runElapsed(primary))
-                return rem > 0 ? "~\(fmtDuration(rem)) remaining" : "finishing..."
-            }
-            eta.alignment = .right
-            eta.frame = NSRect(x: rightX, y: 6, width: rightW, height: 14)
-            addSubview(eta)
-        } else {
-            let started = lbl(fmtStartedAt(startedISO), .systemFont(ofSize: 10.5), .secondaryLabelColor)
-            started.alignment = .right
-            started.frame = NSRect(x: rightX, y: ROW_H - 23, width: rightW, height: 14)
-            addSubview(started)
-
-            // For groups: total wall-clock from earliest start to latest end.
-            let durText: String
-            if group.count > 1,
-               let s = groupStart,
-               let e = group.compactMap({ parseISO($0.updatedAt) }).max() {
-                durText = fmtDuration(e.timeIntervalSince(s))
-            } else {
-                durText = runDuration(primary)
-            }
-            // Spell out non-success outcomes so state is readable without colour.
-            let concl = primary.conclusion ?? ""
-            let word: String? = ignored ? "Ignored" : ["failure": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"][concl]
-            let failed = concl == "failure" && !ignored
-            let dur = lbl(word.map { "\($0) \u{00B7} \(durText)" } ?? durText,
-                          .systemFont(ofSize: 10, weight: failed ? .semibold : .regular),
-                          failed ? C_FAILURE : .secondaryLabelColor)
-            dur.alignment = .right
-            dur.frame = NSRect(x: rightX, y: 6, width: rightW, height: 14)
-            addSubview(dur)
-        }
-
-        let lk = NSButton(frame: NSRect(x: w - linkW - copyW - 4, y: (ROW_H - 24) / 2, width: linkW, height: 24))
-        if let img = NSImage(systemSymbolName: "arrow.up.right.square", accessibilityDescription: "Open in GitHub") { lk.image = img }
-        lk.bezelStyle = .recessed; lk.isBordered = false; lk.imagePosition = .imageOnly
-        lk.target = self; lk.action = #selector(openURL); lk.toolTip = "Open run on GitHub"
-        addSubview(lk)
-
-        let cp = NSButton(frame: NSRect(x: w - copyW - 4, y: (ROW_H - 24) / 2, width: copyW, height: 24))
-        if let img = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy URL") { cp.image = img }
-        cp.bezelStyle = .recessed; cp.isBordered = false; cp.imagePosition = .imageOnly
-        cp.target = self; cp.action = #selector(copyURL(_:)); cp.toolTip = "Copy run URL"
-        addSubview(cp)
-
-        let sep = NSView(frame: NSRect(x: textX, y: 0, width: w - textX - pad, height: 0.5))
-        sep.wantsLayer = true; sep.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        addSubview(sep)
-    }
-
-    @objc func openURL() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
-
-    // Right-click menu. Only completed runs can be re-run.
-    override func menu(for event: NSEvent) -> NSMenu? {
-        let m = NSMenu()
-        let done = group.filter { $0.status == "completed" }
-        let failed = group.filter { $0.isFailure }
-        func item(_ title: String, _ action: Selector, _ runs: [Run], into menu: NSMenu? = nil) {
-            let i = NSMenuItem(title: title, action: runs.isEmpty ? nil : action, keyEquivalent: "")
-            i.target = self; i.representedObject = runs
-            (menu ?? m).addItem(i)
-        }
-        if group.count > 1 {
-            item("Re-run all workflows", #selector(rerun(_:)), done)
-            item("Re-run failed jobs", #selector(rerunFailed(_:)), failed)
-            let one = NSMenu()
-            for r in group {
-                let wf = r.workflowName ?? r.name
-                item("\(wf) #\(r.number)", #selector(rerun(_:)), r.status == "completed" ? [r] : [], into: one)
-                if r.isFailure { item("\(wf) #\(r.number): failed jobs", #selector(rerunFailed(_:)), [r], into: one) }
-            }
-            let sub = NSMenuItem(title: "Re-run one workflow", action: nil, keyEquivalent: "")
-            sub.submenu = one
-            m.addItem(sub)
-        } else {
-            item("Re-run workflow", #selector(rerun(_:)), done)
-            item("Re-run failed jobs", #selector(rerunFailed(_:)), failed)
-        }
-        m.addItem(.separator())
-        let allIgnored = !failed.isEmpty && failed.allSatisfy { IGNORED.contains($0) }
-        item(allIgnored ? "Stop ignoring failure" : "Ignore failure", #selector(toggleIgnore(_:)), failed)
-        m.addItem(.separator())
-        item("Open on GitHub", #selector(openURL), group)
-        item("Copy URL", #selector(copyURL(_:)), group)
-        return m
-    }
-
-    @objc func rerun(_ sender: NSMenuItem) { app?.rerun(repo: repo, runs: sender.representedObject as? [Run] ?? [], failedOnly: false) }
-    @objc func rerunFailed(_ sender: NSMenuItem) { app?.rerun(repo: repo, runs: sender.representedObject as? [Run] ?? [], failedOnly: true) }
-    @objc func toggleIgnore(_ sender: NSMenuItem) {
-        let runs = sender.representedObject as? [Run] ?? []
-        app?.setIgnored(runs, ignored: !runs.allSatisfy { IGNORED.contains($0) })
-    }
-    var app: GHActionsBar? { NSApp.delegate as? GHActionsBar }
-
-    func lbl(_ text: String, _ font: NSFont, _ color: NSColor = .labelColor) -> NSTextField {
-        let l = NSTextField(labelWithString: text)
-        l.font = font; l.textColor = color; l.maximumNumberOfLines = 1
-        l.cell?.truncatesLastVisibleLine = true; return l
-    }
-
-    // Subtle "stack + (done/total)" indicator for grouped workflow runs.
-    func makeGroupChip(done: Int, total: Int) -> NSView {
-        let countText = "\(done)/\(total)"
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        let textW = (countText as NSString).size(withAttributes: [.font: font]).width
-        let iconW: CGFloat = 11, gap: CGFloat = 3, padX: CGFloat = 5
-        let w = padX + iconW + gap + textW + padX
-        let chip = NSView(frame: NSRect(x: 0, y: 0, width: w, height: 16))
-
-        let iv = NSImageView(frame: NSRect(x: padX, y: 2, width: iconW, height: 11))
-        if let img = NSImage(systemSymbolName: "square.stack.3d.up.fill", accessibilityDescription: "\(total) workflows") {
-            iv.image = img; iv.contentTintColor = .secondaryLabelColor
-            iv.symbolConfiguration = .init(pointSize: 9, weight: .medium)
-        }
-        chip.addSubview(iv)
-
-        let l = NSTextField(labelWithString: countText)
-        l.font = font; l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: padX + iconW + gap, y: 0, width: textW + 1, height: 14)
-        chip.addSubview(l)
-        chip.toolTip = "\(done) of \(total) workflows complete"
-        return chip
-    }
-
-    @objc func copyURL(_ sender: Any?) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(urlStr, forType: .string)
-        if let btn = sender as? NSButton,
-           let img = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil) {
-            let orig = btn.image; btn.image = img; btn.contentTintColor = C_SUCCESS
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { btn.image = orig; btn.contentTintColor = nil }
+    var title: String {
+        switch self {
+        case .actions: return "Actions"
+        case .prs: return "PRs"
+        case .projects: return "Projects"
+        case .insights: return "Insights"
         }
     }
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let t = trackingArea { removeTrackingArea(t) }
-        trackingArea = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
-        addTrackingArea(trackingArea!)
-    }
-    // Scrolling moves rows under a still pointer, so hover follows the real pointer position.
-    override func mouseEntered(with event: NSEvent) { animateHover() }
-    override func mouseExited(with event: NSEvent) { animateHover() }
-    func animateHover() {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; syncHover()
+    var isVisible: Bool {
+        switch self {
+        case .actions: return TABS.actions
+        case .prs: return TABS.prs
+        case .projects: return PROJECTS_CFG.showTab
+        case .insights: return TABS.insights
         }
     }
-    override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.25).cgColor
-    }
-    override func mouseUp(with event: NSEvent) {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; layer?.backgroundColor = restingColor
-        }
-        let loc = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(loc) else { return }
-        for sub in subviews where sub is NSButton { if sub.frame.contains(loc) { return } }
-        onToggle?()
-    }
 
-    func syncHover() {
-        guard let win = window else { return }
-        // visibleRect can extend past the row, so intersect it with bounds.
-        let inside = bounds.intersection(visibleRect).contains(convert(win.mouseLocationOutsideOfEventStream, from: nil))
-        layer?.backgroundColor = inside ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor : restingColor
-    }
-
-    // Keyboard accessibility
-    override var acceptsFirstResponder: Bool { true }
-    override var focusRingType: NSFocusRingType {
-        get { .exterior }
-        set {}
-    }
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 49 { // Return or Space
-            onToggle?()
-        } else { super.keyDown(with: event) }
+    static var visible: [Tab] {
+        let tabs = allCases.filter(\.isVisible)
+        return tabs.isEmpty ? [.actions] : tabs
     }
 }
-
-// ─── Run Detail View ─────────────────────────────────────────────────────────
-
-// Inline expansion under a run row. Renders synchronously from the detail caches;
-// TabVC kicks off background fetches and rebuilds when data lands.
-class RunDetailView: Flipped {
-    let urlStr: String
-
-    init(group: [Run], primary: Run, repo: String, history: [Run], w: CGFloat) {
-        self.urlStr = primary.url
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
-        let pad: CGFloat = 42, rPad: CGFloat = 16
-        let contentW = w - pad - rPad
-        var y: CGFloat = 10
-
-        func wrapped(_ text: String, _ font: NSFont, _ color: NSColor, maxH: CGFloat, indent: CGFloat = 0) {
-            let rect = (text as NSString).boundingRect(
-                with: NSSize(width: contentW - indent, height: maxH),
-                options: [.usesLineFragmentOrigin], attributes: [.font: font])
-            let h = min(ceil(rect.height) + 2, maxH)
-            let l = NSTextField(wrappingLabelWithString: text)
-            l.font = font; l.textColor = color
-            l.frame = NSRect(x: pad + indent, y: y, width: contentW - indent, height: h)
-            l.isSelectable = true
-            addSubview(l)
-            y += h + 4
-        }
-
-        func infoLine(_ name: String, _ value: @autoclosure @escaping () -> String, _ valueColor: NSColor = .labelColor,
-                      live: Bool = false) {
-            let n = NSTextField(labelWithString: name)
-            n.font = .systemFont(ofSize: 10.5); n.textColor = .tertiaryLabelColor
-            n.frame = NSRect(x: pad, y: y, width: 80, height: 15)
-            addSubview(n)
-            let font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium)
-            let v = live ? LiveLabel.make(font, valueColor, value) : NSTextField(labelWithString: value())
-            v.font = font; v.textColor = valueColor
-            v.frame = NSRect(x: pad + 84, y: y, width: contentW - 84, height: 15)
-            v.isSelectable = true
-            addSubview(v)
-            y += 17
-        }
-
-        func divider() {
-            let s = NSView(frame: NSRect(x: pad, y: y, width: contentW, height: 0.5))
-            s.wantsLayer = true; s.layer?.backgroundColor = NSColor.separatorColor.cgColor
-            addSubview(s); y += 7
-        }
-
-        // ── Full commit message ──
-        let cachedMsg = commitMsgCache[primary.headSha]
-        wrapped(cachedMsg ?? "Loading commit message\u{2026}",
-                .systemFont(ofSize: 11.5),
-                cachedMsg == nil ? .tertiaryLabelColor : .labelColor, maxH: 170)
-        y += 3
-        divider()
-
-        // ── Timing ──
-        let groupStart = group.compactMap { parseISO($0.startedAt) ?? parseISO($0.createdAt) }.min()
-        let allDone = group.allSatisfy { $0.status == "completed" }
-        let groupEnd = group.compactMap { parseISO($0.updatedAt) }.max()
-        if let s = groupStart { infoLine("Started", timestampFmt.string(from: s)) }
-        if allDone, let e = groupEnd {
-            infoLine("Completed", timestampFmt.string(from: e))
-            if let s = groupStart { infoLine("Duration", fmtDuration(e.timeIntervalSince(s))) }
-        } else {
-            infoLine("Elapsed", fmtDuration(runElapsed(primary)), C_RUNNING, live: true)
-        }
-        if let est = estimatedTotal(for: primary, history: history) {
-            infoLine("Expected", "~\(fmtDuration(est))")
-        }
-        y += 3
-        divider()
-
-        // ── Workflows ──
-        for run in group.prefix(8) {
-            let iv = NSImageView(frame: NSRect(x: pad, y: y + 1, width: 13, height: 13))
-            if let img = NSImage(systemSymbolName: sfName(run), accessibilityDescription: statusText(run)) {
-                iv.image = img; iv.contentTintColor = sfColor(run)
-                iv.symbolConfiguration = .init(pointSize: 9.5, weight: .semibold)
-            }
-            iv.toolTip = statusText(run)
-            addSubview(iv)
-            let name = NSTextField(labelWithString: "\(run.workflowName ?? run.name) #\(run.number)")
-            name.font = .systemFont(ofSize: 11); name.textColor = .labelColor
-            name.lineBreakMode = .byTruncatingTail; name.maximumNumberOfLines = 1
-            name.frame = NSRect(x: pad + 19, y: y, width: contentW - 19 - 155, height: 15)
-            addSubview(name)
-            let st = LiveLabel.make(.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
-                                    run.conclusion == "failure" ? C_FAILURE : .secondaryLabelColor) {
-                switch run.status {
-                case "completed": return "\(statusText(run)) \u{00B7} \(runDuration(run))"
-                case "in_progress": return "\(fmtDuration(runElapsed(run))) elapsed"
-                default: return statusText(run)
-                }
-            }
-            st.alignment = .right
-            st.frame = NSRect(x: pad + contentW - 150, y: y, width: 150, height: 15)
-            addSubview(st)
-            let open = Clicker(run.url)
-            open.frame = NSRect(x: pad, y: y, width: contentW, height: 15)
-            open.toolTip = "Open the workflow run on GitHub"
-            addSubview(open)
-            y += 18
-            y = layoutJobChips(run, repo: repo, x: pad + 19, y: y, w: contentW - 19)
-        }
-        if group.count > 8 {
-            wrapped("+ \(group.count - 8) more workflows", .systemFont(ofSize: 10), .tertiaryLabelColor, maxH: 14)
-        }
-
-        // ── Failure details ──
-        let failedRuns = group.filter { $0.conclusion == "failure" }
-        if !failedRuns.isEmpty {
-            y += 2
-            divider()
-            let hdr = NSTextField(labelWithString: "WHY IT FAILED")
-            hdr.font = .systemFont(ofSize: 9.5, weight: .bold); hdr.textColor = C_FAILURE
-            hdr.frame = NSRect(x: pad, y: y, width: contentW, height: 13)
-            addSubview(hdr); y += 18
-            for run in failedRuns.prefix(3) {
-                if group.count > 1 {
-                    wrapped(run.workflowName ?? run.name, .systemFont(ofSize: 10.5, weight: .semibold),
-                            .labelColor, maxH: 16)
-                }
-                if let fails = failureCache[run.id] {
-                    if fails.isEmpty {
-                        wrapped("No failure annotations \u{2014} open the run on GitHub for full logs.",
-                                .systemFont(ofSize: 10.5), .secondaryLabelColor, maxH: 30)
-                    }
-                    for f in fails {
-                        let head = f.step.map { "\(f.job) \u{00B7} \($0)" } ?? f.job
-                        wrapped(head, .systemFont(ofSize: 10.5, weight: .semibold), C_FAILURE, maxH: 32)
-                        if f.messages.isEmpty {
-                            wrapped("No annotation message \u{2014} see logs on GitHub.",
-                                    .systemFont(ofSize: 10), .secondaryLabelColor, maxH: 14, indent: 10)
-                        }
-                        for m in f.messages {
-                            wrapped(m, .monospacedSystemFont(ofSize: 10, weight: .regular),
-                                    .labelColor, maxH: 110, indent: 10)
-                        }
-                    }
-                } else {
-                    wrapped("Fetching failure details\u{2026}", .systemFont(ofSize: 10.5),
-                            .tertiaryLabelColor, maxH: 16)
-                }
-            }
-        }
-
-        // ── GitHub link ──
-        y += 4
-        let gh = NSButton(title: "View on GitHub", target: self, action: #selector(openGH))
-        gh.bezelStyle = .inline; gh.font = .systemFont(ofSize: 11, weight: .medium)
-        gh.contentTintColor = .linkColor
-        gh.frame = NSRect(x: pad, y: y, width: 130, height: 22)
-        addSubview(gh)
-        y += 32
-
-        frame = NSRect(x: 0, y: 0, width: w, height: y)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    @objc func openGH() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
-
-    // Wraps the run's job chips in rows. Returns the y below the last row.
-    private func layoutJobChips(_ run: Run, repo: String, x: CGFloat, y: CGFloat, w: CGFloat) -> CGFloat {
-        guard let jobs = jobsCache[run.id]?.jobs else {
-            let l = NSTextField(labelWithString: "Loading jobs\u{2026}")
-            l.font = .systemFont(ofSize: 10); l.textColor = .tertiaryLabelColor
-            l.frame = NSRect(x: x, y: y, width: w, height: 14)
-            addSubview(l)
-            return y + 18
-        }
-        let notes = Dictionary((failureCache[run.id] ?? []).map { ($0.job, $0.messages) }, uniquingKeysWith: { a, _ in a })
-        var cx = x, cy = y
-        for job in jobs {
-            let chip = JobChip(job: job, notes: notes[job.name] ?? [], maxW: w)
-            if cx > x && cx + chip.frame.width > x + w { cx = x; cy += JobChip.height + 4 }
-            chip.frame.origin = NSPoint(x: cx, y: cy)
-            addSubview(chip)
-            cx += chip.frame.width + 4
-        }
-        return jobs.isEmpty ? y : cy + JobChip.height + 8
-    }
-}
-
-// ─── PR Row View ─────────────────────────────────────────────────────────────
-
-class PRRow: NSView {
-    let urlStr: String
-    let expanded: Bool
-    var onToggle: (() -> Void)?
-    var trackingArea: NSTrackingArea?
-
-    init(_ pr: PR, repo: String, w: CGFloat, expanded: Bool) {
-        self.urlStr = pr.url
-        self.expanded = expanded
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: PR_ROW_H))
-        wantsLayer = true
-        layer?.backgroundColor = restingColor
-        build(pr, repo: repo, w: w)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    var restingColor: CGColor? {
-        expanded ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.1).cgColor : nil
-    }
-
-    func build(_ pr: PR, repo: String, w: CGFloat) {
-        let pad: CGFloat = 12, iconSz: CGFloat = 20
-        let textX = pad + iconSz + 10, linkW: CGFloat = 28, copyW: CGFloat = 28
-        let rightW: CGFloat = 140
-        let textW = w - textX - rightW - linkW - copyW
-
-        // Review status icon
-        let iv = NSImageView(frame: NSRect(x: pad, y: (PR_ROW_H - iconSz) / 2, width: iconSz, height: iconSz))
-        let reviewDesc = pr.isDraft ? "Draft" : (pr.reviewDecision ?? "Pending review")
-        if let img = NSImage(systemSymbolName: prReviewIcon(pr), accessibilityDescription: reviewDesc) {
-            iv.image = img; iv.contentTintColor = prReviewColor(pr)
-            iv.symbolConfiguration = .init(pointSize: 14, weight: .semibold)
-        }
-        iv.toolTip = reviewDesc
-        addSubview(iv)
-
-        // Title
-        let title = lbl(pr.title, .systemFont(ofSize: 12.5, weight: .semibold))
-        title.frame = NSRect(x: textX, y: PR_ROW_H - 24, width: textW, height: 18)
-        title.lineBreakMode = .byTruncatingTail
-        title.toolTip = pr.title
-        addSubview(title)
-
-        // Subtitle: #number by author + branch (bold number)
-        let sub = NSTextField(labelWithString: "")
-        let subAttr = NSMutableAttributedString()
-        subAttr.append(NSAttributedString(string: "#\(pr.number)", attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.labelColor,
-        ]))
-        subAttr.append(NSAttributedString(string: " by \(pr.author.login)", attributes: [
-            .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]))
-        sub.attributedStringValue = subAttr
-        sub.frame = NSRect(x: textX, y: 6, width: textW * 0.5, height: 16)
-        sub.lineBreakMode = .byTruncatingTail; sub.maximumNumberOfLines = 1
-        addSubview(sub)
-
-        // Branch badge: names over 15 characters keep both ends, the tooltip shows the full name
-        let badge = Badge(pr.headRefName, maxChars: 15, maxWidth: textW * 0.5 - 8)
-        badge.frame.origin = NSPoint(x: textX + textW * 0.5, y: 8)
-        addSubview(badge)
-
-        // Right side: +/- and time
-        let rX = w - rightW - linkW - copyW
-        let diffText = "+\(pr.additions) -\(pr.deletions)"
-        let diffLabel = lbl(diffText, .monospacedDigitSystemFont(ofSize: 10, weight: .medium), .secondaryLabelColor)
-        diffLabel.alignment = .right
-        diffLabel.frame = NSRect(x: rX, y: PR_ROW_H - 22, width: rightW - 4, height: 14)
-        addSubview(diffLabel)
-
-        let timeLabel = lbl(prRelativeTime(pr.updatedAt), .systemFont(ofSize: 10), .secondaryLabelColor)
-        timeLabel.alignment = .right
-        timeLabel.frame = NSRect(x: rX, y: 6, width: rightW - 4, height: 14)
-        addSubview(timeLabel)
-
-        // Draft badge
-        if pr.isDraft {
-            let draft = lbl("Draft", .systemFont(ofSize: 9, weight: .medium), .systemGray)
-            draft.frame = NSRect(x: rX, y: PR_ROW_H / 2 - 6, width: 32, height: 12)
-            addSubview(draft)
-        }
-
-        // Open in GitHub button
-        let linkBtn = NSButton(frame: NSRect(x: w - linkW - copyW - 4, y: (PR_ROW_H - 24) / 2, width: linkW, height: 24))
-        if let img = NSImage(systemSymbolName: "arrow.up.right.square", accessibilityDescription: "Open in GitHub") { linkBtn.image = img }
-        linkBtn.bezelStyle = .recessed; linkBtn.isBordered = false; linkBtn.imagePosition = .imageOnly
-        linkBtn.target = self; linkBtn.action = #selector(openURL)
-        addSubview(linkBtn)
-
-        // Copy URL button
-        let cpBtn = NSButton(frame: NSRect(x: w - copyW - 4, y: (PR_ROW_H - 24) / 2, width: copyW, height: 24))
-        if let img = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy URL") { cpBtn.image = img }
-        cpBtn.bezelStyle = .recessed; cpBtn.isBordered = false; cpBtn.imagePosition = .imageOnly
-        cpBtn.target = self; cpBtn.action = #selector(copyURL); cpBtn.toolTip = "Copy PR URL"
-        addSubview(cpBtn)
-
-        // Separator
-        let sep = NSView(frame: NSRect(x: textX, y: 0, width: w - textX - pad, height: 0.5))
-        sep.wantsLayer = true; sep.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        addSubview(sep)
-    }
-
-    func lbl(_ text: String, _ font: NSFont, _ color: NSColor = .labelColor) -> NSTextField {
-        let l = NSTextField(labelWithString: text)
-        l.font = font; l.textColor = color; l.maximumNumberOfLines = 1
-        l.cell?.truncatesLastVisibleLine = true; return l
-    }
-
-    @objc func openURL() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
-    @objc func copyURL() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(urlStr, forType: .string)
-    }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let t = trackingArea { removeTrackingArea(t) }
-        trackingArea = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
-        addTrackingArea(trackingArea!)
-    }
-    override func mouseEntered(with event: NSEvent) { animateHover() }
-    override func mouseExited(with event: NSEvent) { animateHover() }
-    func animateHover() {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; syncHover()
-        }
-    }
-    override func mouseDown(with event: NSEvent) {
-        layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.25).cgColor
-    }
-    override func mouseUp(with event: NSEvent) {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.15; ctx.allowsImplicitAnimation = true; layer?.backgroundColor = restingColor
-        }
-        let loc = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(loc) else { return }
-        for sub in subviews where sub is NSButton { if sub.frame.contains(loc) { return } }
-        onToggle?()
-    }
-
-    func syncHover() {
-        guard let win = window else { return }
-        // visibleRect can extend past the row, so intersect it with bounds.
-        let inside = bounds.intersection(visibleRect).contains(convert(win.mouseLocationOutsideOfEventStream, from: nil))
-        layer?.backgroundColor = inside ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor : restingColor
-    }
-
-    // Keyboard accessibility
-    override var acceptsFirstResponder: Bool { true }
-    override var focusRingType: NSFocusRingType {
-        get { .exterior }
-        set {}
-    }
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 49 { onToggle?() }
-        else { super.keyDown(with: event) }
-    }
-}
-
-// ─── PR Detail View ──────────────────────────────────────────────────────────
-
-class PRDetailView: NSView {
-    var onAction: ((PRAction) -> Void)?
-    var confirmingClose = false
-    var commentField: NSTextField!
-
-    init(_ pr: PR, repo: String, w: CGFloat) {
-        super.init(frame: .zero)
-        wantsLayer = true
-        // Inverse-of-background tint so the expanded panel is distinct from the doc bg in both modes.
-        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
-        let pad: CGFloat = 42, rPad: CGFloat = 16
-        let contentW = w - pad - rPad
-        var y: CGFloat = 8
-
-        // Body text
-        let bodyText = String((pr.body ?? "No description.").prefix(500))
-        let bodyAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11.5)]
-        let bodyRect = (bodyText as NSString).boundingRect(
-            with: NSSize(width: contentW, height: 100),
-            options: [.usesLineFragmentOrigin], attributes: bodyAttrs)
-        let bodyH = min(ceil(bodyRect.height) + 4, 100)
-        let bodyLabel = NSTextField(wrappingLabelWithString: bodyText)
-        bodyLabel.font = .systemFont(ofSize: 11.5); bodyLabel.textColor = .secondaryLabelColor
-        bodyLabel.frame = NSRect(x: pad, y: y, width: contentW, height: bodyH)
-        bodyLabel.maximumNumberOfLines = 6
-        addSubview(bodyLabel)
-        y += bodyH + 8
-
-        // Labels
-        if !pr.labels.isEmpty {
-            var lx: CGFloat = pad
-            for label in pr.labels.prefix(5) {
-                let lb = Badge(label.name)
-                lb.frame.origin = NSPoint(x: lx, y: y)
-                addSubview(lb)
-                lx += lb.frame.width + 6
-            }
-            y += 24
-        }
-
-        // Separator
-        let sep1 = NSView(frame: NSRect(x: pad, y: y, width: contentW, height: 0.5))
-        sep1.wantsLayer = true; sep1.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        addSubview(sep1); y += 8
-
-        // Action buttons row
-        let btnH: CGFloat = 24
-        var bx: CGFloat = pad
-
-        let approveBtn = makeBtn("Approve", color: C_SUCCESS, x: bx, y: y, h: btnH)
-        approveBtn.target = self; approveBtn.action = #selector(doApprove)
-        addSubview(approveBtn); bx += approveBtn.frame.width + 6
-
-        let changesBtn = makeBtn("Changes", color: C_QUEUED, x: bx, y: y, h: btnH)
-        changesBtn.target = self; changesBtn.action = #selector(doRequestChanges)
-        addSubview(changesBtn); bx += changesBtn.frame.width + 6
-
-        let mergePopup = NSPopUpButton(frame: NSRect(x: bx, y: y, width: 130, height: btnH), pullsDown: false)
-        mergePopup.addItems(withTitles: ["Merge commit", "Rebase", "Squash"])
-        mergePopup.font = .systemFont(ofSize: 11)
-        addSubview(mergePopup); mergePopup.tag = 100; bx += 136
-
-        let mergeBtn = makeBtn("Merge", color: .systemPurple, x: bx, y: y, h: btnH)
-        mergeBtn.target = self; mergeBtn.action = #selector(doMerge)
-        addSubview(mergeBtn); bx += mergeBtn.frame.width + 6
-
-        let closeBtn = makeBtn("Close", color: C_FAILURE, x: bx, y: y, h: btnH)
-        closeBtn.target = self; closeBtn.action = #selector(doClose(_:))
-        closeBtn.tag = 200
-        addSubview(closeBtn)
-        y += btnH + 10
-
-        // Comment field + submit
-        let sep2 = NSView(frame: NSRect(x: pad, y: y, width: contentW, height: 0.5))
-        sep2.wantsLayer = true; sep2.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        addSubview(sep2); y += 8
-
-        let cf = NSTextField(frame: NSRect(x: pad, y: y, width: contentW - 80, height: 24))
-        cf.placeholderString = "Leave a comment..."
-        cf.font = .systemFont(ofSize: 11.5)
-        addSubview(cf); commentField = cf
-
-        let submitBtn = makeBtn("Comment", color: .linkColor, x: pad + contentW - 72, y: y, h: 24)
-        submitBtn.target = self; submitBtn.action = #selector(doComment)
-        addSubview(submitBtn)
-        y += 32
-
-        self.frame = NSRect(x: 0, y: 0, width: w, height: y)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    func makeBtn(_ title: String, color: NSColor, x: CGFloat, y: CGFloat, h: CGFloat) -> NSButton {
-        let b = NSButton(title: title, target: nil, action: nil)
-        b.bezelStyle = .inline; b.font = .systemFont(ofSize: 11, weight: .medium)
-        b.contentTintColor = color
-        let tw = (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium)]).width
-        b.frame = NSRect(x: x, y: y, width: tw + 20, height: h)
-        return b
-    }
-
-    func disableActions(_ message: String) {
-        for sub in subviews where sub is NSButton {
-            (sub as! NSButton).isEnabled = false
-        }
-        commentField.isEnabled = false
-        commentField.stringValue = ""
-        commentField.placeholderString = message
-    }
-
-    @objc func doApprove() {
-        let body = commentField.stringValue.isEmpty ? nil : commentField.stringValue
-        disableActions("Approving...")
-        onAction?(.approve(body))
-    }
-    @objc func doRequestChanges() {
-        let body = commentField.stringValue
-        guard !body.isEmpty else { commentField.placeholderString = "Required: describe changes needed"; return }
-        disableActions("Submitting review...")
-        onAction?(.requestChanges(body))
-    }
-    @objc func doComment() {
-        let body = commentField.stringValue
-        guard !body.isEmpty else { return }
-        disableActions("Posting comment...")
-        onAction?(.comment(body))
-    }
-    @objc func doMerge() {
-        let popup = subviews.compactMap { $0 as? NSPopUpButton }.first(where: { $0.tag == 100 })
-        let methods = ["-m", "-r", "-s"]
-        let method = methods[popup?.indexOfSelectedItem ?? 0]
-        disableActions("Merging...")
-        onAction?(.merge(method))
-    }
-    @objc func doClose(_ sender: NSButton) {
-        if confirmingClose {
-            onAction?(.close)
-        } else {
-            confirmingClose = true
-            sender.title = "Sure?"; sender.contentTintColor = .white
-            sender.layer?.backgroundColor = C_FAILURE.cgColor; sender.layer?.cornerRadius = 4
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                guard let self = self, self.confirmingClose else { return }
-                self.confirmingClose = false
-                sender.title = "Close"; sender.contentTintColor = C_FAILURE
-                sender.layer?.backgroundColor = nil
-            }
-        }
-    }
-}
-
-// ─── Shared Views ────────────────────────────────────────────────────────────
-
-class Badge: NSView {
-    /// Text longer than `maxChars` keeps its first and last characters around an ellipsis.
-    let tint: NSColor?
-    init(_ text: String, maxChars: Int = .max, maxWidth: CGFloat = .greatestFiniteMagnitude, tint: NSColor? = nil) {
-        self.tint = tint
-        let half = (maxChars - 1) / 2
-        let shown = text.count > maxChars ? "\(text.prefix(half))\u{2026}\(text.suffix(half))" : text
-        let l = NSTextField(labelWithString: shown)
-        l.font = .monospacedSystemFont(ofSize: 10, weight: .medium)
-        l.textColor = tint == nil ? .secondaryLabelColor : .labelColor
-        l.alignment = .center
-        l.lineBreakMode = .byTruncatingMiddle
-        l.maximumNumberOfLines = 1
-        // The label cell needs a few points more than its intrinsic width, or it truncates.
-        let sz = l.intrinsicContentSize
-        let textW = ceil(sz.width) + 4
-        let w = min(textW + 14, maxWidth)
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 20))
-        l.frame = NSRect(x: 7, y: (20 - sz.height) / 2, width: w - 14, height: sz.height)
-        addSubview(l)
-        toolTip = text
-    }
-    required init?(coder: NSCoder) { fatalError() }
-    override func draw(_ dirtyRect: NSRect) {
-        let r = bounds.insetBy(dx: 0.5, dy: 0.5)
-        let p = NSBezierPath(roundedRect: r, xRadius: 6, yRadius: 6)
-        if let t = tint {
-            t.withAlphaComponent(0.22).setFill(); p.fill()
-            t.withAlphaComponent(0.6).setStroke(); p.lineWidth = 0.5; p.stroke()
-            return
-        }
-        // Inverse-of-background fill so the badge is visible in both modes:
-        // dark fill in light mode, light fill in dark mode.
-        NSColor.labelColor.withAlphaComponent(0.08).setFill(); p.fill()
-        NSColor.separatorColor.setStroke(); p.lineWidth = 0.5; p.stroke()
-    }
-}
-
-let REPO_PALETTE: [NSColor] = [
-    (0.36, 0.55, 0.95), (0.93, 0.45, 0.25), (0.30, 0.75, 0.45), (0.75, 0.45, 0.90),
-    (0.95, 0.75, 0.20), (0.20, 0.75, 0.80), (0.92, 0.40, 0.60), (0.55, 0.70, 0.25),
-    (0.60, 0.50, 0.40), (0.45, 0.45, 0.85), (0.95, 0.55, 0.45), (0.40, 0.60, 0.65),
-].map { NSColor(srgbRed: $0.0, green: $0.1, blue: $0.2, alpha: 1) }
-
-/// Gives each new repo the least used palette slot. The config keeps the slots, so colors stay the same.
-func assignRepoColors(_ repos: [String]) {
-    let new = repos.filter { REPO_COLORS[$0] == nil }
-    guard !new.isEmpty else { return }
-    var uses = [Int](repeating: 0, count: REPO_PALETTE.count)
-    for i in REPO_COLORS.values { uses[i % uses.count] += 1 }
-    for r in new {
-        let i = uses.indices.min { uses[$0] < uses[$1] }!
-        REPO_COLORS[r] = i
-        uses[i] += 1
-    }
-    saveConfig()
-}
-
-func repoColor(_ repo: String) -> NSColor {
-    assignRepoColors([repo])
-    return REPO_PALETTE[REPO_COLORS[repo]! % REPO_PALETTE.count]
-}
-
-class Header: NSView {
-    init(_ repo: String, w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: HDR_H))
-        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
-        let short = repo.components(separatedBy: "/").last ?? repo
-        let l = NSTextField(labelWithString: short.uppercased())
-        l.font = .systemFont(ofSize: 11, weight: .bold); l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 12, y: 6, width: w - 150, height: 20)
-        addSubview(l)
-        let reload = NSButton(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh \(short)")!,
-                              target: nil, action: nil)
-        reload.isBordered = false; reload.contentTintColor = .secondaryLabelColor
-        reload.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
-        reload.frame = NSRect(x: w - 132, y: 6, width: 20, height: 20)
-        reload.toolTip = "Get the latest runs from GitHub"
-        reload.target = self; reload.action = #selector(refreshRepo(_:))
-        addSubview(reload)
-        let link = NSTextField(labelWithString: "Open Actions")
-        link.font = .systemFont(ofSize: 10, weight: .medium); link.textColor = .linkColor
-        link.frame = NSRect(x: w - 105, y: 8, width: 93, height: 16); link.alignment = .right
-        addSubview(link)
-        let click = Clicker("https://github.com/\(repo)/actions")
-        click.frame = NSRect(x: w - 110, y: 0, width: 110, height: HDR_H)
-        addSubview(click)
-        self.repo = repo
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    private var repo = ""
-
-    // Polls GitHub for this repo at once, so a missed relay event does not hide new runs.
-    @objc func refreshRepo(_ sender: NSButton) {
-        guard let app = NSApp.delegate as? GHActionsBar else { return }
-        sender.isEnabled = false
-        app.refreshRepos([repo], includePRs: true, completedRuns: []) { _ in }
-    }
-}
-
-class Clicker: NSView {
-    let url: String
-    init(_ url: String) { self.url = url; super.init(frame: .zero) }
-    required init?(coder: NSCoder) { fatalError() }
-    override func mouseDown(with event: NSEvent) {}
-    override func mouseUp(with event: NSEvent) {
-        if let u = URL(string: url) { NSWorkspace.shared.open(u) }
-    }
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
-}
-
-class EmptyRow: NSView {
-    init(_ text: String, w: CGFloat, icon: String? = nil) {
-        let h: CGFloat = icon != nil ? 52 : 36
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
-        if let iconName = icon {
-            let iv = NSImageView(frame: NSRect(x: 16, y: (h - 20) / 2, width: 20, height: 20))
-            if let img = NSImage(systemSymbolName: iconName, accessibilityDescription: nil) {
-                iv.image = img; iv.contentTintColor = .secondaryLabelColor
-                iv.symbolConfiguration = .init(pointSize: 14, weight: .regular)
-            }
-            addSubview(iv)
-        }
-        let l = NSTextField(labelWithString: text)
-        l.font = .systemFont(ofSize: 12); l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 42, y: (h - 20) / 2, width: w - 54, height: 20)
-        addSubview(l)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class Flipped: NSView { override var isFlipped: Bool { true } }
-
-// A label that recomputes its text every second while it is in a window.
-final class LiveLabel: NSTextField {
-    var text: (() -> String)? { didSet { tick() } }
-    private var timer: Timer?
-
-    static func make(_ font: NSFont, _ color: NSColor, _ text: @escaping () -> String) -> LiveLabel {
-        let l = LiveLabel(labelWithString: "")
-        l.font = font; l.textColor = color; l.maximumNumberOfLines = 1
-        l.text = text
-        return l
-    }
-
-    private func tick() { if let t = text { stringValue = t() } }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        timer?.invalidate(); timer = nil
-        guard window != nil else { return }
-        tick()
-        // The common mode keeps it ticking while the list scrolls.
-        let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
-    }
-}
-
-class LoadingRow: NSView {
-    init(w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 48))
-        let spinner = NSProgressIndicator(frame: NSRect(x: 16, y: 14, width: 20, height: 20))
-        spinner.style = .spinning
-        spinner.controlSize = .small
-        spinner.startAnimation(nil)
-        addSubview(spinner)
-        let l = NSTextField(labelWithString: "Loading...")
-        l.font = .systemFont(ofSize: 12); l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 44, y: 14, width: w - 56, height: 20)
-        addSubview(l)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-// ─── Footer ──────────────────────────────────────────────────────────────────
-
-// ─── Insights tab views ──────────────────────────────────────────────────────
-
-class TitleRow: NSView {
-    init(_ text: String, w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 34))
-        let l = NSTextField(labelWithString: text)
-        l.font = .systemFont(ofSize: 12, weight: .semibold); l.textColor = .labelColor
-        l.frame = NSRect(x: 12, y: 8, width: w - 24, height: 18)
-        addSubview(l)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class SectionLabel: NSView {
-    init(_ text: String, w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: HDR_H))
-        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
-        let l = NSTextField(labelWithString: text)
-        l.font = .systemFont(ofSize: 11, weight: .bold); l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 12, y: 6, width: w - 24, height: 20)
-        addSubview(l)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class StatTile: NSView {
-    init(frame: NSRect, title: String, value: String, sub: String, subColor: NSColor) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
-        layer?.cornerRadius = 8
-        let t = NSTextField(labelWithString: title.uppercased())
-        t.font = .systemFont(ofSize: 9, weight: .semibold); t.textColor = .tertiaryLabelColor
-        t.frame = NSRect(x: 10, y: frame.height - 22, width: frame.width - 20, height: 13)
-        addSubview(t)
-        let v = NSTextField(labelWithString: value)
-        v.font = .monospacedDigitSystemFont(ofSize: 21, weight: .medium); v.textColor = .labelColor
-        v.frame = NSRect(x: 10, y: frame.height - 50, width: frame.width - 20, height: 26)
-        addSubview(v)
-        if !sub.isEmpty {
-            let s = NSTextField(labelWithString: sub)
-            s.font = .systemFont(ofSize: 10, weight: .medium); s.textColor = subColor
-            s.lineBreakMode = .byTruncatingTail
-            s.frame = NSRect(x: 10, y: 8, width: frame.width - 20, height: 14)
-            addSubview(s)
-        }
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class InsightsSummaryView: NSView {
-    override var isFlipped: Bool { true }
-    init(this t: WindowStats, last l: WindowStats, w: CGFloat) {
-        let pad: CGFloat = 12, gap: CGFloat = 10, cols: CGFloat = 3
-        let tileW = (w - pad * 2 - gap * (cols - 1)) / cols
-        let tileH: CGFloat = 76
-        let h = pad + tileH * 2 + gap + pad
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
-
-        // Returns ("▲ 12% vs prior", color) — green when the move is an improvement.
-        func delta(_ a: Double?, _ b: Double?, higherBetter: Bool, fmt: (Double) -> String, suffix: String = "") -> (String, NSColor) {
-            guard let a = a, let b = b else { return ("", .secondaryLabelColor) }
-            let d = a - b
-            if abs(d) < 0.0001 { return ("no change", .secondaryLabelColor) }
-            let up = d > 0
-            let good = (up == higherBetter)
-            return ("\(up ? "▲" : "▼") \(fmt(abs(d)))\(suffix) vs prior", good ? .systemGreen : .systemRed)
-        }
-        let intFmt: (Double) -> String = { String(Int($0)) }
-        let ptsFmt: (Double) -> String = { String(format: "%.0f", $0) }
-
-        let tiles: [(String, String, (String, NSColor))] = [
-            ("Runs", "\(t.total)", delta(Double(t.total), Double(l.total), higherBetter: true, fmt: intFmt)),
-            ("Pass rate", t.passRate.map(pct) ?? "—",
-             delta(t.passRate.map { $0 * 100 }, l.passRate.map { $0 * 100 }, higherBetter: true, fmt: ptsFmt, suffix: " pts")),
-            ("Failures", "\(t.failure)", delta(Double(t.failure), Double(l.failure), higherBetter: false, fmt: intFmt)),
-            ("Avg time", t.avgDuration.map(fmtDuration) ?? "—",
-             delta(t.avgDuration, l.avgDuration, higherBetter: false, fmt: fmtDuration)),
-            ("Deploys", "\(t.deployTotal)", delta(Double(t.deployTotal), Double(l.deployTotal), higherBetter: true, fmt: intFmt)),
-            ("Deploy pass", t.deployPassRate.map(pct) ?? "—",
-             delta(t.deployPassRate.map { $0 * 100 }, l.deployPassRate.map { $0 * 100 }, higherBetter: true, fmt: ptsFmt, suffix: " pts")),
-        ]
-        for (i, tile) in tiles.enumerated() {
-            let col = CGFloat(i % 3), row = CGFloat(i / 3)
-            let x = pad + col * (tileW + gap)
-            let y = pad + row * (tileH + gap)
-            addSubview(StatTile(frame: NSRect(x: x, y: y, width: tileW, height: tileH),
-                                title: tile.0, value: tile.1, sub: tile.2.0, subColor: tile.2.1))
-        }
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class InsightBulletRow: NSView {
-    init(_ text: String, w: CGFloat) {
-        let x: CGFloat = 14
-        let textW = w - x - 14
-        let font = NSFont.systemFont(ofSize: 12)
-        let h = textHeight("•  " + text, font: font, width: textW) + 14
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
-        let l = NSTextField(wrappingLabelWithString: "•  " + text)
-        l.font = font; l.textColor = .labelColor
-        l.frame = NSRect(x: x, y: 7, width: textW, height: h - 14)
-        addSubview(l)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class WorkflowStatRow: NSView {
-    init(_ s: WFStat, w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 30))
-        let name = NSTextField(labelWithString: s.workflow)
-        name.font = .systemFont(ofSize: 12, weight: .medium); name.textColor = .labelColor
-        name.lineBreakMode = .byTruncatingTail
-        name.frame = NSRect(x: 14, y: 6, width: w - 250, height: 18)
-        addSubview(name)
-        let stats = "\(s.total) runs   \(pct(s.failRate)) fail   \(s.avgDuration.map(fmtDuration) ?? "—")"
-        let r = NSTextField(labelWithString: stats)
-        r.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        r.textColor = s.failRate >= 0.2 ? .systemRed : .secondaryLabelColor
-        r.alignment = .right
-        r.frame = NSRect(x: w - 230, y: 7, width: 216, height: 16)
-        addSubview(r)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class CopyReportRow: NSView {
-    let markdown: String
-    init(this t: WindowStats, last l: WindowStats, insights: [String], thisRecs: [DeployRecord], w: CGFloat) {
-        self.markdown = buildAIReport(this: t, last: l, insights: insights, thisRecs: thisRecs)
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 52))
-        let btn = NSButton(title: "Copy report for AI", target: self, action: #selector(copyIt(_:)))
-        btn.bezelStyle = .rounded; btn.font = .systemFont(ofSize: 12, weight: .medium)
-        btn.frame = NSRect(x: 12, y: 12, width: 170, height: 28)
-        addSubview(btn)
-        let hint = NSTextField(labelWithString: "Copies a markdown report to paste into an AI agent.")
-        hint.font = .systemFont(ofSize: 10); hint.textColor = .tertiaryLabelColor
-        hint.frame = NSRect(x: 190, y: 17, width: w - 202, height: 16)
-        addSubview(hint)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-    @objc func copyIt(_ sender: NSButton) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(markdown, forType: .string)
-        sender.title = "Copied ✓"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { sender.title = "Copy report for AI" }
-    }
-}
-
-class Footer: NSView {
-    init(_ w: CGFloat, updated: Date) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: FTR_H))
-        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
-        let sep = NSView(frame: NSRect(x: 0, y: FTR_H - 0.5, width: w, height: 0.5))
-        sep.wantsLayer = true; sep.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        addSubview(sep)
-
-        let rb = NSButton(title: "Refresh", target: NSApp.delegate, action: #selector(GHActionsBar.doRefresh))
-        rb.bezelStyle = .inline; rb.font = .systemFont(ofSize: 11)
-        rb.frame = NSRect(x: 8, y: 8, width: 80, height: 24)
-        addSubview(rb)
-
-        quota.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
-        quota.frame = NSRect(x: 92, y: 11, width: 40, height: 16)
-        addSubview(quota)
-        showQuota((NSApp.delegate as? GHActionsBar)?.rateLimit.latest)
-
-        let ts = stamp
-        showUpdated(updated)
-        ts.font = .systemFont(ofSize: 10); ts.textColor = .secondaryLabelColor; ts.alignment = .center
-        ts.frame = NSRect(x: 134, y: 11, width: w - 274, height: 16)
-        addSubview(ts)
-
-        // Live updates: green = live, grey = polling, orange = relay error.
-        if let (color, tip) = (NSApp.delegate as? GHActionsBar)?.relay.statusDot {
-            let dot = Dot(color: color, frame: NSRect(x: w - 124, y: 15, width: 10, height: 10))
-            dot.toolTip = tip
-            addSubview(dot)
-        }
-
-        // Settings gear
-        let gear = NSButton(frame: NSRect(x: w - 100, y: 8, width: 36, height: 24))
-        if let img = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings") { gear.image = img }
-        gear.bezelStyle = .inline; gear.imagePosition = .imageOnly
-        gear.target = NSApp.delegate; gear.action = #selector(GHActionsBar.showSettings)
-        gear.toolTip = "Settings"
-        addSubview(gear)
-
-        let qb = NSButton(title: "Quit", target: NSApp.delegate, action: #selector(GHActionsBar.quitApp))
-        qb.bezelStyle = .inline; qb.font = .systemFont(ofSize: 11)
-        qb.frame = NSRect(x: w - 56, y: 8, width: 48, height: 24)
-        addSubview(qb)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    let quota = NSTextField(labelWithString: "")
-    let stamp = NSTextField(labelWithString: "")
-
-    func showUpdated(_ updated: Date) {
-        let f = DateFormatter(); f.dateFormat = "h:mm:ss a"
-        let version = (NSApp.delegate as? GHActionsBar).map { "v\($0.updater.current) · " } ?? ""
-        stamp.stringValue = "\(version)Updated \(f.string(from: updated))"
-    }
-
-    func showQuota(_ rl: RateLimit?) {
-        quota.stringValue = rl.map { "\($0.percent)%" } ?? ""
-        quota.textColor = rl?.color ?? .secondaryLabelColor
-        quota.toolTip = rl?.tooltip
-    }
-}
-
-// ─── Tab View (Actions + PRs) ────────────────────────────────────────────────
 
 let TAB_H: CGFloat = 36
+let SUB_H: CGFloat = 32
 
 class TabVC: NSViewController {
     var grouped: [(String, [Run])]
     var prGrouped: [(String, [PR])]
     var updated: Date
     var loading: Bool
-    var selectedTab: Int
+    var selectedTab: Tab
     var selectedRepo: String?
     var expandedPR: String?
     var expandedRun: String?
+    var expandedItem: String?
+    var projectView: ProjectView = PROJECTS_CFG.defaultView
+    var assignedOnly = false
+    var unreadOnly = false
+    var statusFilter: [String: String] = [:]
+    var showAllProjects: Set<String> = []
+    var selectedProject: String?
+    var projectError: String?
+    var timelineCache: [String: [ActivityEntry]] = [:]
     var scrollView: NSScrollView!
     var doc: Flipped!
     var footerView: NSView!
 
+    var showsSubBar: Bool { selectedTab == .actions || selectedTab == .projects }
+    var chrome: CGFloat { TAB_H + (showsSubBar ? SUB_H : 0) }
+
     init(grouped: [(String, [Run])], prGrouped: [(String, [PR])], updated: Date, loading: Bool,
-         tab: Int, repo: String?, expandedPR: String? = nil) {
+         tab: Tab, repo: String?, expandedPR: String? = nil) {
         self.grouped = grouped; self.prGrouped = prGrouped
         self.updated = updated; self.loading = loading
         self.selectedTab = tab; self.selectedRepo = repo; self.expandedPR = expandedPR
@@ -2473,53 +1074,32 @@ class TabVC: NSViewController {
         let container = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: POP_MAX_H))
         container.wantsLayer = true
 
-        // ── Top bar: tabs + repo filter ──
+        // ── Top bar: tabs + repo or project filter ──
         let topBar = NSView(frame: NSRect(x: 0, y: 0, width: w, height: TAB_H))
         topBar.wantsLayer = true
         topBar.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
 
-        let seg = NSSegmentedControl(labels: ["Actions", "PRs", "Insights"], trackingMode: .selectOne, target: self, action: #selector(tabChanged(_:)))
-        seg.selectedSegment = selectedTab
-        seg.frame = NSRect(x: 12, y: 6, width: 226, height: 24)
+        let tabs = Tab.visible
+        let unread = (NSApp.delegate as? GHActionsBar)?.projectStore.unreadCount() ?? 0
+        let labels = tabs.map { tab -> String in
+            if tab == .projects && unread > 0 { return "Projects \(unread)" }
+            return tab.title
+        }
+        let seg = NSSegmentedControl(labels: labels, trackingMode: .selectOne, target: self, action: #selector(tabChanged(_:)))
+        seg.selectedSegment = tabs.firstIndex(of: selectedTab) ?? 0
+        seg.frame = NSRect(x: 8, y: 6, width: min(420, w - 200), height: 24)
         seg.font = .systemFont(ofSize: 11, weight: .medium)
         topBar.addSubview(seg)
-
-        // Main/develop-only checkbox (Actions tab only)
-        if selectedTab == 0 {
-            let cb = NSButton(checkboxWithTitle: "Default only",
-                              target: self, action: #selector(toggleBranchFilter(_:)))
-            cb.font = .systemFont(ofSize: 11)
-            cb.state = FILTER_DEFAULT_BRANCHES ? .on : .off
-            cb.frame = NSRect(x: 246, y: 8, width: 104, height: 20)
-            cb.toolTip = "Hide workflow runs from branches other than main or develop"
-            topBar.addSubview(cb)
-
-            let sortCB = NSButton(checkboxWithTitle: "Recent first",
-                                  target: self, action: #selector(toggleSortByRecent(_:)))
-            sortCB.font = .systemFont(ofSize: 11)
-            sortCB.state = SORT_BY_RECENT ? .on : .off
-            sortCB.frame = NSRect(x: 352, y: 8, width: 100, height: 20)
-            sortCB.toolTip = "Show each run in its own row, newest first. Turn off to group the workflows of one commit."
-            topBar.addSubview(sortCB)
-        }
-
-        let repoFilter = NSPopUpButton(frame: NSRect(x: w - 200, y: 6, width: 188, height: 24), pullsDown: false)
-        repoFilter.font = .systemFont(ofSize: 11)
-        repoFilter.addItem(withTitle: "All Repos")
-        for repo in REPOS { repoFilter.addItem(withTitle: repo) }
-        if let sel = selectedRepo, let idx = REPOS.firstIndex(of: sel) { repoFilter.selectItem(at: idx + 1) }
-        else { repoFilter.selectItem(at: 0) }
-        repoFilter.target = self; repoFilter.action = #selector(repoChanged(_:))
-        repoFilter.tag = 300
-        topBar.addSubview(repoFilter)
+        buildFilterPopup(in: topBar, w: w)
         container.addSubview(topBar)
+        if showsSubBar { container.addSubview(subBar(w)) }
 
         // ── Footer (fixed at bottom) ──
         let footer = Footer(w, updated: updated)
 
         // ── Scroll content ──
-        let scrollH = POP_MAX_H - TAB_H - FTR_H
-        scrollView = NSScrollView(frame: NSRect(x: 0, y: TAB_H, width: w, height: scrollH))
+        let scrollH = POP_MAX_H - chrome - FTR_H
+        scrollView = NSScrollView(frame: NSRect(x: 0, y: chrome, width: w, height: scrollH))
         scrollView.hasVerticalScroller = true; scrollView.drawsBackground = false; scrollView.autohidesScrollers = true
         doc = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: scrollH))
         doc.wantsLayer = true
@@ -2556,13 +1136,16 @@ class TabVC: NSViewController {
             let w = POP_W
             var rows: [NSView] = []
 
-            if REPOS.isEmpty {
+            switch selectedTab {
+            case .projects:
+                rows = buildProjectsContent(w)
+            case .actions where REPOS.isEmpty, .prs where REPOS.isEmpty, .insights where REPOS.isEmpty:
                 rows.append(EmptyRow("No repos configured. Open Settings to get started.", w: w, icon: "gearshape"))
-            } else if selectedTab == 0 {
+            case .actions:
                 rows = buildActionsContent(w)
-            } else if selectedTab == 1 {
+            case .prs:
                 rows = buildPRContent(w)
-            } else {
+            case .insights:
                 rows = buildInsightsContent(w)
             }
 
@@ -2577,221 +1160,134 @@ class TabVC: NSViewController {
     // expansions grow the popover instead of forcing a scroll.
     func relayout() {
         guard footerView != nil else { return }
-        let scrollHMax = POP_MAX_H - TAB_H - FTR_H
+        let scrollHMax = POP_MAX_H - chrome - FTR_H
         let visScrollH = min(doc.frame.height, scrollHMax)
+        scrollView.frame.origin.y = chrome
         scrollView.frame.size.height = visScrollH
-        footerView.frame.origin.y = TAB_H + visScrollH
-        let totalH = TAB_H + visScrollH + FTR_H
+        footerView.frame.origin.y = chrome + visScrollH
+        let totalH = chrome + visScrollH + FTR_H
         view.frame.size.height = totalH
         preferredContentSize = NSSize(width: POP_W, height: totalH)
     }
 
-    func filteredGrouped() -> [(String, [Run])] {
-        let data = selectedRepo.map { sel in grouped.filter { $0.0 == sel } } ?? grouped
-        return SORT_BY_RECENT ? sortedByRecent(data) : data
-    }
 
-    func filteredPRs() -> [(String, [PR])] {
-        guard let sel = selectedRepo else { return prGrouped }
-        return prGrouped.filter { $0.0 == sel }
-    }
-
-    func buildActionsContent(_ w: CGFloat) -> [NSView] {
-        var rows: [NSView] = []
-        let data = filteredGrouped()
-        if let err = lastFetchError {
-            rows.append(EmptyRow(err, w: w, icon: "exclamationmark.triangle"))
-            return rows
-        }
-        if loading && data.isEmpty {
-            rows.append(LoadingRow(w: w)); return rows
-        }
-        if SORT_BY_RECENT {
-            if let sel = selectedRepo { rows.append(Header(sel, w: w)) }
-            let items = data.flatMap { repo, runs in
-                let visible = visibleRuns(runs)
-                return shownRuns(visible).map { (repo: repo, run: $0, history: visible) }
-            }.sorted { newerActivity($0.run, $1.run) }
-            for it in items {
-                appendRun(&rows, repo: it.repo, group: [it.run], history: it.history, w: w, showRepo: selectedRepo == nil)
-            }
-            if items.isEmpty {
-                rows.append(EmptyRow(FILTER_DEFAULT_BRANCHES ? "No recent runs on main or develop" : "No recent runs", w: w))
-            }
-            return rows
-        }
-        for (repo, runs) in data {
-            rows.append(Header(repo, w: w))
-            let visible = visibleRuns(runs)
-            if visible.isEmpty {
-                let msg = FILTER_DEFAULT_BRANCHES && !runs.isEmpty
-                    ? "No recent runs on main or develop"
-                    : "No recent runs"
-                rows.append(EmptyRow(msg, w: w))
-            } else {
-                let sorted = shownRuns(visible).sorted { a, b in
-                    let aActive = a.status == "in_progress" || a.status == "queued"
-                    let bActive = b.status == "in_progress" || b.status == "queued"
-                    if aActive != bActive { return aActive }
-                    return false  // preserve API order otherwise
+    func buildFilterPopup(in topBar: NSView, w: CGFloat) {
+        let popup = NSPopUpButton(frame: NSRect(x: w - 188, y: 6, width: 176, height: 24), pullsDown: false)
+        popup.font = .systemFont(ofSize: 11)
+        if selectedTab == .projects {
+            popup.addItem(withTitle: "All projects")
+            let projects = (NSApp.delegate as? GHActionsBar)?.projectCatalog.resolve(PROJECTS_CFG) ?? []
+            var lastOwner = ""
+            for p in projects {
+                if p.ref.owner.caseInsensitiveCompare(lastOwner) != .orderedSame {
+                    let head = NSMenuItem(title: p.ref.owner, action: nil, keyEquivalent: "")
+                    head.isEnabled = false
+                    popup.menu?.addItem(head)
+                    lastOwner = p.ref.owner
                 }
-                for group in groupRuns(sorted) {
-                    appendRun(&rows, repo: repo, group: group, history: visible, w: w, showRepo: false)
-                }
+                let item = NSMenuItem(title: "  " + p.title, action: nil, keyEquivalent: "")
+                item.representedObject = p.ref.key
+                popup.menu?.addItem(item)
+                if selectedProject == p.ref.key { popup.select(item) }
             }
+            if selectedProject == nil { popup.selectItem(at: 0) }
+            popup.action = #selector(projectChanged(_:))
+        } else {
+            popup.addItem(withTitle: "All Repos")
+            for repo in REPOS { popup.addItem(withTitle: repo) }
+            if let sel = selectedRepo, let idx = REPOS.firstIndex(of: sel) { popup.selectItem(at: idx + 1) }
+            else { popup.selectItem(at: 0) }
+            popup.action = #selector(repoChanged(_:))
         }
-        if rows.isEmpty { rows.append(EmptyRow("No actions to show", w: w)) }
-        return rows
+        popup.target = self
+        topBar.addSubview(popup)
     }
 
-    func shownRuns(_ visible: [Run]) -> [Run] { ONE_ROW_PER_WORKFLOW ? latestPerWorkflow(visible) : visible }
-
-    // Adds the row for a run group, and its detail view when it is expanded.
-    func appendRun(_ rows: inout [NSView], repo: String, group: [Run], history: [Run], w: CGFloat, showRepo: Bool) {
-        let primary = RunRow.pickPrimary(group)
-        let key = primary.url
-        let isExpanded = expandedRun == key
-        let row = RunRow(repo: repo, group: group, history: history, w: w, expanded: isExpanded, showRepo: showRepo)
-        row.onToggle = { [weak self] in
-            guard let self = self else { return }
-            self.expandedRun = self.expandedRun == key ? nil : key
-            self.rebuildContent()
+    func subBar(_ w: CGFloat) -> NSView {
+        let bar = NSView(frame: NSRect(x: 0, y: TAB_H, width: w, height: SUB_H))
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.75).cgColor
+        if selectedTab == .actions {
+            let cb = NSButton(checkboxWithTitle: "Default only", target: self, action: #selector(toggleBranchFilter(_:)))
+            cb.font = .systemFont(ofSize: 11)
+            cb.state = FILTER_DEFAULT_BRANCHES ? .on : .off
+            cb.frame = NSRect(x: 12, y: 6, width: 110, height: 20)
+            cb.toolTip = "Hide workflow runs from branches other than main or develop"
+            bar.addSubview(cb)
+            let sortCB = NSButton(checkboxWithTitle: "Recent first", target: self, action: #selector(toggleSortByRecent(_:)))
+            sortCB.font = .systemFont(ofSize: 11)
+            sortCB.state = SORT_BY_RECENT ? .on : .off
+            sortCB.frame = NSRect(x: 130, y: 6, width: 110, height: 20)
+            sortCB.toolTip = "Show each run in its own row, newest first. Turn off to group the workflows of one commit."
+            bar.addSubview(sortCB)
+        } else {
+            let seg = NSSegmentedControl(labels: ["By project", "Activity"], trackingMode: .selectOne,
+                                         target: self, action: #selector(projectViewChanged(_:)))
+            seg.selectedSegment = projectView == .activity ? 1 : 0
+            seg.font = .systemFont(ofSize: 11)
+            seg.frame = NSRect(x: 8, y: 4, width: 180, height: 24)
+            bar.addSubview(seg)
+            let mine = NSButton(checkboxWithTitle: "Assigned to me", target: self, action: #selector(toggleAssigned(_:)))
+            mine.font = .systemFont(ofSize: 11)
+            mine.state = assignedOnly ? .on : .off
+            mine.frame = NSRect(x: 200, y: 6, width: 120, height: 20)
+            bar.addSubview(mine)
+            let unread = NSButton(checkboxWithTitle: "Unread only", target: self, action: #selector(toggleUnread(_:)))
+            unread.font = .systemFont(ofSize: 11)
+            unread.state = unreadOnly ? .on : .off
+            unread.frame = NSRect(x: 326, y: 6, width: 110, height: 20)
+            bar.addSubview(unread)
         }
-        rows.append(row)
-        if isExpanded {
-            ensureRunDetail(repo: repo, group: group, key: key)
-            rows.append(RunDetailView(group: group, primary: primary, repo: repo, history: history, w: w))
-        }
-    }
-
-    // Fetch commit message + failure annotations for an expanded run in the
-    // background, then re-render. Results are cached so re-expanding is instant.
-    func ensureRunDetail(repo: String, group: [Run], key: String) {
-        let primary = RunRow.pickPrimary(group)
-        let sha = primary.headSha
-        let needMsg = !sha.isEmpty && commitMsgCache[sha] == nil
-        let needFails = group.filter { $0.conclusion == "failure" && failureCache[$0.id] == nil }
-        let needJobs = group.filter { jobsCache[$0.id]?.updatedAt != $0.updatedAt }
-        guard needMsg || !needFails.isEmpty || !needJobs.isEmpty else { return }
-        guard !detailFetchInFlight.contains(key) else { return }
-        detailFetchInFlight.insert(key)
-        let fallbackMsg = primary.displayTitle
-        let cachedJobs = jobsCache.mapValues(\.jobs)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let msg = needMsg ? fetchCommitMessage(repo: repo, sha: sha) : nil
-            var jobs: [(Run, [RunJob])] = []
-            for r in needJobs { if let j = fetchRunJobs(repo: repo, runId: r.id) { jobs.append((r, j)) } }
-            var fails: [(Int, [RunFailure])] = []
-            for r in needFails {
-                guard let j = jobs.first(where: { $0.0.id == r.id })?.1 ?? cachedJobs[r.id] else { continue }
-                fails.append((r.id, fetchRunFailures(repo: repo, jobs: j)))
-            }
-            DispatchQueue.main.async {
-                if commitMsgCache.count > 300 { commitMsgCache.removeAll() }
-                if failureCache.count > 200 { failureCache.removeAll() }
-                if jobsCache.count > 200 { jobsCache.removeAll() }
-                if needMsg { commitMsgCache[sha] = msg ?? fallbackMsg }
-                for (r, j) in jobs { jobsCache[r.id] = (r.updatedAt, j) }
-                for (id, f) in fails { failureCache[id] = f }
-                detailFetchInFlight.remove(key)
-                guard let self = self, self.expandedRun == key else { return }
-                self.rebuildContent()
-            }
-        }
-    }
-
-    func buildPRContent(_ w: CGFloat) -> [NSView] {
-        var rows: [NSView] = []
-        let data = filteredPRs()
-        if let err = lastFetchError {
-            rows.append(EmptyRow(err, w: w, icon: "exclamationmark.triangle"))
-            return rows
-        }
-        let hasPRs = data.contains { !$0.1.isEmpty }
-        if !hasPRs {
-            rows.append(EmptyRow("No pull requests awaiting your review", w: w, icon: "checkmark.seal"))
-            return rows
-        }
-        for (repo, prs) in data {
-            if prs.isEmpty { continue }
-            rows.append(Header(repo, w: w))
-            for pr in prs {
-                let key = "\(repo)#\(pr.number)"
-                let isExpanded = expandedPR == key
-                let row = PRRow(pr, repo: repo, w: w, expanded: isExpanded)
-                row.onToggle = { [weak self] in
-                    guard let self = self else { return }
-                    self.expandedPR = self.expandedPR == key ? nil : key
-                    // Semitransient when expanded (prevents accidental close while typing comment)
-                    let appDel = NSApp.delegate as? GHActionsBar
-                    appDel?.popover.behavior = self.expandedPR != nil ? .semitransient : .transient
-                    self.rebuildContent()
-                }
-                rows.append(row)
-                if isExpanded {
-                    let detail = PRDetailView(pr, repo: repo, w: w)
-                    detail.onAction = { [weak self] action in
-                        self?.handlePRAction(repo: repo, pr: pr, action: action)
-                    }
-                    rows.append(detail)
-                }
-            }
-        }
-        return rows
-    }
-
-    func buildInsightsContent(_ w: CGFloat) -> [NSView] {
-        var rows: [NSView] = []
-        let recs = DeployLog.shared.all()
-        if recs.isEmpty {
-            rows.append(EmptyRow("No deploy history yet. Cat Eye logs every workflow run it sees — check back after a few runs complete.", w: w, icon: "chart.bar"))
-            return rows
-        }
-        let now = Date()
-        let day = 86400.0
-        var thisR = recordsInWindow(recs, from: now.addingTimeInterval(-7 * day), to: now.addingTimeInterval(1))
-        var lastR = recordsInWindow(recs, from: now.addingTimeInterval(-14 * day), to: now.addingTimeInterval(-7 * day))
-        if let sel = selectedRepo {
-            thisR = thisR.filter { $0.repo == sel }
-            lastR = lastR.filter { $0.repo == sel }
-        }
-        let tw = computeWindow(thisR)
-        let lw = computeWindow(lastR)
-        let insights = generateInsights(this: tw, last: lw)
-
-        rows.append(TitleRow("Last 7 days vs previous 7", w: w))
-        rows.append(InsightsSummaryView(this: tw, last: lw, w: w))
-        rows.append(SectionLabel("INSIGHTS", w: w))
-        for i in insights { rows.append(InsightBulletRow(i, w: w)) }
-        if !tw.byWorkflow.isEmpty {
-            rows.append(SectionLabel("PER-WORKFLOW (7d)", w: w))
-            for wf in tw.byWorkflow.values.sorted(by: { $0.total > $1.total }).prefix(12) {
-                rows.append(WorkflowStatRow(wf, w: w))
-            }
-        }
-        rows.append(CopyReportRow(this: tw, last: lw, insights: insights, thisRecs: thisR, w: w))
-        return rows
-    }
-
-    func handlePRAction(repo: String, pr: PR, action: PRAction) {
-        executePRAction(repo: repo, number: pr.number, action: action) {
-            (NSApp.delegate as? GHActionsBar)?.doRefresh()
-        }
+        return bar
     }
 
     @objc func tabChanged(_ sender: NSSegmentedControl) {
-        selectedTab = sender.selectedSegment
+        let tabs = Tab.visible
+        let idx = min(max(0, sender.selectedSegment), tabs.count - 1)
+        selectedTab = tabs[idx]
         // Reassigning contentViewController is what NSPopover observes at show time;
         // calling loadView() alone leaves stale tab body visible in an already-shown popover.
         let appDel = NSApp.delegate as? GHActionsBar
+        rememberProjectUI()
         appDel?.selectedTab = selectedTab
         appDel?.selectedRepo = selectedRepo
         expandedPR = nil
         expandedRun = nil
-        // A fresh TabVC also rebuilds the top bar, so the branch-filter checkbox
-        // shows/hides with the tab.
         appDel?.applySystemAppearance()
         appDel?.buildWithAppearance { appDel?.popover.contentViewController = appDel?.makeTabVC() }
+    }
+
+    func rememberProjectUI() {
+        let app = NSApp.delegate as? GHActionsBar
+        app?.projectView = projectView
+        app?.projectAssignedOnly = assignedOnly
+        app?.projectUnreadOnly = unreadOnly
+        app?.expandedItem = expandedItem
+        app?.selectedProject = selectedProject
+        app?.projectStatusFilter = statusFilter
+        app?.projectShowAll = showAllProjects
+    }
+
+    @objc func projectViewChanged(_ sender: NSSegmentedControl) {
+        projectView = sender.selectedSegment == 1 ? .activity : .board
+        rememberProjectUI()
+        rebuildContent()
+    }
+    @objc func toggleAssigned(_ sender: NSButton) {
+        assignedOnly = sender.state == .on
+        rememberProjectUI()
+        rebuildContent()
+    }
+    @objc func toggleUnread(_ sender: NSButton) {
+        unreadOnly = sender.state == .on
+        rememberProjectUI()
+        rebuildContent()
+    }
+    @objc func projectChanged(_ sender: NSPopUpButton) {
+        selectedProject = sender.selectedItem?.representedObject as? String
+        rememberProjectUI()
+        expandedItem = nil
+        rebuildContent()
     }
 
     @objc func toggleBranchFilter(_ sender: NSButton) {
@@ -2831,51 +1327,6 @@ class TabVC: NSViewController {
     }
 }
 
-// ─── Settings View ───────────────────────────────────────────────────────────
-
-class SettingsHeader: NSView {
-    init(_ title: String, y: CGFloat, w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: y, width: w, height: 28))
-        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.7).cgColor
-        let l = NSTextField(labelWithString: title)
-        l.font = .systemFont(ofSize: 10, weight: .bold); l.textColor = .secondaryLabelColor
-        l.frame = NSRect(x: 16, y: 6, width: w - 100, height: 16)
-        addSubview(l)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-class SeparatorLine: NSView {
-    init(y: CGFloat, w: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: y, width: w, height: 0.5))
-        wantsLayer = true; layer?.backgroundColor = NSColor.separatorColor.cgColor
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
-// Back button plus the Repositories / Live updates tabs.
-class SettingsNav: NSView {
-    init(w: CGFloat, selected: Int) {
-        super.init(frame: NSRect(x: 0, y: 0, width: w, height: 44))
-        wantsLayer = true; layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
-        let back = NSButton(title: "Back", target: NSApp.delegate, action: #selector(GHActionsBar.showList))
-        back.bezelStyle = .inline; back.font = .systemFont(ofSize: 12)
-        back.frame = NSRect(x: 8, y: 10, width: 70, height: 24)
-        addSubview(back)
-        let seg = NSSegmentedControl(labels: ["Repositories", "Live updates"], trackingMode: .selectOne,
-                                     target: self, action: #selector(tabChanged(_:)))
-        seg.selectedSegment = selected
-        seg.font = .systemFont(ofSize: 11, weight: .medium)
-        seg.frame = NSRect(x: w / 2 - 110, y: 10, width: 220, height: 24)
-        addSubview(seg)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    @objc func tabChanged(_ sender: NSSegmentedControl) {
-        let app = NSApp.delegate as? GHActionsBar
-        sender.selectedSegment == 1 ? app?.showRelaySettings() : app?.showSettings()
-    }
-}
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -2886,7 +1337,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     var fallbackTimer: Timer?
     var lastFallbackPRRefresh = Date.distantPast
     var isPulsing = false
-    struct IconKey: Equatable { let color: NSColor; let badge: String?; let active: Bool }
+    struct IconKey: Equatable { let color: NSColor; let badge: String?; let active: Bool; let dot: Bool }
     var iconKey: IconKey?
     var refreshInFlight = false
     var pendingCompletion: (() -> Void)?
@@ -2898,13 +1349,42 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     var firstLoad = true
     var ghIcon: NSImage?
     var prevStatuses: [String: String] = [:]
-    var selectedTab: Int = 0
+    var selectedTab: Tab = .actions
     var selectedRepo: String? = nil
+    var selectedProject: String?
+    var projectView: ProjectView = .board
+    var projectAssignedOnly = false
+    var projectUnreadOnly = false
+    var expandedItem: String?
+    var projectStatusFilter: [String: String] = [:]
+    var projectShowAll: Set<String> = []
+    var pendingProjectItem: String?
+    var lastSettingsTab: SettingsTab = .general
+    var lastSyncedOrgs: [String] = []
+    var ghScopes = Set<String>()
+    var scopesKnown = false
+    var viewerLogin: String?
     var appearanceObs: NSKeyValueObservation?
     var warnedStatusItemMissing = false
     var statusItemRecheckDone = false
     let relayDeployer = RelayDeployer()
     let catalog = RepoCatalog(path: REPO_CACHE_PATH)
+    let projectCatalog = ProjectCatalog(api: ProjectAPI(), path: PROJECT_CACHE_PATH)
+    lazy var projectNotifier: ProjectNotifier = {
+        ProjectNotifier(me: { [weak self] in self?.viewerLogin }, post: { [weak self] title, subtitle, body, id in
+            self?.notify(title: title, subtitle: subtitle, body: body, id: id)
+        })
+    }()
+    lazy var projectStore: ProjectStore = {
+        let s = ProjectStore(api: ProjectAPI(), notifier: projectNotifier,
+                             statePath: PROJECT_STATE_PATH, activityPath: PROJECT_ACTIVITY_PATH)
+        s.relayIsLive = { [weak self] in self?.relay.state == .live }
+        s.onChange = { [weak self] in
+            self?.updateIcon()
+            self?.reloadList()
+        }
+        return s
+    }()
     var catalogTimer: Timer?
     let rateLimit = RateLimitMonitor()
     let updater = Updater()
@@ -2989,6 +1469,24 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         catalog.refreshIfStale()
         catalogTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.catalog.refreshIfStale()
+            self?.projectCatalog.refreshIfStale()
+        }
+        projectStore.track(projectCatalog.resolve(PROJECTS_CFG), live: liveProjectKeys())
+        syncProjectOrgs()
+        projectCatalog.refreshIfStale()
+        NotificationCenter.default.addObserver(forName: ProjectCatalog.changed, object: projectCatalog, queue: .main) { [weak self] _ in
+            guard let self = self, !self.projectCatalog.refreshing else { return }
+            self.projectStore.track(self.projectCatalog.resolve(PROJECTS_CFG), live: self.liveProjectKeys())
+            self.syncProjectOrgs()
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let scopes = ProjectAPI().scopes()
+            let login = getGHUser()
+            DispatchQueue.main.async {
+                self?.ghScopes = scopes
+                self?.scopesKnown = true
+                self?.viewerLogin = login
+            }
         }
     }
 
@@ -3259,7 +1757,57 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 }
             }
             relayDeployer.pruneHooks(removed: removed)
+            syncProjectOrgs()
         }
+    }
+
+    func trackedOrgLogins() -> [String] {
+        var seen = Set<String>()
+        return projectCatalog.resolve(PROJECTS_CFG).compactMap { p -> String? in
+            guard p.ownerKind == .org, seen.insert(p.ref.owner.lowercased()).inserted else { return nil }
+            return p.ref.owner
+        }
+    }
+
+    func liveProjectKeys() -> Set<String> {
+        Set(projectCatalog.resolve(PROJECTS_CFG).filter { p in
+            guard p.ownerKind == .org else { return false }
+            switch relayDeployer.hooks.statuses["org:\(p.ref.owner)"] {
+            case .live, .waiting: return true
+            default: return false
+            }
+        }.map(\.ref.key))
+    }
+
+    func applyProjectSelection() {
+        projectStore.track(projectCatalog.resolve(PROJECTS_CFG), live: liveProjectKeys())
+        projectStore.restartTimer()
+        syncProjectOrgs()
+        updateIcon()
+        if popover.isShown, popover.contentViewController is ProjectSettingsVC {
+            showList()
+        }
+    }
+
+    func syncProjectOrgs() {
+        guard !RELAY.deviceID.isEmpty, !RELAY.workerURL.isEmpty else { return }
+        let orgs = trackedOrgLogins()
+        let removed = lastSyncedOrgs.filter { old in !orgs.contains { $0.caseInsensitiveCompare(old) == .orderedSame } }
+        lastSyncedOrgs = orgs
+        relayDeployer.registerRepos()
+        if !removed.isEmpty { relayDeployer.pruneOrgHooks(removed: removed) }
+        guard !orgs.isEmpty else { return }
+        let d = relayDeployer
+        d.perform("Install org webhooks", { d.installOrgHooks(orgs: orgs) }) { [weak self] _ in
+            self?.projectStore.track(self?.projectCatalog.resolve(PROJECTS_CFG) ?? [], live: self?.liveProjectKeys() ?? [])
+        }
+    }
+
+    var needsProjectScope: Bool {
+        guard scopesKnown, !ghScopes.isEmpty else {
+            return projectStore.lastError?.localizedCaseInsensitiveContains("scope") == true
+        }
+        return !ghScopes.contains("project") && !ghScopes.contains("read:project")
     }
 
     func onConfigSaved(previous: [String]) {
@@ -3284,10 +1832,11 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         statusItem.button?.toolTip = "Cat Eye \u{2014} \(label)"
         // Setting the image redraws the item on each display, which fires the appearance
         // observer again. Without this check the two loop and use a full CPU core.
-        let key = IconKey(color: color, badge: badge, active: active)
+        let dot = PROJECTS_CFG.menuDot && projectStore.unreadCount() > 0
+        let key = IconKey(color: color, badge: badge, active: active, dot: dot)
         guard key != iconKey else { return }
         iconKey = key
-        statusItem.button?.image = statusBadgedIcon(ghIcon, color: color, badge: badge)
+        statusItem.button?.image = statusBadgedIcon(ghIcon, color: color, badge: badge, dot: dot)
         if active { startAnimation() } else { stopAnimation() }
     }
 
@@ -3413,7 +1962,17 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler handler: @escaping () -> Void) {
-        DispatchQueue.main.async { self.closeTime = .distantPast; self.toggle() }
+        let id = response.notification.request.identifier
+        DispatchQueue.main.async {
+            self.closeTime = .distantPast
+            if id.hasPrefix("project:") {
+                self.pendingProjectItem = String(id.dropFirst("project:".count))
+                self.selectedTab = .projects
+                self.expandedItem = self.pendingProjectItem
+                if self.popover.isShown { self.popover.close() }
+            }
+            self.toggle()
+        }
         handler()
     }
 
@@ -3426,8 +1985,18 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     // MARK: - Popover
 
     func makeTabVC() -> TabVC {
-        TabVC(grouped: grouped, prGrouped: prGrouped, updated: lastUpdate, loading: firstLoad,
-              tab: selectedTab, repo: selectedRepo)
+        let vc = TabVC(grouped: grouped, prGrouped: prGrouped, updated: lastUpdate, loading: firstLoad,
+                       tab: selectedTab, repo: selectedRepo)
+        vc.projectView = projectView
+        vc.assignedOnly = projectAssignedOnly
+        vc.unreadOnly = projectUnreadOnly
+        vc.expandedItem = pendingProjectItem ?? expandedItem
+        vc.selectedProject = selectedProject
+        vc.statusFilter = projectStatusFilter
+        vc.showAllProjects = projectShowAll
+        if pendingProjectItem != nil { selectedTab = .projects; vc.selectedTab = .projects }
+        pendingProjectItem = nil
+        return vc
     }
 
     @objc func toggle() {
@@ -3483,40 +2052,47 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             self.updateIcon()
             // Discard the stale view tree (its CGColors are baked in the OLD appearance).
             // Next show reconstructs under the new drawing context.
-            let wasShownAsSettings = self.popover.contentViewController is SettingsVC
-            let wasShownAsRelay = self.popover.contentViewController is RelaySettingsVC
+            let wasSettings = self.popover.contentViewController is GeneralSettingsVC
+                || self.popover.contentViewController is ActionsSettingsVC
+                || self.popover.contentViewController is ProjectSettingsVC
+                || self.popover.contentViewController is RelaySettingsVC
+            let settingsTab = self.lastSettingsTab
             let wasShown = self.popover.isShown
             self.popover.close()
             self.popover.contentViewController = nil
             if wasShown {
                 self.closeTime = .distantPast
-                if wasShownAsSettings { self.showSettings() }
-                else if wasShownAsRelay { self.showRelaySettings() }
+                if wasSettings { self.showSettings(settingsTab) }
                 else { self.toggle() }
             }
         }
     }
 
-    @objc func showSettings() {
-        popover.behavior = .transient
+    @objc func showSettings() { showSettings(lastSettingsTab) }
+
+    func showSettings(_ tab: SettingsTab) {
+        lastSettingsTab = tab
+        popover.behavior = tab == .live ? .semitransient : .transient
         applySystemAppearance()
-        buildWithAppearance { self.popover.contentViewController = SettingsVC(catalog: catalog, updater: updater, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS)) }
+        buildWithAppearance {
+            switch tab {
+            case .general:
+                self.popover.contentViewController = GeneralSettingsVC(catalog: self.catalog, updater: self.updater)
+            case .actions:
+                self.popover.contentViewController = ActionsSettingsVC(catalog: self.catalog, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS))
+            case .projects:
+                self.popover.contentViewController = ProjectSettingsVC(catalog: self.projectCatalog, store: self.projectStore, cfg: PROJECTS_CFG)
+            case .live:
+                self.popover.contentViewController = RelaySettingsVC(deployer: self.relayDeployer, client: self.relay)
+            }
+        }
         if !popover.isShown {
             closeTime = .distantPast
             toggle()
         }
     }
 
-    @objc func showRelaySettings() {
-        applySystemAppearance()
-        // Login and installs leave the app, which would close a transient popover.
-        popover.behavior = .semitransient
-        buildWithAppearance { self.popover.contentViewController = RelaySettingsVC(deployer: relayDeployer, client: relay) }
-        if !popover.isShown {
-            closeTime = .distantPast
-            toggle()
-        }
-    }
+    @objc func showRelaySettings() { showSettings(.live) }
 
     @objc func showList() {
         popover.behavior = .transient
@@ -3551,7 +2127,15 @@ extension GHActionsBar: RelaySink {
 
     // A gap in the log: refresh every repo.
     func relayFullRefresh(done: @escaping (Bool) -> Void) {
-        refreshRepos(REPOS, includePRs: true, completedRuns: [], done: done)
+        refreshRepos(REPOS, includePRs: true, completedRuns: []) { ok in
+            self.projectStore.refresh(self.projectStore.tracked.map(\.ref.key), force: true) { projectOK in
+                done(ok && projectOK)
+            }
+        }
+    }
+
+    func relayProjectRefresh(projectNodeIds: [String], issues: [(repo: String, number: Int)], done: @escaping (Bool) -> Void) {
+        projectStore.refreshForEvents(projectNodeIds: projectNodeIds, issues: issues, done: done)
     }
 
     func relayStateChanged() {

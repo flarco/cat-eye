@@ -34,7 +34,7 @@ final class RelaySettingsVC: NSViewController {
         let container = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: POP_MAX_H))
         container.wantsLayer = true
         container.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.85).cgColor
-        container.addSubview(SettingsNav(w: w, selected: 1))
+        container.addSubview(SettingsNav(w: w, selected: .live))
         container.addSubview(SeparatorLine(y: 44, w: w))
 
         scroll = NSScrollView(frame: NSRect(x: 0, y: 44.5, width: w, height: POP_MAX_H - 44.5))
@@ -73,7 +73,11 @@ final class RelaySettingsVC: NSViewController {
 
     func afterInspect() {
         checked = true
-        if deployer.state.joined && !lastHealthCheckRecent { deployer.checkHooks(repos: REPOS); lastHealthCheck = Date() }
+        if deployer.state.joined && !lastHealthCheckRecent {
+            deployer.checkHooks(repos: REPOS)
+            deployer.checkOrgHooks(orgs: (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? [])
+            lastHealthCheck = Date()
+        }
         rebuild()
         if autoSetup { runNext() }
     }
@@ -121,8 +125,14 @@ final class RelaySettingsVC: NSViewController {
             }
         case .hooks:
             let repos = REPOS
-            d.perform("Install webhooks", { d.installHooks(repos: repos) }) { ok in
+            let orgs = (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? []
+            d.perform("Install webhooks", {
+                let reposOK = d.installHooks(repos: repos)
+                let orgsOK = orgs.isEmpty || d.installOrgHooks(orgs: orgs)
+                return reposOK && orgsOK
+            }) { ok in
                 d.checkHooks(repos: repos)
+                d.checkOrgHooks(orgs: orgs)
                 after(ok)
             }
         case .live:
@@ -177,12 +187,26 @@ final class RelaySettingsVC: NSViewController {
                 y += 6
             }
 
+            let orgs = (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? []
+            if s.joined || !orgs.isEmpty {
+                y = section("ORG WEBHOOKS", y: y, buttons: [("Check again", #selector(checkOrgHooks))],
+                            enabled: [deployer.busy == nil && s.joined && !orgs.isEmpty])
+                if orgs.isEmpty {
+                    y = line("Track an organization project to add org webhooks.", y: y)
+                } else {
+                    for org in orgs { y = orgRow(org, y: y) }
+                }
+                y = pollNote(y)
+                y += 6
+            }
+
             // Health
             if let h = s.health {
                 y = section("HEALTH", y: y, buttons: [("Check now", #selector(checkAgain))], enabled: [deployer.busy == nil])
                 let oldest = h.oldestAt.map { relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "none"
                 let lastHook = h.lastWebhookAt.map { relativeAgo(Date(timeIntervalSince1970: $0 / 1000)) } ?? "never"
                 y = line("Events kept: \(h.events) · oldest \(oldest) · last webhook \(lastHook)", y: y)
+                y = line("Project events (24h): \(h.projectEventsToday)", y: y)
                 let q = WriteQuota(rowsToday: h.rowsWrittenToday, now: Date())
                 let pct = Int((q.fraction * 100).rounded())
                 y = line("Writes today: about \(h.rowsWrittenToday) · projected \(q.projected) / \(FREE_ROWS_PER_DAY) per day (free plan, \(pct)%)",
@@ -355,6 +379,38 @@ final class RelaySettingsVC: NSViewController {
         SetupStep.allCases.filter { $0.rawValue < step.rawValue }.allSatisfy { isDone($0) || $0 == .hooks }
     }
 
+    func orgRow(_ org: String, y: CGFloat) -> CGFloat {
+        let st = deployer.hooks.statuses["org:\(org)"] ?? .unknown
+        let row = NSView(frame: NSRect(x: 0, y: y, width: POP_W, height: 26))
+        row.addSubview(Dot(color: hookColor(st), frame: NSRect(x: 18, y: 8, width: 8, height: 8)))
+        row.addSubview(label(org, x: 34, y: 5, width: 110, size: 12))
+        let pills = label("item · project · issues · comment", x: 148, y: 5, width: 250, size: 11, color: .secondaryLabelColor)
+        pills.toolTip = ORG_RELAY_EVENTS.joined(separator: ", ")
+        row.addSubview(pills)
+        let title: String
+        switch st {
+        case .live, .waiting: title = "Check again"
+        default: title = "Add project events"
+        }
+        let b = button(title, #selector(orgHookAction(_:)), x: POP_W - 156, y: 2, width: 140)
+        b.identifier = NSUserInterfaceItemIdentifier(org)
+        b.isEnabled = deployer.busy == nil && deployer.state.joined
+        b.toolTip = deployer.describe(st)
+        row.addSubview(b)
+        body.addSubview(row)
+        return y + 26
+    }
+
+    func pollNote(_ y: CGFloat) -> CGFloat {
+        let row = NSView(frame: NSRect(x: 0, y: y, width: POP_W, height: 24))
+        let minutes = min(30, max(2, PROJECTS_CFG.pollMinutes))
+        row.addSubview(label("Personal projects use polling every \(minutes) min.", x: 16, y: 4, width: 340, size: 11, color: .secondaryLabelColor))
+        let b = button("Settings → Projects", #selector(openProjectSettings), x: 360, y: 1, width: 150)
+        row.addSubview(b)
+        body.addSubview(row)
+        return y + 28
+    }
+
     func hookColor(_ s: HookStatus) -> NSColor {
         switch s {
         case .live, .waiting: return C_SUCCESS
@@ -440,6 +496,29 @@ final class RelaySettingsVC: NSViewController {
     @objc func stepRelay() { run(.relay) }
     @objc func stepJoin() { run(.join) }
     @objc func stepHooks() { run(.hooks) }
+
+    @objc func checkOrgHooks() {
+        deployer.checkOrgHooks(orgs: (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? [])
+    }
+
+    @objc func orgHookAction(_ sender: NSButton) {
+        guard let org = sender.identifier?.rawValue else { return }
+        let st = deployer.hooks.statuses["org:\(org)"] ?? .unknown
+        switch st {
+        case .live, .waiting:
+            deployer.checkOrgHooks(orgs: [org])
+        default:
+            let d = deployer
+            d.perform("Install org webhook for \(org)", { d.installOrgHooks(orgs: [org]) }) { [weak self] _ in
+                d.checkOrgHooks(orgs: [org])
+                self?.rebuild()
+            }
+        }
+    }
+
+    @objc func openProjectSettings() {
+        (NSApp.delegate as? GHActionsBar)?.showSettings(.projects)
+    }
     @objc func stepLive() { run(.live) }
 
     @objc func accountChanged(_ sender: NSPopUpButton) {

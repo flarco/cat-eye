@@ -15,9 +15,11 @@ struct RelayConfig: Codable {
 
 var RELAY = RelayConfig()
 let RELAY_DIR = (CONFIG_DIR as NSString).appendingPathComponent("relay")
-let RELAY_BUNDLED_VERSION = 1    // keep equal to RELAY_VERSION in worker/wrangler.jsonc
+let RELAY_BUNDLED_VERSION = 2    // keep equal to RELAY_VERSION in worker/wrangler.jsonc
 let RELAY_WORKER_NAME = "cat-eye-relay"
 let RELAY_EVENTS = ["workflow_run", "workflow_job", "pull_request", "pull_request_review"]
+// Org hooks only. Repo hooks keep RELAY_EVENTS, so an issue is not delivered twice.
+let ORG_RELAY_EVENTS = ["projects_v2_item", "projects_v2", "issues", "issue_comment"]
 let FREE_ROWS_PER_DAY = 100_000
 
 func randomHex(_ bytes: Int) -> String {
@@ -250,6 +252,30 @@ struct RelayEvent: Decodable {
     let runId: Int?
     let jobId: Int?
     let prNumber: Int?
+    let org: String?
+    let projectId: String?
+    let itemId: String?
+    let issueNumber: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case seq, deliveryId, repo, kind, action, runId, jobId, prNumber, org, projectId, itemId, issueNumber
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seq = try c.decode(Int.self, forKey: .seq)
+        deliveryId = try c.decode(String.self, forKey: .deliveryId)
+        repo = try c.decode(String.self, forKey: .repo)
+        kind = try c.decode(String.self, forKey: .kind)
+        action = try c.decodeIfPresent(String.self, forKey: .action)
+        runId = try c.decodeIfPresent(Int.self, forKey: .runId)
+        jobId = try c.decodeIfPresent(Int.self, forKey: .jobId)
+        prNumber = try c.decodeIfPresent(Int.self, forKey: .prNumber)
+        org = try c.decodeIfPresent(String.self, forKey: .org)
+        projectId = try c.decodeIfPresent(String.self, forKey: .projectId)
+        itemId = try c.decodeIfPresent(String.self, forKey: .itemId)
+        issueNumber = try c.decodeIfPresent(Int.self, forKey: .issueNumber)
+    }
 }
 
 struct RelayEventsPage: Decodable {
@@ -266,11 +292,33 @@ struct RelayDevice: Decodable {
     let lastSeen: Double?
     let lag: Int
     let repos: [String]
+    let orgs: [String]
     let connected: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, lastSeen, lag, repos, orgs, connected
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        lastSeen = try c.decodeIfPresent(Double.self, forKey: .lastSeen)
+        lag = try c.decode(Int.self, forKey: .lag)
+        repos = try c.decodeIfPresent([String].self, forKey: .repos) ?? []
+        orgs = try c.decodeIfPresent([String].self, forKey: .orgs) ?? []
+        connected = try c.decode(Bool.self, forKey: .connected)
+    }
 }
 
 struct RelayHook: Decodable {
     let repo: String
+    let hookId: Int?
+    let lastDelivery: Double?
+}
+
+struct RelayOrgHook: Decodable {
+    let org: String
     let hookId: Int?
     let lastDelivery: Double?
 }
@@ -285,6 +333,28 @@ struct RelayHealth: Decodable {
     let rowsWrittenToday: Int
     let devices: [RelayDevice]
     let hooks: [RelayHook]
+    let orgHooks: [RelayOrgHook]
+    let projectEventsToday: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case version, retentionHours, head, events, oldestAt, lastWebhookAt, rowsWrittenToday
+        case devices, hooks, orgHooks, projectEventsToday
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(String.self, forKey: .version)
+        retentionHours = try c.decode(Int.self, forKey: .retentionHours)
+        head = try c.decode(Int.self, forKey: .head)
+        events = try c.decode(Int.self, forKey: .events)
+        oldestAt = try c.decodeIfPresent(Double.self, forKey: .oldestAt)
+        lastWebhookAt = try c.decodeIfPresent(Double.self, forKey: .lastWebhookAt)
+        rowsWrittenToday = try c.decode(Int.self, forKey: .rowsWrittenToday)
+        devices = try c.decode([RelayDevice].self, forKey: .devices)
+        hooks = try c.decode([RelayHook].self, forKey: .hooks)
+        orgHooks = try c.decodeIfPresent([RelayOrgHook].self, forKey: .orgHooks) ?? []
+        projectEventsToday = try c.decodeIfPresent(Int.self, forKey: .projectEventsToday) ?? 0
+    }
 }
 
 enum RelayFailure: Error, CustomStringConvertible {
@@ -342,14 +412,16 @@ struct RelayAPI {
     func health() -> Result<RelayHealth, RelayFailure> { send("GET", "/v1/health") }
     func events(after: Int) -> Result<RelayEventsPage, RelayFailure> { send("GET", "/v1/events?after=\(after)&limit=500") }
     func ack(_ seq: Int) -> Bool { (try? send("POST", "/v1/ack", body: ["seq": seq], as: OK.self).get()) != nil }
-    func registerSelf(name: String, repos: [String]) -> Result<OK, RelayFailure> {
-        send("PUT", "/v1/devices/self", body: ["name": name, "repos": repos])
+    func registerSelf(name: String, repos: [String], orgs: [String] = []) -> Result<OK, RelayFailure> {
+        send("PUT", "/v1/devices/self", body: ["name": name, "repos": repos, "orgs": orgs])
     }
     func removeDevice(_ id: String) -> Bool { (try? send("DELETE", "/v1/devices/\(id)", as: OK.self).get()) != nil }
     func setRetention(hours: Int) -> Result<OK, RelayFailure> { send("PUT", "/v1/config", body: ["retentionHours": hours]) }
     func webhookSecret() -> String? { try? send("GET", "/v1/webhook-secret", as: Secret.self).get().secret }
     func putHook(repo: String, id: Int) -> Bool { (try? send("PUT", "/v1/hooks/\(repo)", body: ["hookId": id], as: OK.self).get()) != nil }
     func deleteHook(repo: String) -> Bool { (try? send("DELETE", "/v1/hooks/\(repo)", as: OK.self).get()) != nil }
+    func putOrgHook(org: String, id: Int) -> Bool { (try? send("PUT", "/v1/org-hooks/\(org)", body: ["hookId": id], as: OK.self).get()) != nil }
+    func deleteOrgHook(org: String) -> Bool { (try? send("DELETE", "/v1/org-hooks/\(org)", as: OK.self).get()) != nil }
 }
 
 // ─── Webhooks on GitHub ──────────────────────────────────────────────────────
@@ -460,6 +532,82 @@ final class HookManager {
     func delete(repo: String, hookId: Int) -> Bool {
         let ok = gh(["api", "-X", "DELETE", "repos/\(repo)/hooks/\(hookId)"])?.ok == true
         lock.lock(); _statuses[repo] = nil; lock.unlock()
+        return ok
+    }
+
+    func findOrg(org: String, url: String) -> Lookup {
+        guard let r = gh(["api", "orgs/\(org)/hooks?per_page=100", "--jq", "[.[] | {id, url: .config.url}]"]) else {
+            return .failed(.error("gh failed to start"))
+        }
+        if !r.ok { return .failed(denied(r) ? .pollingOnly("Not an org owner") : .error(String(r.err.prefix(80)))) }
+        let hooks = (try? JSONDecoder().decode([GHHook].self, from: r.out)) ?? []
+        return hooks.first { $0.url == url }.map { .found($0.id) } ?? .missing
+    }
+
+    // Org hooks need admin:org_hook and the org owner role. Denied access stays on polling.
+    func ensureOrg(org: String, workerURL: String, secret: String, api: RelayAPI) -> HookStatus {
+        let url = workerURL + "/webhook"
+        let key = "org:\(org)"
+        let body: [String: Any] = [
+            "name": "web", "active": true, "events": ORG_RELAY_EVENTS,
+            "config": ["url": url, "content_type": "json", "secret": secret, "insecure_ssl": "0"],
+        ]
+        let existing: Int?
+        switch findOrg(org: org, url: url) {
+        case .failed(let s): setStatus(key, s); return s
+        case .missing: existing = nil
+        case .found(let id): existing = id
+        }
+        let res = existing.map { gh(["api", "-X", "PATCH", "orgs/\(org)/hooks/\($0)", "--jq", ".id"], body: body) }
+            ?? gh(["api", "-X", "POST", "orgs/\(org)/hooks", "--jq", ".id"], body: body)
+        guard let r = res else { return .error("gh failed to start") }
+        guard r.ok, let id = Int(String(decoding: r.out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            let s: HookStatus = denied(r) ? .pollingOnly("Not an org owner") : .error(String(r.err.prefix(80)))
+            setStatus(key, s); return s
+        }
+        _ = api.putOrgHook(org: org, id: id)
+        _ = gh(["api", "-X", "POST", "orgs/\(org)/hooks/\(id)/pings"])
+        setStatus(key, .waiting)
+        return .waiting
+    }
+
+    func checkOrg(org: String, workerURL: String) -> HookStatus {
+        let key = "org:\(org)"
+        let id: Int
+        switch findOrg(org: org, url: workerURL + "/webhook") {
+        case .failed(let s): setStatus(key, s); return s
+        case .missing: setStatus(key, .error("No hook")); return .error("No hook")
+        case .found(let found): id = found
+        }
+        guard let r = gh(["api", "orgs/\(org)/hooks/\(id)/deliveries?per_page=5",
+                          "--jq", "[.[] | {status_code, delivered_at}]"]), r.ok,
+              let list = try? JSONDecoder().decode([Delivery].self, from: r.out) else {
+            setStatus(key, .waiting); return .waiting
+        }
+        guard let last = list.first else { setStatus(key, .waiting); return .waiting }
+        let ago = parseISO(last.delivered_at).map { relativeAgo($0) } ?? ""
+        let s: HookStatus
+        switch last.status_code {
+        case 200..<300: s = .live("\(last.status_code) · \(ago)")
+        case 401: s = .error("Secret mismatch (401) · \(ago)")
+        default: s = .error("HTTP \(last.status_code) · \(ago)")
+        }
+        setStatus(key, s)
+        return s
+    }
+
+    func patchOrgSecret(org: String, hookId: Int, secret: String) -> Bool {
+        let body: [String: Any] = ["config": ["url": RELAY.workerURL + "/webhook", "content_type": "json",
+                                              "secret": secret, "insecure_ssl": "0"]]
+        return gh(["api", "-X", "PATCH", "orgs/\(org)/hooks/\(hookId)", "--jq", ".id"], body: body)?.ok == true
+    }
+
+    func deleteOrg(org: String, hookId: Int) -> Bool {
+        let ok = gh(["api", "-X", "DELETE", "orgs/\(org)/hooks/\(hookId)"])?.ok == true
+        lock.lock()
+        let drop = _statuses.keys.filter { $0.lowercased() == "org:\(org.lowercased())" }
+        for k in drop { _statuses[k] = nil }
+        lock.unlock()
         return ok
     }
 }
@@ -643,8 +791,9 @@ final class RelayDeployer {
         secrets.set(SecretStore.deviceToken, token)
         DispatchQueue.main.sync { RELAY.deviceID = id; saveConfig() }
         // A new secret takes a few seconds to reach the edge.
+        let orgs = trackedOrgs()
         for _ in 0..<15 {
-            if case .success = api.registerSelf(name: Host.current().localizedName ?? "Mac", repos: REPOS) {
+            if case .success = api.registerSelf(name: Host.current().localizedName ?? "Mac", repos: REPOS, orgs: orgs) {
                 if let s = api.webhookSecret() { secrets.set(SecretStore.webhookSecret, s) }
                 return true
             }
@@ -682,9 +831,15 @@ final class RelayDeployer {
         }
     }
 
+    func trackedOrgs() -> [String] {
+        let read = { (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? [] }
+        if Thread.isMainThread { return read() }
+        return DispatchQueue.main.sync(execute: read)
+    }
+
     func registerRepos() {
-        let api = self.api, repos = REPOS
-        work.async { _ = api.registerSelf(name: Host.current().localizedName ?? "Mac", repos: repos) }
+        let api = self.api, repos = REPOS, orgs = trackedOrgs()
+        work.async { _ = api.registerSelf(name: Host.current().localizedName ?? "Mac", repos: repos, orgs: orgs) }
     }
 
     func webhookSecret() -> String? {
@@ -715,6 +870,44 @@ final class RelayDeployer {
         work.async {
             DispatchQueue.concurrentPerform(iterations: repos.count) { _ = self.hooks.check(repo: repos[$0], workerURL: url) }
             DispatchQueue.main.async { self.onChange?() }
+        }
+    }
+
+    func installOrgHooks(orgs: [String]) -> Bool {
+        guard let secret = webhookSecret() else { append("The webhook secret is not available"); return false }
+        let api = self.api, url = RELAY.workerURL
+        var ok = true
+        for org in orgs {
+            let s = hooks.ensureOrg(org: org, workerURL: url, secret: secret, api: api)
+            append("\(org) (org): \(describe(s))")
+            if case .error = s { ok = false }
+            if case .pollingOnly = s {
+                append("Org webhooks need an org owner. If you are one, run in Terminal: gh auth refresh -s admin:org_hook")
+            }
+        }
+        return ok
+    }
+
+    func checkOrgHooks(orgs: [String]) {
+        let url = RELAY.workerURL
+        guard !url.isEmpty, !orgs.isEmpty else { return }
+        work.async {
+            DispatchQueue.concurrentPerform(iterations: orgs.count) { _ = self.hooks.checkOrg(org: orgs[$0], workerURL: url) }
+            DispatchQueue.main.async { self.onChange?() }
+        }
+    }
+
+    // Deletes org hooks that no device tracks any more.
+    func pruneOrgHooks(removed: [String]) {
+        guard !removed.isEmpty, !RELAY.workerURL.isEmpty else { return }
+        let api = self.api
+        work.async {
+            guard case .success(let h) = api.health() else { return }
+            let others = Set(h.devices.filter { $0.id != RELAY.deviceID }.flatMap { $0.orgs.map { $0.lowercased() } })
+            for org in removed where !others.contains(org.lowercased()) {
+                guard let hook = h.orgHooks.first(where: { $0.org == org.lowercased() }), let id = hook.hookId else { continue }
+                if self.hooks.deleteOrg(org: org, hookId: id) { _ = api.deleteOrgHook(org: org) }
+            }
         }
     }
 
@@ -760,6 +953,15 @@ final class RelayDeployer {
                 append("\(hook.repo): not updated. Click Repair on a Mac with admin access to this repo.")
             }
         }
+        for hook in h.orgHooks {
+            guard let id = hook.hookId else { continue }
+            if hooks.patchOrgSecret(org: hook.org, hookId: id, secret: secret) {
+                append("\(hook.org) (org): updated")
+            } else {
+                ok = false
+                append("\(hook.org) (org): not updated. An org owner can click Add project events again.")
+            }
+        }
         return ok
     }
 
@@ -769,6 +971,10 @@ final class RelayDeployer {
             for hook in h.hooks {
                 guard let id = hook.hookId else { continue }
                 append("\(hook.repo): \(hooks.delete(repo: hook.repo, hookId: id) ? "hook deleted" : "hook not deleted")")
+            }
+            for hook in h.orgHooks {
+                guard let id = hook.hookId else { continue }
+                append("\(hook.org): \(hooks.deleteOrg(org: hook.org, hookId: id) ? "org hook deleted" : "org hook not deleted")")
             }
         }
         guard tools.wrangler(["delete", RELAY_WORKER_NAME], onLine: append).ok else { return false }
@@ -830,8 +1036,47 @@ struct Backoff {
 // The consumer of relay events. GHActionsBar implements it.
 protocol RelaySink: AnyObject {
     func relayRefresh(repos: [String], includePRs: Bool, completedRuns: [(String, Int)], done: @escaping (Bool) -> Void)
+    func relayProjectRefresh(projectNodeIds: [String], issues: [(repo: String, number: Int)], done: @escaping (Bool) -> Void)
     func relayFullRefresh(done: @escaping (Bool) -> Void)
     func relayStateChanged()
+}
+
+// Splits a page of relay events into a repo refresh and a project refresh.
+struct RelayApplyPlan {
+    var repos: [String] = []
+    var includePRs = false
+    var completedRuns: [(String, Int)] = []
+    var projectNodeIds: [String] = []
+    var issues: [(repo: String, number: Int)] = []
+    var wantsRepoRefresh: Bool { !repos.isEmpty }
+    var wantsProjectRefresh: Bool { !projectNodeIds.isEmpty || !issues.isEmpty }
+}
+
+func relayApplyPlan(_ events: [RelayEvent], knownRepos: [String]) -> RelayApplyPlan {
+    let byLower = Dictionary(knownRepos.map { ($0.lowercased(), $0) }, uniquingKeysWith: { a, _ in a })
+    var plan = RelayApplyPlan()
+    for e in events {
+        switch e.kind {
+        case "workflow_run", "workflow_job", "pull_request", "pull_request_review":
+            if let r = byLower[e.repo], !plan.repos.contains(r) { plan.repos.append(r) }
+            if e.kind.hasPrefix("pull_request") { plan.includePRs = true }
+            if e.kind == "workflow_run", e.action == "completed", let id = e.runId, let r = byLower[e.repo] {
+                plan.completedRuns.append((r, id))
+            }
+        case "projects_v2", "projects_v2_item":
+            if let id = e.projectId, !plan.projectNodeIds.contains(id) { plan.projectNodeIds.append(id) }
+        case "issues", "issue_comment":
+            if let n = e.issueNumber, !e.repo.isEmpty {
+                let repo = byLower[e.repo] ?? e.repo
+                if !plan.issues.contains(where: { $0.repo == repo && $0.number == n }) {
+                    plan.issues.append((repo, n))
+                }
+            }
+        default:
+            break
+        }
+    }
+    return plan
 }
 
 final class RelayClient: NSObject, URLSessionWebSocketDelegate {
@@ -1058,18 +1303,27 @@ final class RelayClient: NSObject, URLSessionWebSocketDelegate {
             return
         }
         guard !fresh.isEmpty else { finish(true); return }
-        // Events carry lowercased repo names. Map them back to the configured spelling.
-        let byLower = Dictionary(REPOS.map { ($0.lowercased(), $0) }, uniquingKeysWith: { a, _ in a })
-        var repos: [String] = []
-        for e in fresh { if let r = byLower[e.repo], !repos.contains(r) { repos.append(r) } }
-        let includePRs = fresh.contains { $0.kind.hasPrefix("pull_request") }
-        let completed = fresh.compactMap { e -> (String, Int)? in
-            guard e.kind == "workflow_run", e.action == "completed", let id = e.runId, let r = byLower[e.repo] else { return nil }
-            return (r, id)
+        let plan = relayApplyPlan(fresh, knownRepos: REPOS)
+        guard plan.wantsRepoRefresh || plan.wantsProjectRefresh else { finish(true); return }
+        guard let sink = sink else { finish(false); return }
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var ok = true
+        let note: (Bool) -> Void = { success in
+            lock.lock(); ok = ok && success; lock.unlock()
+            group.leave()
         }
-        guard !repos.isEmpty else { finish(true); return }
-        log.info("Relay: \(fresh.count) event(s) for \(repos.count) repo(s)")
-        sink?.relayRefresh(repos: repos, includePRs: includePRs, completedRuns: completed, done: finish) ?? finish(false)
+        if plan.wantsRepoRefresh {
+            group.enter()
+            log.info("Relay: \(fresh.count) event(s) for \(plan.repos.count) repo(s)")
+            sink.relayRefresh(repos: plan.repos, includePRs: plan.includePRs, completedRuns: plan.completedRuns, done: note)
+        }
+        if plan.wantsProjectRefresh {
+            group.enter()
+            log.info("Relay: project refresh for \(plan.projectNodeIds.count) project(s), \(plan.issues.count) issue(s)")
+            sink.relayProjectRefresh(projectNodeIds: plan.projectNodeIds, issues: plan.issues, done: note)
+        }
+        group.notify(queue: .main) { finish(ok) }
     }
 
     // Footer dot: colour, tooltip.

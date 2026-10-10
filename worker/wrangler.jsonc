@@ -6,5 +6,5 @@
   "observability": { "enabled": false },
   "durable_objects": { "bindings": [{ "name": "HUB", "class_name": "Hub" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Hub"] }],
-  "vars": { "RELAY_VERSION": "1" }
+  "vars": { "RELAY_VERSION": "2" }
 }

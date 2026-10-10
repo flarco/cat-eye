@@ -41,7 +41,7 @@ const hub = () => env.HUB.get(env.HUB.idFromName("hub"));
 
 beforeEach(() =>
   runInDurableObject(hub(), (obj) => {
-    obj.sql.exec("DELETE FROM events; DELETE FROM devices; DELETE FROM hooks; DELETE FROM config");
+    obj.sql.exec("DELETE FROM events; DELETE FROM devices; DELETE FROM hooks; DELETE FROM org_hooks; DELETE FROM config");
   }));
 afterEach(() => vi.restoreAllMocks());
 
@@ -82,6 +82,44 @@ describe("webhook", () => {
     expect(JSON.stringify(body)).not.toContain("secret");
   });
 
+  it("accepts an org event without a repository", async () => {
+    const r = await webhook("projects_v2_item", {
+      action: "edited",
+      organization: { login: "Acme" },
+      projects_v2_item: { node_id: "PVTI_1", project_node_id: "PVT_9" },
+    });
+    expect(r.status).toBe(202);
+    const body = await (await authed("/v1/events?after=0")).json();
+    expect(body.events.at(-1)).toMatchObject({
+      repo: "", org: "acme", kind: "projects_v2_item", projectId: "PVT_9", itemId: "PVTI_1", issueNumber: null,
+    });
+  });
+
+  it("stores no text from a projects_v2_item payload", async () => {
+    await webhook("projects_v2_item", {
+      action: "edited",
+      organization: { login: "Acme" },
+      sender: { login: "hidden-user" },
+      projects_v2_item: {
+        node_id: "PVTI_1",
+        project_node_id: "PVT_9",
+        content_title: "hidden-title",
+        content_body: "hidden-body",
+      },
+    }, { id: "proj-text" });
+    const body = await (await authed("/v1/events?after=0")).json();
+    const row = body.events.find((e) => e.deliveryId === "proj-text");
+    const stored = await runInDurableObject(hub(), (obj) =>
+      JSON.stringify(obj.sql.exec("SELECT * FROM events WHERE delivery_id = 'proj-text'").toArray()));
+    expect(JSON.stringify(row)).not.toContain("hidden-title");
+    expect(JSON.stringify(row)).not.toContain("hidden-body");
+    expect(JSON.stringify(row)).not.toContain("hidden-user");
+    expect(stored).not.toContain("hidden-title");
+    expect(stored).not.toContain("hidden-body");
+    expect(stored).not.toContain("hidden-user");
+    expect((await (await authed("/v1/health")).json()).projectEventsToday).toBeGreaterThan(0);
+  });
+
   it("never logs the body", async () => {
     const spies = ["log", "info", "warn", "error", "debug"].map((m) => vi.spyOn(console, m));
     await webhook("workflow_run", runEvent("o/logged"));
@@ -96,7 +134,7 @@ describe("auth", () => {
   const routes = [
     ["GET", "/v1/events"], ["POST", "/v1/ack"], ["PUT", "/v1/devices/self"], ["DELETE", "/v1/devices/AAAA"],
     ["GET", "/v1/health"], ["PUT", "/v1/config"], ["GET", "/v1/webhook-secret"], ["PUT", "/v1/hooks/o/r"],
-    ["GET", "/v1/connect"],
+    ["PUT", "/v1/org-hooks/acme"], ["GET", "/v1/connect"],
   ];
   for (const [method, path] of routes) {
     it(`${method} ${path} needs a token`, async () => {
@@ -106,7 +144,7 @@ describe("auth", () => {
   }
 
   it("serves the discovery route without auth", async () => {
-    expect(await (await call("/")).json()).toEqual({ app: "cat-eye-relay", version: "1" });
+    expect(await (await call("/")).json()).toEqual({ app: "cat-eye-relay", version: "2" });
   });
 
   it("returns the webhook secret to a device", async () => {
@@ -151,12 +189,65 @@ describe("devices and events", () => {
     expect(health.devices.some((d) => d.id === "BBBB")).toBe(false);
   });
 
+  it("filters org events by the orgs of the device", async () => {
+    await putJSON("/v1/devices/self", { name: "A", repos: ["o/a"], orgs: ["Acme"] }, "token-a");
+    await putJSON("/v1/devices/self", { name: "B", repos: ["o/b"], orgs: [] }, "token-b");
+    await webhook("projects_v2_item", {
+      action: "edited",
+      organization: { login: "Acme" },
+      projects_v2_item: { node_id: "PVTI_1", project_node_id: "PVT_9" },
+    });
+    await webhook("workflow_run", runEvent("o/b", 2));
+    await webhook("issues", { action: "opened", organization: { login: "Acme" }, repository: { full_name: "Acme/App" }, issue: { number: 4, title: "hidden-title" } });
+    const a = await (await authed("/v1/events?after=0", "token-a")).json();
+    const b = await (await authed("/v1/events?after=0", "token-b")).json();
+    expect(a.events.map((e) => e.kind)).toEqual(["projects_v2_item", "issues"]);
+    expect(a.events[1]).toMatchObject({ repo: "acme/app", org: "acme", issueNumber: 4 });
+    expect(JSON.stringify(a)).not.toContain("hidden-title");
+    expect(b.events.map((e) => e.repo)).toEqual(["o/b"]);
+    expect((await (await authed("/v1/health")).json()).devices.find((d) => d.id === "AAAA").orgs).toEqual(["acme"]);
+  });
+
   it("records hooks", async () => {
     await putJSON("/v1/hooks/O/R", { hookId: 42 });
     const health = await (await authed("/v1/health")).json();
     expect(health.hooks).toContainEqual({ repo: "o/r", hookId: 42, lastDelivery: null });
     await authed("/v1/hooks/o/r", "token-a", { method: "DELETE" });
     expect((await (await authed("/v1/health")).json()).hooks).toEqual([]);
+  });
+
+  it("records org hooks", async () => {
+    await putJSON("/v1/org-hooks/Acme", { hookId: 7 });
+    const health = await (await authed("/v1/health")).json();
+    expect(health.orgHooks).toContainEqual({ org: "acme", hookId: 7, lastDelivery: null });
+    await authed("/v1/org-hooks/acme", "token-a", { method: "DELETE" });
+    expect((await (await authed("/v1/health")).json()).orgHooks).toEqual([]);
+  });
+
+  it("migrates an old events table twice and still reads its rows", async () => {
+    await runInDurableObject(hub(), (obj) => {
+      obj.sql.exec("DROP TABLE events");
+      obj.sql.exec(`CREATE TABLE events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        delivery_id TEXT NOT NULL UNIQUE,
+        repo TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        action TEXT,
+        run_id INTEGER, job_id INTEGER, pr_number INTEGER,
+        received_at INTEGER NOT NULL
+      )`);
+      obj.sql.exec(
+        "INSERT INTO events (delivery_id, repo, kind, action, received_at) VALUES ('legacy', 'o/legacy', 'workflow_run', 'completed', ?)",
+        Date.now());
+      obj.migrate();
+      obj.migrate();
+    });
+    const body = await (await authed("/v1/events?after=0")).json();
+    const row = body.events.find((e) => e.deliveryId === "legacy");
+    expect(row).toMatchObject({
+      repo: "o/legacy", kind: "workflow_run", action: "completed",
+      org: null, projectId: null, itemId: null, issueNumber: null,
+    });
   });
 });
 

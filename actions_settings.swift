@@ -2,30 +2,23 @@ import Cocoa
 
 // Repositories tab: a tree of owners (the user and their orgs) and their repos.
 // The tree shows the cached catalog at once and updates while it refreshes.
-final class SettingsVC: NSViewController {
+final class ActionsSettingsVC: NSViewController {
     // Expanded owners survive a reopen of the settings.
     static var expanded: Set<String> = []
     static var seenOwners: Set<String> = []
 
     let catalog: RepoCatalog
-    let updater: Updater
     var picked: Set<String>
     var orgs: Set<String>
     var repoScroll: NSScrollView?
     var repoDoc: Flipped?
-    var statusLabel: NSTextField?
     var syncLabel: NSTextField?
     var syncSpinner: NSProgressIndicator?
     var refreshAllBtn: NSButton?
     var addField: NSTextField?
     var observer: NSObjectProtocol?
-    var updateObserver: NSObjectProtocol?
-    var updateLabel: NSTextField?
-    var updateBtn: NSButton?
-
-    init(catalog: RepoCatalog, updater: Updater, picked: Set<String>, orgs: Set<String>) {
+    init(catalog: RepoCatalog, picked: Set<String>, orgs: Set<String>) {
         self.catalog = catalog
-        self.updater = updater
         self.picked = picked
         self.orgs = orgs
         super.init(nibName: nil, bundle: nil)
@@ -33,7 +26,7 @@ final class SettingsVC: NSViewController {
     required init?(coder: NSCoder) { fatalError() }
 
     deinit {
-        for o in [observer, updateObserver].compactMap({ $0 }) { NotificationCenter.default.removeObserver(o) }
+        if let o = observer { NotificationCenter.default.removeObserver(o) }
     }
 
     override func loadView() {
@@ -43,26 +36,7 @@ final class SettingsVC: NSViewController {
         container.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.85).cgColor
         var y: CGFloat = 0
 
-        container.addSubview(SettingsNav(w: w, selected: 0)); y += 44
-        container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
-
-        // ── Account section ──
-        container.addSubview(SettingsHeader("GITHUB ACCOUNT", y: y, w: w)); y += 28
-        let accRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
-        let sl = NSTextField(labelWithString: "Checking...")
-        sl.font = .systemFont(ofSize: 12); sl.textColor = .secondaryLabelColor
-        sl.frame = NSRect(x: 16, y: 10, width: w - 180, height: 20)
-        accRow.addSubview(sl)
-        statusLabel = sl
-        let loginBtn = NSButton(title: "Login...", target: self, action: #selector(doLogin))
-        loginBtn.bezelStyle = .inline; loginBtn.font = .systemFont(ofSize: 11)
-        loginBtn.frame = NSRect(x: w - 160, y: 10, width: 64, height: 24)
-        accRow.addSubview(loginBtn)
-        let logoutBtn = NSButton(title: "Logout", target: self, action: #selector(doLogout))
-        logoutBtn.bezelStyle = .inline; logoutBtn.font = .systemFont(ofSize: 11)
-        logoutBtn.frame = NSRect(x: w - 88, y: 10, width: 64, height: 24)
-        accRow.addSubview(logoutBtn)
-        container.addSubview(accRow); y += 40
+        container.addSubview(SettingsNav(w: w, selected: .actions)); y += 44
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
         // ── Display section ──
@@ -104,29 +78,6 @@ final class SettingsVC: NSViewController {
         container.addSubview(notifyRow); y += 36
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
-        // ── Updates section ──
-        container.addSubview(SettingsHeader("UPDATES", y: y, w: w)); y += 28
-        let updRow = NSView(frame: NSRect(x: 0, y: y, width: w, height: 40))
-        let auto = NSButton(checkboxWithTitle: "Automatically install updates", target: self, action: #selector(toggleAutoUpdate(_:)))
-        auto.font = .systemFont(ofSize: 12)
-        auto.state = AUTO_UPDATE ? .on : .off
-        auto.isEnabled = !updater.isDev
-        auto.frame = NSRect(x: 16, y: 10, width: 220, height: 20)
-        updRow.addSubview(auto)
-        let ul = NSTextField(labelWithString: "")
-        ul.font = .systemFont(ofSize: 11); ul.textColor = .secondaryLabelColor
-        ul.alignment = .right; ul.lineBreakMode = .byTruncatingTail
-        ul.frame = NSRect(x: 240, y: 12, width: w - 350, height: 16)
-        updRow.addSubview(ul)
-        updateLabel = ul
-        let ub = NSButton(title: "Check now", target: self, action: #selector(checkOrRestart))
-        ub.bezelStyle = .inline; ub.font = .systemFont(ofSize: 11)
-        ub.frame = NSRect(x: w - 104, y: 10, width: 88, height: 24)
-        updRow.addSubview(ub)
-        updateBtn = ub
-        container.addSubview(updRow); y += 40
-        container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
-
         // ── Repos section ──
         let repoHdr = SettingsHeader("SELECT REPOS TO TRACK", y: y, w: w)
         let sp = NSProgressIndicator(frame: NSRect(x: w - 342, y: 7, width: 14, height: 14))
@@ -147,7 +98,7 @@ final class SettingsVC: NSViewController {
         container.addSubview(repoHdr); y += 28
 
         // The notification switches add a row; keep the whole panel within its popover height.
-        let scrollH: CGFloat = 260
+        let scrollH: CGFloat = 360
         let rd = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: scrollH))
         let rs = NSScrollView(frame: NSRect(x: 0, y: y, width: w, height: scrollH))
         rs.hasVerticalScroller = true; rs.drawsBackground = false
@@ -186,50 +137,9 @@ final class SettingsVC: NSViewController {
         self.preferredContentSize = NSSize(width: w, height: min(y, POP_MAX_H))
 
         observer = NotificationCenter.default.addObserver(forName: RepoCatalog.changed, object: catalog,
-                                                          queue: .main) { [weak self] _ in self?.reload() }
-        updateObserver = NotificationCenter.default.addObserver(forName: Updater.changed, object: updater,
-                                                                queue: .main) { [weak self] _ in self?.updateUpdaterUI() }
-        updateUpdaterUI()
-        reload()
-        // The account check is fast, so it runs on its own and does not wait for the repo lists.
-        catalog.checkAuth()
-        catalog.refreshIfStale()
-    }
-
-    func reload() {
-        updateAuthUI()
+                                                          queue: .main) { [weak self] _ in self?.changed() }
         changed()
-    }
-
-    func updateAuthUI() {
-        guard let sl = statusLabel, catalog.authChecked else { return }
-        if let user = catalog.user {
-            let attr = NSMutableAttributedString()
-            attr.append(NSAttributedString(string: "Authenticated as ", attributes: [
-                .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor,
-            ]))
-            attr.append(NSAttributedString(string: user, attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor,
-            ]))
-            sl.attributedStringValue = attr
-        } else {
-            // Distinguish "gh CLI missing" (infra) from "not authenticated" (user action).
-            if let err = lastFetchError, err.contains("not found") {
-                sl.stringValue = err
-            } else {
-                sl.stringValue = "Not authenticated — click Login"
-            }
-            sl.textColor = .systemRed
-        }
-    }
-
-    func updateUpdaterUI() {
-        let status = updater.statusText
-        updateLabel?.stringValue = "Version \(updater.current)" + (status.isEmpty ? "" : " · \(status)")
-        if case .failed = updater.state { updateLabel?.textColor = .systemRed } else { updateLabel?.textColor = .secondaryLabelColor }
-        updateLabel?.toolTip = updateLabel?.stringValue
-        if case .ready = updater.state { updateBtn?.title = "Restart now" } else { updateBtn?.title = "Check now" }
-        updateBtn?.isEnabled = !updater.busy
+        catalog.refreshIfStale()
     }
 
     @objc func toggleOneRow(_ sender: NSButton) {
@@ -248,16 +158,6 @@ final class SettingsVC: NSViewController {
         default: return
         }
         saveConfig()
-    }
-
-    @objc func toggleAutoUpdate(_ sender: NSButton) {
-        AUTO_UPDATE = sender.state == .on
-        saveConfig()
-        if AUTO_UPDATE { updater.check(manual: false) }
-    }
-
-    @objc func checkOrRestart() {
-        if case .ready = updater.state { updater.install() } else { updater.check(manual: true) }
     }
 
     func updateSyncUI() {
@@ -308,10 +208,10 @@ final class SettingsVC: NSViewController {
                 let repos = reposOf(owner)
                 let count = repos.filter(isPicked).count
                 // Open owners with a partial pick the first time they appear, so picks are visible.
-                if SettingsVC.seenOwners.insert(owner).inserted && count > 0 && !isOrgPicked(owner) {
-                    SettingsVC.expanded.insert(owner)
+                if ActionsSettingsVC.seenOwners.insert(owner).inserted && count > 0 && !isOrgPicked(owner) {
+                    ActionsSettingsVC.expanded.insert(owner)
                 }
-                let open = SettingsVC.expanded.contains(owner)
+                let open = ActionsSettingsVC.expanded.contains(owner)
                 y = ownerRow(owner, repos: repos, count: count, open: open, y: y, w: w, in: doc)
                 guard open else { continue }
                 for repo in repos {
@@ -412,7 +312,7 @@ final class SettingsVC: NSViewController {
 
     @objc func toggleExpand(_ sender: NSButton) {
         guard let owner = sender.identifier?.rawValue else { return }
-        if sender.state == .on { SettingsVC.expanded.insert(owner) } else { SettingsVC.expanded.remove(owner) }
+        if sender.state == .on { ActionsSettingsVC.expanded.insert(owner) } else { ActionsSettingsVC.expanded.remove(owner) }
         rebuildTree()
     }
 
@@ -456,21 +356,9 @@ final class SettingsVC: NSViewController {
             return
         }
         picked.insert(text)
-        SettingsVC.expanded.insert(repoOwner(text))
+        ActionsSettingsVC.expanded.insert(repoOwner(text))
         addField?.stringValue = ""
         changed()
-    }
-
-    @objc func doLogin() { runInTerminal("gh auth login --web -p https") }
-    @objc func doLogout() { runInTerminal("gh auth logout") }
-
-    func runInTerminal(_ command: String) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", "tell application \"Terminal\" to do script \"\(command)\""]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
     }
 
     @objc func doSave() {

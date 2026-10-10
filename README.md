@@ -1,6 +1,6 @@
 # Cat Eye — GitHub Actions & PR Monitor for macOS
 
-> A lightweight, native macOS menu bar app for monitoring GitHub Actions CI/CD status, pull request reviews, and weekly CI health. Open source, ~380KB, accessible, zero Electron.
+> A lightweight, native macOS menu bar app for monitoring GitHub Actions, pull request reviews, Projects, and weekly CI health. Open source, about 1.3 MB, accessible, zero Electron.
 
 The octocat's eye never blinks.
 
@@ -8,13 +8,13 @@ The octocat's eye never blinks.
 
 Cat Eye is built on three principles:
 
-- **Extremely low footprint** — a single ~380KB Swift binary, ~35MB of RAM, zero frameworks beyond AppKit. No runtime, no bundled browser, no background bloat.
-- **Minimalist** — just the important information: are your Actions passing, and do any PRs need your review. Deeper stats live behind the Insights tab, so the default view stays a status light, not a dashboard.
+- **Extremely low footprint** — a native Swift binary of about 1.3 MB, ~35MB of RAM, zero frameworks beyond AppKit. No runtime, no bundled browser, no background bloat.
+- **Minimalist** — just the important information: are your Actions passing, do any PRs need your review, and did a tracked project change. Deeper stats live behind the Insights tab, so the default view stays a status light, not a dashboard.
 - **Accessible** — colour is never the only signal. Status uses the Okabe-Ito colour-blind-safe palette plus shape and text cues, and everything is keyboard navigable.
 
-| Actions tab | Pull Requests tab |
-|:-----------:|:-----------------:|
-| ![Actions](screenshots/actions.png) | ![Pull Requests](screenshots/prs.png) |
+| Actions tab | Pull Requests tab | Projects tab |
+|:-----------:|:-----------------:|:------------:|
+| ![Actions](screenshots/actions.png) | ![Pull Requests](screenshots/prs.png) | ![Projects](screenshots/projects.png) |
 
 ## Features
 
@@ -34,6 +34,19 @@ Cat Eye is built on three principles:
 - **Inline comments** — type and submit comments without leaving the popover
 - **Safe input** — popover won't dismiss while you're typing a comment
 
+### Projects Tab
+- **Boards you already use** — GitHub Projects (v2) from your user account and from your organizations, in one tab
+- **By project or activity** — status chips and a stacked bar per project, or a feed of what changed
+- **Item preview** — status, fields, assignees, and the latest comment. Expand a row for the timeline
+- **Change it in place** — set the status, or comment, without leaving the menu bar
+- **macOS notifications** — mentions, comments, status, assignment, and closed items. "My items" means you are an assignee or the author. Your own comments are skipped
+- **Two update sources** — an org project with an org webhook and live updates on is **Live**. A personal project, an org project without a webhook, or the relay off is **Polled**
+- **Poll interval** — Settings → Projects → "Poll projects without live updates every" is 2, 5, 10, 15, or 30 minutes. The default is 5. Live projects use the same interval only while the relay is disconnected
+
+GitHub sends `projects_v2_item` only to organization webhooks, so a personal project cannot be live. The relay still stores only IDs: project and item node ids, and issue numbers. No titles, bodies, or user names.
+
+The Projects tab needs the `project` scope (`gh auth refresh -s project`). Adding org webhooks also needs `admin:org_hook`, and you must be an owner of that org. If you are not, those projects stay on the poll and the live-updates panel says "Not an org owner".
+
 ### Insights Tab
 - **Deploy log** — every run Cat Eye sees is appended to `~/.config/cat-eye/deploys.jsonl`, so your history survives restarts
 - **Last 7 days vs previous 7** — pass rate, average duration, deploy pass rate, and a per-workflow breakdown
@@ -41,7 +54,7 @@ Cat Eye is built on three principles:
 - **Copy report for AI** — copies a full markdown report plus a task prompt, ready to paste into Claude or ChatGPT
 
 ### General
-- **Tabbed interface** — switch between Actions, PRs and Insights
+- **Tabbed interface** — switch between Actions, PRs, Projects and Insights. Hide a tab from Settings → General
 - **Repo filter** — "All Repos" or pick a specific repo; persists across tabs
 - **Built-in setup** — login to GitHub and pick repos to track from the settings panel. Repos show as a tree per owner. Select an organization to track all its repos, also the repos that it adds later. The repo list is cached and refreshes in the background once a day.
 - **Keyboard accessible** — navigate rows with Tab, activate with Return or Space
@@ -53,7 +66,7 @@ Cat Eye is built on three principles:
 - **Hot-reload config** — change tracked repos from settings without restarting
 - **Auto-detects `gh` CLI** — finds your GitHub CLI install automatically
 - **Error feedback** — clear messages when gh CLI is missing, auth fails, or API errors occur
-- **Tiny footprint** — ~380KB binary, ~35MB memory, zero dependencies beyond macOS
+- **Tiny footprint** — about 1.3 MB, ~35MB memory, zero dependencies beyond macOS
 
 ## Requirements
 
@@ -161,6 +174,11 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
         "failed": true,
         "cancelled": true,
         "other": true
+    },
+    "projects": {
+        "picked": ["myorg/4"],
+        "pollMinutes": 5,
+        "showTab": true
     }
 }
 ```
@@ -178,6 +196,10 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `autoUpdate` | `true` | Install new releases automatically, written by **Settings → Updates** |
 | `notifications` | all `true` | macOS notification switches in **Settings → Notifications**. `failed` includes timeouts and startup failures; `other` covers skipped and other completed conclusions |
 | `relay` | none | Live updates settings, written by **Settings → Live updates** (see below) |
+| `projects.picked` | `[]` | Projects to track, as `owner/number` (for example `myorg/4`) |
+| `projects.allOf` | `[]` | Owners whose projects are all tracked, including ones they add later |
+| `projects.pollMinutes` | `5` | How often to poll projects that are not live. One of 2, 5, 10, 15, 30 |
+| `projects.showTab` | `true` | Show the Projects tab |
 
 ## Updates
 
@@ -199,11 +221,13 @@ Set it up from **Settings → Live updates → Set up**. The panel does these st
 6. Install a webhook on each tracked repo (`gh` must have admin access to the repo; other repos stay on polling).
 7. Connect.
 
+Organization projects need a separate org webhook. **Settings → Live updates → Org webhooks** shows one row per org that owns a tracked project. **Add project events** installs it. That needs `admin:org_hook` and the org owner role. Personal projects have no webhook path: they poll every `pollMinutes` (5 by default). The same note in that section links to Settings → Projects.
+
 On a second Mac, log in to the same Cloudflare account and click **Set up**. It joins the same relay. You do not need a pairing code.
 
 - **Cost:** the Cloudflare free plan is enough for up to about 1,000 events per hour.
 - **Retention:** the relay keeps events for 24 hours by default (1 hour to 30 days). A Mac that was offline reads the events it missed. After a longer gap, it does one full refresh.
-- **Privacy:** the relay keeps only repo names, event types and IDs. It does not log payloads. Each webhook is verified with an HMAC secret.
+- **Privacy:** the relay keeps only repo names, org logins, event types and IDs (run, job, pull request, project, item, issue number). It does not log payloads, titles, bodies, or user names. Each webhook is verified with an HMAC secret.
 - **Remove:** **Remove relay…** deletes the webhooks, the Worker and the Keychain items.
 
 The Worker source is in [`worker/`](worker/).
@@ -238,7 +262,8 @@ xcode-select --install
 - Fetches runs via `gh api repos/OWNER/REPO/actions/runs` and PRs via `gh pr list --search review-requested:@me`, for every configured repo, all concurrently.
 - The 10-second poll runs only while the popover is open. Closed, Cat Eye falls back to the normal interval — measured on a real machine, that took a long CI run from 1,148 GitHub API calls/hour down to 382.
 - PR actions (approve, comment, merge, close) call `gh pr review`, `gh pr comment`, `gh pr merge`, and `gh pr close` respectively.
-- With live updates on, a webhook event refreshes only the repo it is about, and the footer dot shows the relay state (green = live, grey = polling, orange = relay error).
+- With live updates on, a workflow or pull request event refreshes only the repo it is about. A project event refreshes the matching project. The footer dot shows the relay state (green = live, grey = polling, orange = relay error). The footer also shows the REST and GraphQL quotas side by side.
+- Project snapshots come from `gh api graphql`. The first snapshot of a project creates no activity, so launch stays quiet.
 - Runs as a macOS accessory app (no Dock icon, no Cmd+Tab entry).
 - Notifications use the native `UserNotifications` framework — respects Do Not Disturb and Focus modes.
 
@@ -255,6 +280,8 @@ Colours come from the [Okabe-Ito colour-blind-safe palette](https://jfly.uni-koe
 
 Each workflow on each branch counts. A newer run of the same workflow replaces an old failure. To keep a failure from turning the icon red, ignore that run. To skip feature branches, select **Default only**.
 
+A small blue dot on the icon means a tracked project has unread activity. The CI colour still wins. Turn the dot off in Settings → Projects.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -263,6 +290,8 @@ Each workflow on each branch counts. A newer run of the same workflow replaces a
 | "Not authenticated" error | Run `gh auth login` in Terminal, or click Login in Settings |
 | "No access" or a 404 from `gh` | The token expired or lost a scope. GitHub answers 404, not 401, for a private repo it cannot see — run `gh auth login` |
 | No PRs showing | The PR tab only shows PRs where **your review is requested** — not all open PRs |
+| Projects tab asks for the project scope | Run `gh auth refresh -s project`, or click Grant access in the tab |
+| Org project stays on polling | GitHub has no webhook for personal projects. For an org, you must be an owner and grant `admin:org_hook` |
 | Popover closes while typing | Expand a PR first — this switches to semitransient mode |
 | Config changes not taking effect | Click "Save & Apply" in Settings — no restart needed |
 | Build fails | Ensure Xcode Command Line Tools are installed: `xcode-select --install` |
@@ -271,13 +300,13 @@ Each workflow on each branch counts. A newer run of the same workflow replaces a
 
 | | Cat Eye | Typical Electron app |
 |---|---|---|
-| **Binary** | ~380 KB | 150–300 MB |
+| **Binary** | ~1.3 MB | 150–300 MB |
 | **Memory** | ~35 MB (0.2%) | 200–400 MB |
 | **CPU at idle** | 0% | 0.5–2% |
 | **Dependencies** | macOS + `gh` CLI | Node.js, Chromium, npm packages |
 | **Startup** | Instant | 2–5 seconds |
 
-Cat Eye is a single Swift file compiled to a native binary. No runtime, no garbage collector, no bundled browser engine. It wakes up every 30 seconds, runs a few `gh` CLI commands, updates a menu bar icon, and goes back to sleep.
+Cat Eye is native Swift, compiled to one binary. No runtime, no garbage collector, no bundled browser engine. It wakes up on its poll interval, runs a few `gh` CLI commands, updates a menu bar icon, and goes back to sleep.
 
 ## Process info
 
@@ -285,13 +314,13 @@ Cat Eye is a single Swift file compiled to a native binary. No runtime, no garba
 |---|---|
 | **Process name** | `cat-eye` |
 | **Spotlight name** | Cat Eye |
-| **Binary size** | ~380KB |
+| **Binary size** | ~1.3 MB |
 | **Memory** | ~35 MB / 0.2% on 16GB Mac |
 | **Bundle ID** | `com.flarco.cateye` |
 
 ## Contributing
 
-Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The short version: keep it lean (one Swift file, zero dependencies), keep it secure, keep it accessible.
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The short version: keep it lean (native Swift, zero dependencies), keep it secure, keep it accessible.
 
 ## License
 

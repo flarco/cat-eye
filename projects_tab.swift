@@ -218,7 +218,7 @@ final class ProjectItemRow: NSView {
     let urlStr: String
     let expanded: Bool
     init(item: ProjectItem, snap: ProjectSnapshot, unread: Bool, last: String?, w: CGFloat, expanded: Bool) {
-        self.urlStr = item.url ?? snap.summary.url
+        self.urlStr = item.paneURL(projectURL: snap.summary.url) ?? item.url ?? snap.summary.url
         self.expanded = expanded
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: ROW_H))
         wantsLayer = true
@@ -272,7 +272,7 @@ final class ProjectItemRow: NSView {
         let cp = NSButton(frame: NSRect(x: w - 36, y: (ROW_H - 22) / 2, width: 28, height: 22))
         cp.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy link")
         cp.isBordered = false; cp.target = self; cp.action = #selector(copyLink)
-        cp.toolTip = "Copy link"
+        cp.toolTip = "Copy item link"
         addSubview(cp)
         setAccessibilityLabel("\(item.title), \(opt?.name ?? "no status")")
     }
@@ -474,7 +474,7 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
         addSubview(read)
         y += 30
         frame = NSRect(x: 0, y: 0, width: w, height: y)
-        self.itemURL = item.url ?? snap.summary.url
+        self.itemURL = item.paneURL(projectURL: snap.summary.url) ?? item.url ?? snap.summary.url
     }
     required init?(coder: NSCoder) { fatalError() }
     private var itemURL = ""

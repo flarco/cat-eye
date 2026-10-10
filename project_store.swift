@@ -264,7 +264,8 @@ final class ProjectStore {
         let entries = changes.map { pair -> ActivityEntry in
             let item = snap.items.first { $0.id == pair.itemId } ?? old?.items.first { $0.id == pair.itemId }
             return ActivityEntry.make(projectKey: key, itemId: pair.itemId, change: pair.1,
-                                      actor: pair.1.commentAuthor, url: item?.url ?? snap.summary.url, at: at)
+                                      actor: pair.1.commentAuthor,
+                                      url: item?.paneURL(projectURL: snap.summary.url) ?? item?.url ?? snap.summary.url, at: at)
         }
         append(entries)
         let filtered = changes.filter { !suppressNotify.contains($0.itemId) }

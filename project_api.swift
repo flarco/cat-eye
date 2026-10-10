@@ -2,6 +2,12 @@ import Foundation
 
 // ─── GitHub Projects (v2) via `gh api graphql` ───────────────────────────────
 
+func jsonID(_ value: Any?) -> String? {
+    if let s = value as? String, !s.isEmpty { return s }
+    if let n = value as? NSNumber { return n.stringValue }
+    return nil
+}
+
 func jsonInt(_ value: Any?) -> Int? {
     if let n = value as? Int { return n }
     if let n = value as? NSNumber { return n.intValue }
@@ -249,7 +255,7 @@ final class ProjectAPI {
               items(first: 100, after: $after) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  id updatedAt
+                  id fullDatabaseId updatedAt
                   content { \(contentFields) }
                   fieldValues(first: 20) { nodes { \(fieldValueFields) } }
                 }
@@ -322,6 +328,7 @@ final class ProjectAPI {
                            kind: kind,
                            title: content["title"] as? String ?? "Private item",
                            url: content["url"] as? String,
+                           databaseId: jsonID(n["fullDatabaseId"]),
                            repo: (content["repository"] as? [String: Any])?["nameWithOwner"] as? String,
                            number: content["number"] as? Int,
                            state: content["state"] as? String,

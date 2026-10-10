@@ -60,6 +60,53 @@ struct StatusOption: Codable, Hashable {
 
 enum ItemKind: String, Codable { case issue, pullRequest, draft }
 
+// GitHub's side pane uses the item's numeric id, not the issue URL. The node id
+// is a msgpack array whose last value is that number, so a cached item still copies
+// the right link before the next fetch stores `databaseId`.
+func projectItemDatabaseId(nodeId: String, stored: String? = nil) -> String? {
+    if let stored, !stored.isEmpty { return stored }
+    guard nodeId.hasPrefix("PVTI_") else { return nil }
+    var raw = String(nodeId.dropFirst("PVTI_".count))
+    raw = raw.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+    raw += String(repeating: "=", count: (4 - raw.count % 4) % 4)
+    guard let data = Data(base64Encoded: raw), let first = data.first, first & 0xF0 == 0x90 else { return nil }
+    let count = Int(first & 0x0F)
+    var i = 1
+    var last: UInt64?
+    for _ in 0..<count {
+        guard i < data.count else { return nil }
+        let tag = data[i]
+        i += 1
+        if tag <= 0x7F {
+            last = UInt64(tag)
+        } else if tag == 0xCC, i < data.count {
+            last = UInt64(data[i]); i += 1
+        } else if tag == 0xCD, i + 1 < data.count {
+            last = UInt64(data[i]) << 8 | UInt64(data[i + 1]); i += 2
+        } else if tag == 0xCE, i + 3 < data.count {
+            last = UInt64(data[i]) << 24 | UInt64(data[i + 1]) << 16 | UInt64(data[i + 2]) << 8 | UInt64(data[i + 3])
+            i += 4
+        } else if tag == 0xCF, i + 7 < data.count {
+            var v: UInt64 = 0
+            for b in data[i..<(i + 8)] { v = (v << 8) | UInt64(b) }
+            last = v
+            i += 8
+        } else {
+            return nil
+        }
+    }
+    return last.map { String($0) }
+}
+
+func projectItemURL(projectURL: String, nodeId: String, databaseId: String?) -> String? {
+    guard let id = projectItemDatabaseId(nodeId: nodeId, stored: databaseId), !projectURL.isEmpty else { return nil }
+    var base = projectURL
+    if let i = base.firstIndex(of: "?") { base = String(base[..<i]) }
+    if let i = base.firstIndex(of: "#") { base = String(base[..<i]) }
+    while base.hasSuffix("/") { base.removeLast() }
+    return "\(base)/views/1?pane=issue&itemId=\(id)"
+}
+
 struct CommentRef: Codable, Hashable {
     let id: String
     let author: String?
@@ -73,6 +120,8 @@ struct ProjectItem: Codable, Hashable {
     let kind: ItemKind
     let title: String
     let url: String?
+    // Numeric ProjectV2Item id used in the side-pane link. Nil on snapshots fetched before it was stored.
+    let databaseId: String?
     let repo: String?
     let number: Int?
     let state: String?
@@ -85,6 +134,11 @@ struct ProjectItem: Codable, Hashable {
     let commentCount: Int
     let lastComment: CommentRef?
     var mentionsMe: Bool
+
+    // https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=268087835
+    func paneURL(projectURL: String) -> String? {
+        projectItemURL(projectURL: projectURL, nodeId: id, databaseId: databaseId)
+    }
 
     func isMine(_ login: String?) -> Bool {
         guard let me = login?.lowercased(), !me.isEmpty else { return false }

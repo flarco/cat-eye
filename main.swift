@@ -794,7 +794,7 @@ func runSelfTest() {
     func projectItem(_ id: String, status: String?, fields: [String: String] = [:], assignees: [String] = [],
                      author: String? = "bea", comments: Int = 0, last: CommentRef? = nil) -> ProjectItem {
         ProjectItem(id: id, contentId: "C\(id)", kind: .issue, title: "Item \(id)", url: "https://example/\(id)",
-                    repo: "o/r", number: 1, state: "OPEN", statusOptionId: status, fields: fields,
+                    databaseId: nil, repo: "o/r", number: 1, state: "OPEN", statusOptionId: status, fields: fields,
                     assignees: assignees, labels: [], author: author, updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
                     commentCount: comments, lastComment: last, mentionsMe: false)
     }
@@ -886,6 +886,9 @@ func runSelfTest() {
     ]
     let parsed = projectSummaries(from: nodes, owner: "flarco", kind: .user)
     check(parsed.count == 1 && parsed[0].title == "Fritz Tasks" && parsed[0].ref.number == 3, "null project nodes are skipped")
+    check(projectItemDatabaseId(nodeId: "PVTI_lAHOAHUM4s4BmgROzg_6shs") == "268087835", "item id from node")
+    check(projectItemURL(projectURL: "https://github.com/users/flarco/projects/3/", nodeId: "PVTI_x", databaseId: "268087835")
+            == "https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=268087835", "item pane url")
 
     let oldConfig = #"{"repos":["o/r"],"pollInterval":30}"#.data(using: .utf8)!
     let decoded = try? JSONDecoder().decode(AppConfig.self, from: oldConfig)

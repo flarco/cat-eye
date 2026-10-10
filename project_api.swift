@@ -2,6 +2,29 @@ import Foundation
 
 // ─── GitHub Projects (v2) via `gh api graphql` ───────────────────────────────
 
+func jsonInt(_ value: Any?) -> Int? {
+    if let n = value as? Int { return n }
+    if let n = value as? NSNumber { return n.intValue }
+    return nil
+}
+
+// Nodes may contain null for a project the token cannot see. A failed cast of the
+// whole array used to drop every project of that owner.
+func projectSummaries(from nodes: Any?, owner: String, kind: OwnerKind) -> [ProjectSummary] {
+    let raw = nodes as? [Any] ?? []
+    let list = raw.compactMap { item -> ProjectSummary? in
+        guard let n = item as? [String: Any],
+              let id = n["id"] as? String,
+              let number = jsonInt(n["number"]),
+              let title = n["title"] as? String else { return nil }
+        let count = jsonInt((n["items"] as? [String: Any])?["totalCount"]) ?? 0
+        let url = n["url"] as? String ?? "https://github.com/\(kind == .org ? "orgs/" : "users/")\(owner)/projects/\(number)"
+        return ProjectSummary(ref: ProjectRef(owner: owner, number: number), nodeId: id, title: title,
+                              url: url, closed: n["closed"] as? Bool ?? false, itemCount: count, ownerKind: kind)
+    }
+    return list.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+}
+
 enum ProjectAPIError: Error, Equatable {
     case missingScope(String), notFound, gh(String)
 
@@ -31,28 +54,57 @@ final class ProjectAPI {
     }
 
     func projects(owner: String, kind: OwnerKind) -> Result<[ProjectSummary], ProjectAPIError> {
-        let root = kind == .org ? "organization" : "user"
-        let q = """
-        query($login: String!) {
-          \(root)(login: $login) {
-            projectsV2(first: 100) {
-              nodes { id number title url closed items { totalCount } }
-            }
-          }
+        projects(owners: [(owner, kind)]).flatMap { map in
+            map[owner.lowercased()] ?? .failure(.notFound)
         }
-        """
-        return graphql(q, ["login": owner]).flatMap { data in
-            guard let node = data[root] as? [String: Any] else { return .failure(.notFound) }
-            let nodes = ((node["projectsV2"] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
-            let list = nodes.compactMap { n -> ProjectSummary? in
-                guard let id = n["id"] as? String, let number = n["number"] as? Int,
-                      let title = n["title"] as? String else { return nil }
-                let count = ((n["items"] as? [String: Any])?["totalCount"] as? Int) ?? 0
-                return ProjectSummary(ref: ProjectRef(owner: owner, number: number), nodeId: id, title: title,
-                                      url: n["url"] as? String ?? "https://github.com/\(kind == .org ? "orgs/" : "")\(owner)/projects/\(number)",
-                                      closed: n["closed"] as? Bool ?? false, itemCount: count, ownerKind: kind)
+    }
+
+    // One GraphQL call for several owners. A null node does not wipe the rest of the list.
+    func projects(owners: [(login: String, kind: OwnerKind)]) -> Result<[String: Result<[ProjectSummary], ProjectAPIError>], ProjectAPIError> {
+        if owners.isEmpty { return .success([:]) }
+        var merged: [String: Result<[ProjectSummary], ProjectAPIError>] = [:]
+        var start = 0
+        while start < owners.count {
+            let end = min(start + 8, owners.count)
+            let slice = Array(owners[start..<end])
+            start = end
+            switch projectsChunk(slice) {
+            case .failure(let e):
+                for o in slice { merged[o.login.lowercased()] = .failure(e) }
+            case .success(let part):
+                for (k, v) in part { merged[k] = v }
             }
-            return .success(list.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending })
+        }
+        return .success(merged)
+    }
+
+    private func projectsChunk(_ owners: [(login: String, kind: OwnerKind)]) -> Result<[String: Result<[ProjectSummary], ProjectAPIError>], ProjectAPIError> {
+        var defs: [String] = []
+        var fields: [String] = []
+        var vars: [String: Any] = [:]
+        for (i, o) in owners.enumerated() {
+            let root = o.kind == .org ? "organization" : "user"
+            defs.append("$l\(i): String!")
+            fields.append("a\(i): \(root)(login: $l\(i)) { projectsV2(first: 100) { nodes { id number title url closed items { totalCount } } } }")
+            vars["l\(i)"] = o.login
+        }
+        let q = "query(\(defs.joined(separator: ", "))) { \(fields.joined(separator: " ")) }"
+        return graphqlPayload(q, vars).map { payload in
+            var out: [String: Result<[ProjectSummary], ProjectAPIError>] = [:]
+            for (i, o) in owners.enumerated() {
+                let key = o.login.lowercased()
+                let node = payload.data["a\(i)"] as? [String: Any]
+                let conn = node?["projectsV2"] as? [String: Any]
+                if conn == nil {
+                    let msg = payload.errors.first { $0.contains(o.login) } ?? payload.errors.first
+                        ?? "Could not read projects for \(o.login). Cat Eye needs the project scope."
+                    out[key] = .failure(classify(msg))
+                    continue
+                }
+                let list = projectSummaries(from: conn?["nodes"], owner: o.login, kind: o.kind)
+                out[key] = .success(list)
+            }
+            return out
         }
     }
 
@@ -135,7 +187,21 @@ final class ProjectAPI {
 
     // MARK: GraphQL
 
+    private struct GQLPayload {
+        var data: [String: Any]
+        var errors: [String]
+    }
+
     private func graphql(_ query: String, _ variables: [String: Any] = [:]) -> Result<[String: Any], ProjectAPIError> {
+        switch graphqlPayload(query, variables) {
+        case .failure(let e): return .failure(e)
+        case .success(let payload):
+            if let msg = payload.errors.first { return .failure(classify(msg)) }
+            return .success(payload.data)
+        }
+    }
+
+    private func graphqlPayload(_ query: String, _ variables: [String: Any]) -> Result<GQLPayload, ProjectAPIError> {
         guard FileManager.default.isExecutableFile(atPath: GH) else {
             return .failure(.gh("GitHub CLI not found at \(GH)"))
         }
@@ -143,20 +209,18 @@ final class ProjectAPI {
         guard let input = try? JSONSerialization.data(withJSONObject: body) else {
             return .failure(.gh("Could not encode the query"))
         }
-        guard let res = try? ghRun(["api", "graphql", "--input", "-"], input: input) else {
+        guard let res = try? ghRun(["api", "graphql", "--input", "-"], input: input, timeout: 30) else {
             return .failure(.gh("gh failed to start"))
         }
         guard let obj = try? JSONSerialization.jsonObject(with: res.out) as? [String: Any] else {
-            let msg = res.err.isEmpty ? "Empty GraphQL response" : String(res.err.prefix(160))
+            let msg = res.err.isEmpty ? (res.out.isEmpty ? "GitHub CLI timed out" : "Empty GraphQL response") : String(res.err.prefix(160))
             return .failure(classify(msg))
         }
-        if let errors = obj["errors"] as? [[String: Any]], let msg = errors.first?["message"] as? String {
-            return .failure(classify(msg))
-        }
+        let errors = (obj["errors"] as? [[String: Any]] ?? []).compactMap { $0["message"] as? String }
         guard let data = obj["data"] as? [String: Any] else {
-            return .failure(.gh(String((res.err.isEmpty ? "GraphQL failed" : res.err).prefix(160))))
+            return .failure(classify(errors.first ?? (res.err.isEmpty ? "GraphQL failed" : String(res.err.prefix(160)))))
         }
-        return .success(data)
+        return .success(GQLPayload(data: data, errors: errors))
     }
 
     private func classify(_ msg: String) -> ProjectAPIError {

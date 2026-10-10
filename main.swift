@@ -155,7 +155,7 @@ struct GHResult {
 }
 
 // Runs gh with optional stdin, so request bodies with secrets never appear in argv.
-func ghRun(_ args: [String], input: Data? = nil) throws -> GHResult {
+func ghRun(_ args: [String], input: Data? = nil, timeout: TimeInterval? = nil) throws -> GHResult {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: GH)
     proc.arguments = args
@@ -170,6 +170,15 @@ func ghRun(_ args: [String], input: Data? = nil) throws -> GHResult {
     if let inPipe = inPipe, let input = input {
         inPipe.fileHandleForWriting.write(input)
         try? inPipe.fileHandleForWriting.close()
+    }
+    if let timeout = timeout {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+            guard proc.isRunning else { return }
+            proc.terminate()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+                if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+            }
+        }
     }
     // Drain both pipes BEFORE waiting: a child that fills a 64KB pipe buffer
     // would otherwise block forever inside waitUntilExit, stranding a worker
@@ -869,6 +878,14 @@ func runSelfTest() {
     check(plan.includePRs, "pull request events refresh PRs")
     check(plan.projectNodeIds == ["PVT_1"] && plan.issues.count == 1
             && plan.issues[0].repo == "acme/app" && plan.issues[0].number == 4, "relay plan splits project events")
+
+    let nodes: [Any] = [
+        NSNull(),
+        ["id": "PVT_1", "number": NSNumber(value: 3), "title": "Fritz Tasks", "url": "https://github.com/users/flarco/projects/3",
+         "closed": false, "items": ["totalCount": 1]],
+    ]
+    let parsed = projectSummaries(from: nodes, owner: "flarco", kind: .user)
+    check(parsed.count == 1 && parsed[0].title == "Fritz Tasks" && parsed[0].ref.number == 3, "null project nodes are skipped")
 
     let oldConfig = #"{"repos":["o/r"],"pollInterval":30}"#.data(using: .utf8)!
     let decoded = try? JSONDecoder().decode(AppConfig.self, from: oldConfig)

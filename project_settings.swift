@@ -80,7 +80,7 @@ final class ProjectSettingsVC: NSViewController {
             let b = NSButton(title: t, target: self, action: sel)
             b.bezelStyle = .inline; b.font = .systemFont(ofSize: 10)
             b.frame = NSRect(x: POP_W - 96, y: 4, width: 84, height: 20)
-            b.isEnabled = !catalog.refreshing
+            b.isEnabled = !catalog.listingOwners
             hdr.addSubview(b)
         }
         doc?.addSubview(hdr)
@@ -92,9 +92,12 @@ final class ProjectSettingsVC: NSViewController {
         let q = (filterField?.stringValue ?? "").lowercased()
         let owners = catalog.owners
         if owners.isEmpty {
-            let l = NSTextField(labelWithString: catalog.refreshing ? "Loading projects…" : "No projects found. Login, then refresh.")
-            l.font = .systemFont(ofSize: 12); l.textColor = .secondaryLabelColor
+            let text = catalog.refreshing ? "Loading projects…" : (catalog.listError ?? "No projects found. Login, then refresh.")
+            let l = NSTextField(labelWithString: text)
+            l.font = .systemFont(ofSize: 12); l.textColor = catalog.listError == nil ? .secondaryLabelColor : .systemRed
             l.frame = NSRect(x: 16, y: y + 4, width: w - 32, height: 18)
+            l.lineBreakMode = .byTruncatingTail
+            l.toolTip = catalog.listError
             doc.addSubview(l)
             return y + 28
         }
@@ -102,7 +105,7 @@ final class ProjectSettingsVC: NSViewController {
             let projects = catalog.projects(of: owner.login).filter { p in
                 q.isEmpty || p.title.lowercased().contains(q) || owner.login.lowercased().contains(q)
             }
-            if !q.isEmpty && projects.isEmpty { continue }
+            if !q.isEmpty && projects.isEmpty && owner.login.lowercased().contains(q) == false { continue }
             let open = ProjectSettingsVC.expanded.contains(owner.login) || !q.isEmpty
             let disc = NSButton(frame: NSRect(x: 10, y: y + 4, width: 16, height: 16))
             disc.bezelStyle = .disclosure; disc.setButtonType(.pushOnPushOff); disc.title = ""
@@ -111,7 +114,17 @@ final class ProjectSettingsVC: NSViewController {
             disc.identifier = NSUserInterfaceItemIdentifier(owner.login)
             doc.addSubview(disc)
             let kind = owner.kind == .user ? "you" : "org"
-            let cb = NSButton(checkboxWithTitle: " \(owner.login)  \(kind) · \(projects.count)", target: self, action: #selector(toggleAll(_:)))
+            let countLabel: String
+            if !projects.isEmpty {
+                countLabel = "\(projects.count)"
+            } else {
+                switch catalog.fetch(owner.login) {
+                case .loading: countLabel = "…"
+                case .failed: countLabel = "failed"
+                case .idle: countLabel = "0"
+                }
+            }
+            let cb = NSButton(checkboxWithTitle: " \(owner.login)  \(kind) · \(countLabel)", target: self, action: #selector(toggleAll(_:)))
             cb.font = .systemFont(ofSize: 12, weight: .semibold)
             cb.state = cfg.allOf.contains { $0.caseInsensitiveCompare(owner.login) == .orderedSame } ? .on : .off
             cb.toolTip = "Track all, also new ones"
@@ -140,6 +153,29 @@ final class ProjectSettingsVC: NSViewController {
                 let chip = Badge(live ? "Live" : "\(cfg.pollMinutes) min")
                 chip.frame.origin = NSPoint(x: w - 90, y: y + 1)
                 doc.addSubview(chip)
+                y += 22
+            }
+            if open && projects.isEmpty {
+                let text: String
+                let color: NSColor
+                switch catalog.fetch(owner.login) {
+                case .loading:
+                    text = "Loading projects…"
+                    color = .secondaryLabelColor
+                case .failed(let msg):
+                    text = msg
+                    color = .systemRed
+                case .idle:
+                    text = "No projects"
+                    color = .secondaryLabelColor
+                }
+                let l = NSTextField(labelWithString: text)
+                l.font = .systemFont(ofSize: 12)
+                l.textColor = color
+                l.lineBreakMode = .byTruncatingTail
+                l.toolTip = text
+                l.frame = NSRect(x: 54, y: y + 2, width: w - 80, height: 18)
+                doc.addSubview(l)
                 y += 22
             }
             y += 4
@@ -236,11 +272,18 @@ final class ProjectSettingsVC: NSViewController {
     }
 
     @objc func filterChanged() { rebuild() }
-    @objc func refreshAll() { catalog.refreshAll() }
-    @objc func refreshOwner(_ sender: NSButton) { if let o = sender.identifier?.rawValue { catalog.refresh(owner: o) } }
+    @objc func refreshAll() { catalog.refreshAll(force: true) }
+    @objc func refreshOwner(_ sender: NSButton) { if let o = sender.identifier?.rawValue { catalog.refresh(owner: o, force: true) } }
     @objc func toggleExpand(_ sender: NSButton) {
         guard let o = sender.identifier?.rawValue else { return }
-        if sender.state == .on { ProjectSettingsVC.expanded.insert(o) } else { ProjectSettingsVC.expanded.remove(o) }
+        if sender.state == .on {
+            ProjectSettingsVC.expanded.insert(o)
+            if catalog.projects(of: o).isEmpty {
+                if case .loading = catalog.fetch(o) {} else { catalog.refresh(owner: o, force: true) }
+            }
+        } else {
+            ProjectSettingsVC.expanded.remove(o)
+        }
         rebuild()
     }
     @objc func toggleAll(_ sender: NSButton) {

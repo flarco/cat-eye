@@ -24,7 +24,9 @@ final class ProjectCatalog {
     private(set) var fetchedAt: [String: Date] = [:]
     private(set) var status: [String: OwnerFetch] = [:]
     private(set) var listingOwners = false
+    private(set) var listError: String?
     private var pending = 0
+    private var ticket: [String: Int] = [:]
     private let api: ProjectAPI
     private let path: String
     private let fetchQ: OperationQueue = {
@@ -77,8 +79,8 @@ final class ProjectCatalog {
 
     func refreshIfStale() { if isStale { refreshAll() } }
 
-    func refreshAll() {
-        guard !refreshing else { return }
+    func refreshAll(force: Bool = false) {
+        guard force || !refreshing else { return }
         listingOwners = true
         notify()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -88,37 +90,62 @@ final class ProjectCatalog {
                 self.listingOwners = false
                 switch result {
                 case .success(let list):
+                    self.listError = nil
                     self.owners = list
-                    list.forEach { self.refresh(owner: $0.login) }
-                case .failure, .none:
+                    self.fetchProjects(list)
+                case .failure(let e):
+                    self.listError = e.message
+                    self.notify()
+                case .none:
                     self.notify()
                 }
             }
         }
     }
 
-    func refresh(owner login: String) {
+    // One request for every owner. A click on Refresh starts a new request even if
+    // the previous one is still marked loading.
+    func refresh(owner login: String, force: Bool = false) {
         let key = login.lowercased()
-        if case .loading = fetch(login) { return }
+        if !force, case .loading = fetch(login) { return }
         let kind = owners.first { $0.login.lowercased() == key }?.kind ?? .org
-        status[key] = .loading
+        fetchProjects([(login, kind)])
+    }
+
+    private func fetchProjects(_ list: [(login: String, kind: OwnerKind)]) {
+        guard !list.isEmpty else { notify(); return }
+        var mine: [String: Int] = [:]
+        for o in list {
+            let key = o.login.lowercased()
+            let n = (ticket[key] ?? 0) + 1
+            ticket[key] = n
+            mine[key] = n
+            status[key] = .loading
+        }
         pending += 1
         notify()
         fetchQ.addOperation { [weak self] in
-            let result = self?.api.projects(owner: login, kind: kind) ?? .failure(.gh("Catalog gone"))
+            let result = self?.api.projects(owners: list) ?? .failure(.gh("Catalog gone"))
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.pending -= 1
+                self.pending = max(0, self.pending - 1)
                 switch result {
-                case .success(let list):
-                    self.status[key] = .idle
-                    self.byOwner[key] = list
-                    self.fetchedAt[key] = Date()
-                    if !self.owners.contains(where: { $0.login.lowercased() == key }) {
-                        self.owners.append((login, kind))
+                case .success(let byKey):
+                    for (key, res) in byKey {
+                        guard self.ticket[key] == mine[key] else { continue }
+                        switch res {
+                        case .success(let projects):
+                            self.status[key] = .idle
+                            self.byOwner[key] = projects
+                            self.fetchedAt[key] = Date()
+                        case .failure(let e):
+                            self.status[key] = .failed(e.message)
+                        }
                     }
                 case .failure(let e):
-                    self.status[key] = .failed(e.message)
+                    for (key, n) in mine where self.ticket[key] == n {
+                        self.status[key] = .failed(e.message)
+                    }
                 }
                 self.save()
                 self.notify()

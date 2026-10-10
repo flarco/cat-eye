@@ -38,14 +38,37 @@ Cat Eye is built on three principles:
 - **Boards you already use** — GitHub Projects (v2) from your user account and from your organizations, in one tab
 - **By project or activity** — status chips and a stacked bar per project, or a feed of what changed
 - **Item preview** — status, fields, assignees, and the latest comment. Expand a row for the timeline
-- **Change it in place** — set the status, or comment, without leaving the menu bar
+- **Change it in place** — set the status, edit the title and description, or comment, without leaving the menu bar
+- **New item** — click **+** next to the filter, or press ⌘N. Make a draft, or an issue in a repo. Set the status and the other single-select fields
+- **Start** — ▶ Start sets the first "in progress" status and assigns you
+- **Copy for agent** — copies the item as Markdown: title, facts, link, description and all comments. Paste it into a coding agent
+- **Fold and reorder** — click a project header to fold it. A folded header shows one number: the items that are not done. Drag the grip to change the order
+- **Filter** — press ⌘F and type. The filter looks in titles and descriptions. Esc clears it
+- **Quick capture** — press ⌃⌥N in any app. Cat Eye opens New item with the clipboard text. Change the shortcut in Settings → Projects
 - **macOS notifications** — mentions, comments, status, assignment, and closed items. "My items" means you are an assignee or the author. Your own comments are skipped
 - **Two update sources** — an org project with an org webhook and live updates on is **Live**. A personal project, an org project without a webhook, or the relay off is **Polled**
 - **Poll interval** — Settings → Projects → "Poll projects without live updates every" is 2, 5, 10, 15, or 30 minutes. The default is 5. Live projects use the same interval only while the relay is disconnected
 
 GitHub sends `projects_v2_item` only to organization webhooks, so a personal project cannot be live. The relay still stores only IDs: project and item node ids, and issue numbers. No titles, bodies, or user names.
 
-The Projects tab needs the `project` scope (`gh auth refresh -s project`). Adding org webhooks also needs `admin:org_hook`, and you must be an owner of that org. If you are not, those projects stay on the poll and the live-updates panel says "Not an org owner".
+The Projects tab needs the `project` scope (`gh auth refresh -s project`). To make issues, `gh` also needs the `repo` scope. Adding org webhooks also needs `admin:org_hook`, and you must be an owner of that org. If you are not, those projects stay on the poll and the live-updates panel says "Not an org owner".
+
+### AI (optional)
+AI helps in New item and in the editor. It is off until you set it up. Go to **Settings → AI**:
+
+1. Select the format: **OpenAI** (`/chat/completions`) or **Anthropic** (`/v1/messages`). Any server with one of these formats works, for example a local server
+2. Type the base URL, for example `https://api.openai.com/v1` or `https://api.anthropic.com`. The help line shows the full POST URL
+3. Type the API key. Cat Eye keeps it in the Keychain, not in the config file
+4. Type the model. For OpenAI, select the reasoning effort. "none" leaves the field out. For Anthropic, set Max tokens
+5. Click **Test**. A pass enables the AI switch. If you change the format, the URL, the model or the key, you must test again
+6. Click **Save & Apply**
+
+What AI does:
+- **Title and fields** — from the description, it suggests a title, two other titles, and field values. Click Suggest again for new ones
+- **Tidy** — makes the description into clear Markdown. Undo is one click
+- **Pick the project** — "✦ Auto" lets the AI select the project and tells you why
+
+**Extra context** is text that Cat Eye adds to each prompt, for example your team words or title rules. Cat Eye sends only the text you see in the dialog and the names of the projects, fields and options.
 
 ### Insights Tab
 - **Deploy log** — every run Cat Eye sees is appended to `~/.config/cat-eye/deploys.jsonl`, so your history survives restarts
@@ -58,6 +81,7 @@ The Projects tab needs the `project` scope (`gh auth refresh -s project`). Addin
 - **Repo filter** — "All Repos" or pick a specific repo; persists across tabs
 - **Built-in setup** — login to GitHub and pick repos to track from the settings panel. Repos show as a tree per owner. Select an organization to track all its repos, also the repos that it adds later. The repo list is cached and refreshes in the background once a day.
 - **Keyboard accessible** — navigate rows with Tab, activate with Return or Space
+- **Shortcuts** — in the Projects tab: ⌘N new item, ⌘F filter, ⌘↩ save or create, Esc cancel, ⇧⌘V paste the clipboard in New item. In any app: ⌃⌥N quick capture
 - **Colour-blind friendly** — status colours use the Okabe-Ito colour-blind-safe palette, and every state also carries a shape or text signal (badge glyphs, spelled-out statuses, tooltips)
 - **Copy URL** — one-click copy of any run or PR URL to clipboard
 - **Direct links** — click to open runs or PRs in GitHub
@@ -178,7 +202,16 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
     "projects": {
         "picked": ["myorg/4"],
         "pollMinutes": 5,
-        "showTab": true
+        "showTab": true,
+        "order": ["myorg/4"],
+        "folded": [],
+        "capture": { "enabled": true, "keyCode": 45, "modifiers": 6144, "pasteClipboard": true, "aiTitle": true }
+    },
+    "ai": {
+        "format": "openai",
+        "baseURL": "https://api.openai.com/v1",
+        "model": "gpt-5-mini",
+        "effort": "low"
     }
 }
 ```
@@ -200,6 +233,10 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `projects.allOf` | `[]` | Owners whose projects are all tracked, including ones they add later |
 | `projects.pollMinutes` | `5` | How often to poll projects that are not live. One of 2, 5, 10, 15, 30 |
 | `projects.showTab` | `true` | Show the Projects tab |
+| `projects.order` | `[]` | The project order, written when you drag a header. Projects not in the list come after, by owner and title |
+| `projects.folded` | `[]` | Folded projects |
+| `projects.capture` | on, ⌃⌥N | Quick capture: `enabled`, the Carbon `keyCode` and `modifiers`, `pasteClipboard` and `aiTitle`. Set it in Settings → Projects |
+| `ai` | off | AI settings, written by **Settings → AI**. The API key is in the Keychain |
 
 ## Updates
 
@@ -292,6 +329,8 @@ A small blue dot on the icon means a tracked project has unread activity. The CI
 | No PRs showing | The PR tab only shows PRs where **your review is requested** — not all open PRs |
 | Projects tab asks for the project scope | Run `gh auth refresh -s project`, or click Grant access in the tab |
 | Org project stays on polling | GitHub has no webhook for personal projects. For an org, you must be an owner and grant `admin:org_hook` |
+| Quick capture shortcut does nothing | Another app has the shortcut. Settings → Projects shows the error. Record a different shortcut |
+| AI switch is disabled | Click Test in Settings → AI. A change to the format, URL, model or key needs a new test |
 | Popover closes while typing | Expand a PR first — this switches to semitransient mode |
 | Config changes not taking effect | Click "Save & Apply" in Settings — no restart needed |
 | Build fails | Ensure Xcode Command Line Tools are installed: `xcode-select --install` |

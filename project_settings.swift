@@ -9,6 +9,8 @@ final class ProjectSettingsVC: NSViewController {
     var doc: Flipped?
     var scroll: NSScrollView?
     var observer: NSObjectProtocol?
+    var shortcutField: ShortcutField?
+    static var captureError: String?
     static var expanded: Set<String> = []
 
     init(catalog: ProjectCatalog, store: ProjectStore, cfg: ProjectsConfig) {
@@ -65,6 +67,8 @@ final class ProjectSettingsVC: NSViewController {
             y = display(y: y, w: w, in: doc)
             y = header("REFRESH", y: y, button: nil)
             y = refreshSection(y: y, w: w, in: doc)
+            y = header("QUICK CAPTURE", y: y, button: nil)
+            y = captureSection(y: y, w: w, in: doc)
             let save = NSButton(title: "Save & Apply", target: self, action: #selector(doSave))
             save.bezelStyle = .inline; save.font = .systemFont(ofSize: 12, weight: .semibold)
             save.frame = NSRect(x: w / 2 - 60, y: y + 12, width: 120, height: 28)
@@ -102,7 +106,7 @@ final class ProjectSettingsVC: NSViewController {
             return y + 28
         }
         for owner in owners {
-            let projects = catalog.projects(of: owner.login).filter { p in
+            let projects = cfg.sorted(catalog.projects(of: owner.login)).filter { p in
                 q.isEmpty || p.title.lowercased().contains(q) || owner.login.lowercased().contains(q)
             }
             if !q.isEmpty && projects.isEmpty && owner.login.lowercased().contains(q) == false { continue }
@@ -257,6 +261,77 @@ final class ProjectSettingsVC: NSViewController {
         return y + 48
     }
 
+    func captureSection(y: CGFloat, w: CGFloat, in doc: NSView) -> CGFloat {
+        var y = y + 4
+        let sw = NSSwitch(frame: NSRect(x: 16, y: y, width: 40, height: 22))
+        sw.state = cfg.capture.enabled ? .on : .off
+        sw.target = self; sw.action = #selector(toggleCapture(_:))
+        doc.addSubview(sw)
+        let l = NSTextField(labelWithString: "Global shortcut opens New item from any app")
+        l.font = .systemFont(ofSize: 12)
+        l.frame = NSRect(x: 64, y: y + 2, width: 300, height: 18)
+        doc.addSubview(l)
+        let field = ShortcutField(cfg.capture)
+        field.frame = NSRect(x: w - 230, y: y - 2, width: 110, height: 26)
+        field.isEnabled = cfg.capture.enabled
+        field.onChange = { [weak self] code, mods in
+            self?.cfg.capture.keyCode = code
+            self?.cfg.capture.modifiers = mods
+        }
+        field.onRecording = { on in (NSApp.delegate as? GHActionsBar)?.suspendCaptureHotKey(on) }
+        doc.addSubview(field)
+        shortcutField = field
+        let clear = NSButton(title: "Clear", target: self, action: #selector(clearShortcut))
+        clear.bezelStyle = .rounded; clear.font = .systemFont(ofSize: 11)
+        clear.frame = NSRect(x: w - 116, y: y - 2, width: 60, height: 26)
+        doc.addSubview(clear)
+        let tryIt = NSButton(title: "Try", target: self, action: #selector(tryCapture))
+        tryIt.bezelStyle = .rounded; tryIt.font = .systemFont(ofSize: 11)
+        tryIt.frame = NSRect(x: w - 60, y: y - 2, width: 48, height: 26)
+        tryIt.toolTip = "Open the New item sheet as the shortcut does"
+        doc.addSubview(tryIt)
+        y += 32
+        let rows: [(String, String, String, Bool)] = [
+            ("paste", "Put the clipboard text in the description", "Only when the clipboard has text.", cfg.capture.pasteClipboard),
+            ("ai", "Write the title with AI at once", "Needs Settings → AI. AI also picks the project.", cfg.capture.aiTitle),
+        ]
+        for r in rows {
+            let cb = NSButton(checkboxWithTitle: r.1, target: self, action: #selector(toggleCaptureOption(_:)))
+            cb.font = .systemFont(ofSize: 12)
+            cb.identifier = NSUserInterfaceItemIdentifier(r.0)
+            cb.state = r.3 ? .on : .off
+            cb.frame = NSRect(x: 64, y: y, width: w - 80, height: 18)
+            doc.addSubview(cb)
+            let d = NSTextField(labelWithString: r.2)
+            d.font = .systemFont(ofSize: 10.5); d.textColor = .tertiaryLabelColor
+            d.frame = NSRect(x: 84, y: y + 18, width: w - 100, height: 14)
+            doc.addSubview(d)
+            y += 38
+        }
+        if let msg = ProjectSettingsVC.captureError {
+            let e = NSTextField(labelWithString: msg)
+            e.font = .systemFont(ofSize: 11); e.textColor = C_FAILURE
+            e.frame = NSRect(x: 64, y: y, width: w - 80, height: 16)
+            doc.addSubview(e)
+            y += 20
+        }
+        return y + 4
+    }
+
+    @objc func toggleCapture(_ sender: NSSwitch) {
+        cfg.capture.enabled = sender.state == .on
+        shortcutField?.isEnabled = cfg.capture.enabled
+    }
+    @objc func clearShortcut() {
+        cfg.capture.modifiers = 0
+        shortcutField?.set(cfg.capture)
+    }
+    @objc func toggleCaptureOption(_ sender: NSButton) {
+        let on = sender.state == .on
+        if sender.identifier?.rawValue == "paste" { cfg.capture.pasteClipboard = on } else { cfg.capture.aiTitle = on }
+    }
+    @objc func tryCapture() { (NSApp.delegate as? GHActionsBar)?.quickCapture() }
+
     func popupRow(_ title: String, _ items: [String], _ selected: Int, _ action: Selector, y: CGFloat, in doc: NSView) -> CGFloat {
         let l = NSTextField(labelWithString: title)
         l.font = .systemFont(ofSize: 12)
@@ -336,6 +411,9 @@ final class ProjectSettingsVC: NSViewController {
         PROJECTS_CFG = cfg
         saveConfig()
         let app = NSApp.delegate as? GHActionsBar
+        let ok = app?.applyCaptureHotKey() ?? true
+        ProjectSettingsVC.captureError = ok ? nil : "macOS did not accept \(cfg.capture.shortcutLabel). Another app may use it."
         app?.applyProjectSelection()
+        if !ok { app?.showSettings(.projects) }
     }
 }

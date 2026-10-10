@@ -21,7 +21,7 @@ fi
 BINS=()
 for arch in ${ARCHS:-$(uname -m)}; do
   swiftc -Osize -target "$arch-apple-macos13.0" -o "CatEye.app/Contents/MacOS/cat-eye-$arch" *.swift \
-    -framework Cocoa -framework UserNotifications -framework Network
+    -framework Cocoa -framework UserNotifications -framework Network -framework Carbon
   BINS+=("CatEye.app/Contents/MacOS/cat-eye-$arch")
 done
 lipo -create "${BINS[@]}" -output CatEye.app/Contents/MacOS/cat-eye

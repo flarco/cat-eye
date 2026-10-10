@@ -112,6 +112,7 @@ struct CommentRef: Codable, Hashable {
     let author: String?
     let createdAt: Date
     let url: String
+    var body: String? = nil
 }
 
 struct ProjectItem: Codable, Hashable {
@@ -134,6 +135,7 @@ struct ProjectItem: Codable, Hashable {
     let commentCount: Int
     let lastComment: CommentRef?
     var mentionsMe: Bool
+    var body: String? = nil
 
     // https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=268087835
     func paneURL(projectURL: String) -> String? {
@@ -150,6 +152,44 @@ struct ProjectItem: Codable, Hashable {
         let s = (state ?? "").uppercased()
         return s == "CLOSED" || s == "MERGED"
     }
+
+    // Markdown for a coding agent: title, facts, link, description, comments (oldest first).
+    func agentMarkdown(snap: ProjectSnapshot, comments: [CommentRef]) -> String {
+        var facts = ["Project: \(snap.summary.ref.owner)/\(snap.summary.title)"]
+        facts.append("Status: \(snap.statusName(statusOptionId) ?? "None")")
+        if let repo, let number { facts.append("Issue: \(repo)#\(number)") }
+        if kind == .draft { facts.append("Draft") }
+        for (k, v) in fields.sorted(by: { $0.key < $1.key }) where k != "Status" && k != "Title" { facts.append("\(k): \(v)") }
+        if !assignees.isEmpty { facts.append("Assignees: " + assignees.map { "@" + $0 }.joined(separator: ", ")) }
+        var out = "# \(title)\n\n" + facts.joined(separator: " · ") + "\n"
+        if let link = paneURL(projectURL: snap.summary.url) ?? url { out += link + "\n" }
+        let text = (body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        out += "\n" + (text.isEmpty ? "_No description_" : text) + "\n\n## Comments\n"
+        if comments.isEmpty { return out + "_None_\n" }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = TimeZone(identifier: "UTC")
+        df.dateFormat = "yyyy-MM-dd"
+        for c in comments.sorted(by: { $0.createdAt < $1.createdAt }) {
+            let lines = (c.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
+            out += "- @\(c.author ?? "ghost") (\(df.string(from: c.createdAt))): " + lines.joined(separator: "\n  ") + "\n"
+        }
+        return out
+    }
+
+    // Case-insensitive match on the title and the body. An empty query matches all.
+    func matches(_ query: String) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty { return true }
+        return title.localizedCaseInsensitiveContains(q) || (body ?? "").localizedCaseInsensitiveContains(q)
+    }
+}
+
+// A single-select field of a project, such as Status, Size or Priority.
+struct ProjectField: Codable, Hashable {
+    let id: String
+    let name: String
+    let options: [StatusOption]
 }
 
 struct ProjectSnapshot: Codable {
@@ -158,6 +198,10 @@ struct ProjectSnapshot: Codable {
     let statusOptions: [StatusOption]
     let items: [ProjectItem]
     let fetchedAt: Date
+    var fields: [ProjectField]? = nil
+
+    // The number on a folded header.
+    var notDoneCount: Int { items.filter { option($0.statusOptionId)?.category != .done }.count }
 
     var counts: [StatusCategory: Int] {
         var c: [StatusCategory: Int] = [:]

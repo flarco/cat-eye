@@ -69,12 +69,7 @@ final class ProjectCatalog {
             }
         }
         // A pick whose owner has not been fetched yet still has a key. Skip it until the catalog has it.
-        return out.sorted {
-            if $0.ref.owner.caseInsensitiveCompare($1.ref.owner) != .orderedSame {
-                return $0.ref.owner.localizedCaseInsensitiveCompare($1.ref.owner) == .orderedAscending
-            }
-            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
-        }
+        return cfg.sorted(out)
     }
 
     func refreshIfStale() { if isStale { refreshAll() } }

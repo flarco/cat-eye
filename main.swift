@@ -894,6 +894,156 @@ func runSelfTest() {
     let decoded = try? JSONDecoder().decode(AppConfig.self, from: oldConfig)
     check(decoded?.projects == nil && decoded?.repos == ["o/r"], "old config without projects decodes")
 
+    // Projects: order, fold, filter.
+    let oldProjects = try? JSONDecoder().decode(ProjectsConfig.self, from: Data(#"{"picked":["a/1"],"pollMinutes":5}"#.utf8))
+    check(oldProjects?.order == [] && oldProjects?.folded == [] && oldProjects?.capture == CaptureConfig()
+            && oldProjects?.picked == ["a/1"], "old projects config gets the new defaults")
+    func summary(_ owner: String, _ n: Int, _ title: String) -> ProjectSummary {
+        ProjectSummary(ref: ProjectRef(owner: owner, number: n), nodeId: "N\(n)", title: title, url: "", closed: false,
+                       itemCount: 0, ownerKind: .org)
+    }
+    var orderCfg = ProjectsConfig()
+    orderCfg.order = ["zed/9", "ACME/2", "gone/7"]
+    let ordered = orderCfg.sorted([summary("acme", 1, "Beta"), summary("acme", 2, "Alpha"), summary("zed", 9, "Zed"),
+                                   summary("bolt", 3, "Bolt"), summary("acme", 4, "Aardvark")]).map(\.ref.key)
+    check(ordered == ["zed/9", "acme/2", "acme/4", "acme/1", "bolt/3"], "project order \(ordered)")
+    orderCfg.setFolded("acme/1", true)
+    check(orderCfg.isFolded("ACME/1"), "fold is case-insensitive")
+    orderCfg.setFolded("acme/1", false)
+    check(orderCfg.folded.isEmpty, "unfold")
+    let nextOpt = StatusOption(id: "s3", name: "Next", color: "BLUE")
+    let reviewOpt = StatusOption(id: "s4", name: "In review", color: "PURPLE")
+    let doneOpt = StatusOption(id: "s5", name: "Done", color: "GREEN")
+    let foldSnap = ProjectSnapshot(summary: summary("acme", 4, "Board"), statusFieldId: "F",
+                                   statusOptions: [todoOpt, nextOpt, reviewOpt, doneOpt],
+                                   items: [projectItem("1", status: "s3"), projectItem("2", status: "s4"),
+                                           projectItem("3", status: "s5"), projectItem("4", status: nil)],
+                                   fetchedAt: Date())
+    check(foldSnap.notDoneCount == 3, "fold count is items not done")
+    var bodyItem = projectItem("9", status: nil)
+    bodyItem.body = "The Relay drops events"
+    check(bodyItem.matches("relay") && bodyItem.matches("ITEM 9") && bodyItem.matches("  ") && !bodyItem.matches("nope"),
+          "filter matches title and body")
+
+    // AI dialects, without network.
+    var aiCfg = AIConfig()
+    aiCfg.baseURL = "https://llm.example.com/v1/"
+    aiCfg.model = "m1"
+    let aiReq = AIRequest(system: "SYS", user: "USER", maxTokens: 300)
+    func jsonBody(_ r: URLRequest?) -> [String: Any] {
+        (r?.httpBody).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+    }
+    let oa = try? OpenAIDialect().urlRequest(aiReq, cfg: aiCfg, key: "k1")
+    check(oa?.url?.absoluteString == "https://llm.example.com/v1/chat/completions", "openai url \(oa?.url?.absoluteString ?? "")")
+    check(oa?.value(forHTTPHeaderField: "Authorization") == "Bearer k1", "openai bearer")
+    check(jsonBody(oa)["reasoning_effort"] as? String == "low" && jsonBody(oa)["model"] as? String == "m1", "openai effort")
+    check((jsonBody(oa)["messages"] as? [[String: Any]])?.first?["role"] as? String == "system", "openai system message")
+    aiCfg.baseURL = "https://llm.example.com/v1"
+    aiCfg.effort = "none"
+    let oaNone = try? OpenAIDialect().urlRequest(aiReq, cfg: aiCfg, key: "k1")
+    check(oaNone?.url?.absoluteString == "https://llm.example.com/v1/chat/completions", "openai url without slash")
+    check(jsonBody(oaNone)["reasoning_effort"] == nil, "effort none leaves out the field")
+    aiCfg.format = .anthropic
+    aiCfg.baseURL = "https://api.anthropic.com/"
+    let an = try? AnthropicDialect().urlRequest(aiReq, cfg: aiCfg, key: "k2")
+    check(an?.url?.absoluteString == "https://api.anthropic.com/v1/messages", "anthropic url")
+    check(an?.value(forHTTPHeaderField: "x-api-key") == "k2" && an?.value(forHTTPHeaderField: "anthropic-version") == "2023-06-01",
+          "anthropic headers")
+    check(jsonBody(an)["max_tokens"] as? Int == 300 && jsonBody(an)["system"] as? String == "SYS", "anthropic body")
+    check(AnthropicDialect.endpoint("https://proxy.example/v1") == "https://proxy.example/v1/messages", "anthropic url with /v1")
+    let oaReply = Data(#"{"choices":[{"message":{"role":"assistant","content":"Hello"}}]}"#.utf8)
+    check((try? OpenAIDialect().text(from: oaReply, status: 200)) == "Hello", "openai reply")
+    let anReply = Data(#"{"content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"Hi"},{"type":"text","text":"!"}]}"#.utf8)
+    check((try? AnthropicDialect().text(from: anReply, status: 200)) == "Hi!", "anthropic reply")
+    let errBody = Data(#"{"error":{"message":"Invalid API key\nmore","type":"auth"}}"#.utf8)
+    do { _ = try OpenAIDialect().text(from: errBody, status: 401); check(false, "401 must throw") }
+    catch { check(error as? AIError == .http(401, "Invalid API key"), "http error \(error)") }
+
+    // Suggestion parsing.
+    let sizeField = ProjectField(id: "FS", name: "Size", options: [StatusOption(id: "o1", name: "S", color: "GRAY"),
+                                                                   StatusOption(id: "o2", name: "L", color: "GRAY")])
+    let draftCtx = DraftContext(projects: [("flarco/3", "Fritz Tasks"), ("acme/1", "Board")], fields: [sizeField])
+    let reply = """
+    Sure! Here it is:
+    ```json
+    {"title": "  \(String(repeating: "x", count: 80)).", "alternatives": ["Other", "Third"],
+     "fields": {"size": "l", "Priority": "P0", "Size2": "S"}, "project": "FLARCO/3", "reason": "personal"}
+    ```
+    """
+    let sug = DraftSuggestion.parse(reply, ctx: draftCtx)
+    check(sug?.title.count == 70 && sug?.alternatives == ["Other", "Third"], "suggestion title and alternatives")
+    check(sug?.fields == ["Size": "L"], "unknown fields and options are dropped \(sug?.fields ?? [:])")
+    check(sug?.project == "flarco/3" && sug?.reason == "personal", "project key is normalized")
+    check(DraftSuggestion.parse(#"{"title":"Fix it","project":"nope/1"}"#, ctx: draftCtx)?.project == nil, "unknown project dropped")
+    check(DraftSuggestion.parse("no json here", ctx: draftCtx) == nil, "no JSON gives nil")
+    check(unfenced("```markdown\n## Context\nText\n```") == "## Context\nText", "fence removed")
+
+    // The AI switch needs a test that passed for the current values.
+    var gate = AIConfig()
+    gate.baseURL = "https://a"; gate.model = "m"; gate.enabled = true
+    gate.verified = gate.fingerprint(key: "k")
+    check(gate.isOn(key: "k") && !gate.isOn(key: "k2") && !gate.isOn(key: nil), "ai on only with the tested key")
+    var changed = gate; changed.model = "m2"
+    check(!changed.isOn(key: "k"), "model change turns ai off")
+    changed = gate; changed.baseURL = "https://b"
+    check(!changed.isOn(key: "k"), "url change turns ai off")
+    changed = gate; changed.format = .anthropic
+    check(!changed.isOn(key: "k"), "format change turns ai off")
+    changed = gate; changed.enabled = false
+    check(!changed.isOn(key: "k"), "disabled ai is off")
+    check(changed.extraContext == "" && (try? JSONDecoder().decode(AIConfig.self, from: Data("{}".utf8)))?.effort == "low",
+          "ai config defaults")
+
+    // Copy for agent.
+    let agentSnap = ProjectSnapshot(summary: ProjectSummary(ref: ProjectRef(owner: "flarco", number: 3), nodeId: "P",
+                                                            title: "Fritz Tasks", url: "https://github.com/users/flarco/projects/3",
+                                                            closed: false, itemCount: 2, ownerKind: .user),
+                                    statusFieldId: "F", statusOptions: [todoOpt, doingOpt], items: [], fetchedAt: Date())
+    let draftItem = ProjectItem(id: "PVTI_x", contentId: "DI_1", kind: .draft, title: "Add quick capture", url: nil,
+                                databaseId: "42", repo: nil, number: nil, state: nil, statusOptionId: "s1",
+                                fields: ["Size": "L", "Title": "Add quick capture"], assignees: [], labels: [], author: nil,
+                                updatedAt: Date(), commentCount: 0, lastComment: nil, mentionsMe: false, body: "Use ⌃⌥N.\n")
+    check(draftItem.agentMarkdown(snap: agentSnap, comments: []) == """
+    # Add quick capture
+
+    Project: flarco/Fritz Tasks · Status: Todo · Draft · Size: L
+    https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=42
+
+    Use ⌃⌥N.
+
+    ## Comments
+    _None_
+
+    """, "agent markdown for a draft")
+    let issueItem = ProjectItem(id: "PVTI_y", contentId: "I_1", kind: .issue, title: "Fix login", url: "https://github.com/o/r/issues/5",
+                                databaseId: "43", repo: "o/r", number: 5, state: "OPEN", statusOptionId: "s2",
+                                fields: [:], assignees: ["ada"], labels: [], author: "bea", updatedAt: Date(),
+                                commentCount: 2, lastComment: nil, mentionsMe: false, body: nil)
+    let c1 = CommentRef(id: "c1", author: "bea", createdAt: Date(timeIntervalSince1970: 1_700_000_000), url: "", body: "First\nline two")
+    let c2 = CommentRef(id: "c2", author: "ada", createdAt: Date(timeIntervalSince1970: 1_700_100_000), url: "", body: "Done?")
+    check(issueItem.agentMarkdown(snap: agentSnap, comments: [c2, c1]) == """
+    # Fix login
+
+    Project: flarco/Fritz Tasks · Status: In progress · Issue: o/r#5 · Assignees: @ada
+    https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=43
+
+    _No description_
+
+    ## Comments
+    - @bea (2023-11-14): First
+      line two
+    - @ada (2023-11-16): Done?
+
+    """, "agent markdown for an issue with comments")
+
+    // Quick capture shortcut label.
+    check(CaptureConfig().shortcutLabel == "⌃⌥N", "default shortcut label")
+    var cap = CaptureConfig()
+    cap.keyCode = 40; cap.modifiers = CaptureConfig.carbonModifiers([.command, .shift])
+    check(cap.shortcutLabel == "⇧⌘K", "shortcut label \(cap.shortcutLabel)")
+    cap.modifiers = 0
+    check(cap.shortcutLabel == "None" && !cap.hasShortcut, "cleared shortcut")
+
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
 
@@ -1073,6 +1223,16 @@ class TabVC: NSViewController {
     var selectedProject: String?
     var projectError: String?
     var timelineCache: [String: [ActivityEntry]] = [:]
+    var projectQuery = ""
+    var projectNotice: String?
+    var editingItem: String?
+    var itemEdit: ItemEdit?
+    var bodyExpanded: Set<String> = []
+    var sheet: NewItemSheet?
+    var searchField: NSSearchField?
+    var keyMonitor: Any?
+    var dragLine: NSView?
+    var dragTarget: Int?
     var scrollView: NSScrollView!
     var doc: Flipped!
     var footerView: NSView!
@@ -1142,6 +1302,8 @@ class TabVC: NSViewController {
         self.updated = updated; self.loading = loading
         guard isViewLoaded else { return }
         (footerView as? Footer)?.showUpdated(updated)
+        // A rebuild would take the focus from the editor.
+        if editingItem != nil || dragLine != nil { return }
         let origin = scrollView.contentView.bounds.origin
         JobSummary.close()  // the rebuild removes its chip
         rebuildContent()
@@ -1185,9 +1347,83 @@ class TabVC: NSViewController {
         scrollView.frame.origin.y = chrome
         scrollView.frame.size.height = visScrollH
         footerView.frame.origin.y = chrome + visScrollH
-        let totalH = chrome + visScrollH + FTR_H
+        var totalH = chrome + visScrollH + FTR_H
+        if let sheet {
+            totalH = max(totalH, sheet.cardHeight)
+            sheet.frame = NSRect(x: 0, y: 0, width: POP_W, height: totalH)
+        }
         view.frame.size.height = totalH
         preferredContentSize = NSSize(width: POP_W, height: totalH)
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, e.window == self.view.window, self.sheet == nil, self.selectedTab == .projects else { return e }
+            let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if self.editingItem != nil {
+                if e.keyCode == 53 { self.endEdit(); return nil }
+                if e.keyCode == 36 && mods.contains(.command) { self.saveEdit(); return nil }
+                return e
+            }
+            if e.keyCode == 53, self.view.window?.firstResponder === self.searchField?.currentEditor(), !self.projectQuery.isEmpty {
+                self.searchField?.stringValue = ""
+                self.projectQuery = ""
+                (NSApp.delegate as? GHActionsBar)?.projectQuery = ""
+                self.rebuildContent()
+                return nil
+            }
+            guard mods == .command else { return e }
+            switch e.charactersIgnoringModifiers?.lowercased() {
+            case "n": self.presentNewItem(target: self.selectedProject, prefill: nil); return nil
+            case "f": self.view.window?.makeFirstResponder(self.searchField); return nil
+            default: return e
+            }
+        }
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+    }
+
+    // ⌘N or "+": the sheet sits over the list. `target` nil lets AI pick the project.
+    func presentNewItem(target: String?, prefill: String?, suggest: Bool = false) {
+        guard let app = NSApp.delegate as? GHActionsBar else { return }
+        let projects = app.projectCatalog.resolve(PROJECTS_CFG).filter { app.projectStore.snapshots[$0.ref.key] != nil }
+        guard !projects.isEmpty else { return }
+        sheet?.removeFromSuperview()
+        let s = NewItemSheet(store: app.projectStore, projects: projects, repoCatalog: app.catalog,
+                             target: target, prefill: prefill, w: POP_W)
+        s.onClose = { [weak self] key, notice in self?.closeNewItem(key: key, notice: notice) }
+        s.onResize = { [weak self] in self?.relayout() }
+        view.addSubview(s)
+        sheet = s
+        app.popover.behavior = .semitransient
+        relayout()
+        s.focus()
+        if suggest && s.aiDraft && !s.body.isEmpty { s.suggest() }
+    }
+
+    func closeNewItem(key: String?, notice: String?) {
+        sheet?.removeFromSuperview()
+        sheet = nil
+        let app = NSApp.delegate as? GHActionsBar
+        app?.popover.behavior = expandedItem != nil ? .semitransient : .transient
+        if let key, PROJECTS_CFG.isFolded(key) {
+            PROJECTS_CFG.setFolded(key, false)
+            saveConfig()
+        }
+        if let notice {
+            projectNotice = notice
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.projectNotice == notice else { return }
+                self.projectNotice = nil
+                self.rebuildContent()
+            }
+        }
+        rebuildContent()
     }
 
 
@@ -1255,8 +1491,27 @@ class TabVC: NSViewController {
             let unread = NSButton(checkboxWithTitle: "Unread only", target: self, action: #selector(toggleUnread(_:)))
             unread.font = .systemFont(ofSize: 11)
             unread.state = unreadOnly ? .on : .off
-            unread.frame = NSRect(x: 326, y: 6, width: 110, height: 20)
+            unread.frame = NSRect(x: 326, y: 6, width: 104, height: 20)
             bar.addSubview(unread)
+            let search = NSSearchField(frame: NSRect(x: 436, y: 5, width: w - 436 - 40, height: 22))
+            search.placeholderString = "Filter  ⌘F"
+            search.font = .systemFont(ofSize: 11)
+            search.stringValue = projectQuery
+            search.sendsSearchStringImmediately = true
+            search.target = self; search.action = #selector(queryChanged(_:))
+            search.isEnabled = projectView == .board
+            bar.addSubview(search)
+            searchField = search
+            let add = NSButton(image: NSImage(systemSymbolName: "plus", accessibilityDescription: "New item")!,
+                               target: self, action: #selector(newItem))
+            add.bezelStyle = .rounded
+            add.isBordered = true
+            add.bezelColor = .controlAccentColor
+            add.contentTintColor = .white
+            add.symbolConfiguration = .init(pointSize: 11, weight: .bold)
+            add.frame = NSRect(x: w - 34, y: 4, width: 26, height: 24)
+            add.toolTip = "New item (⌘N)"
+            bar.addSubview(add)
         }
         return bar
     }
@@ -1293,6 +1548,12 @@ class TabVC: NSViewController {
         rememberProjectUI()
         rebuildContent()
     }
+    @objc func queryChanged(_ sender: NSSearchField) {
+        projectQuery = sender.stringValue
+        (NSApp.delegate as? GHActionsBar)?.projectQuery = projectQuery
+        rebuildContent()
+    }
+    @objc func newItem() { presentNewItem(target: selectedProject, prefill: nil) }
     @objc func toggleAssigned(_ sender: NSButton) {
         assignedOnly = sender.state == .on
         rememberProjectUI()
@@ -1378,6 +1639,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     var expandedItem: String?
     var projectStatusFilter: [String: String] = [:]
     var projectShowAll: Set<String> = []
+    var projectQuery = ""
     var pendingProjectItem: String?
     var lastSettingsTab: SettingsTab = .general
     var lastSyncedOrgs: [String] = []
@@ -1406,6 +1668,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         return s
     }()
     var catalogTimer: Timer?
+    var captureHotKey: GlobalHotKey?
     let rateLimit = RateLimitMonitor()
     let updater = Updater()
     lazy var relay: RelayClient = {
@@ -1419,6 +1682,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     func applicationDidFinishLaunching(_ note: Notification) {
         log.info("Cat Eye launching — repos: \(REPOS.count), poll: \(POLL_NORMAL)s/\(POLL_ACTIVE)s")
         loadConfig()
+        installEditMenu()
         REPOS = catalog.resolve(picked: PICKED_REPOS, orgs: PICKED_ORGS)
         assignRepoColors(REPOS)
         log.info("Config loaded — tracking \(REPOS.count) repos: \(REPOS.joined(separator: ", "))")
@@ -1494,6 +1758,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         projectStore.track(projectCatalog.resolve(PROJECTS_CFG), live: liveProjectKeys())
         syncProjectOrgs()
         projectCatalog.refreshIfStale()
+        applyCaptureHotKey()
         NotificationCenter.default.addObserver(forName: ProjectCatalog.changed, object: projectCatalog, queue: .main) { [weak self] _ in
             guard let self = self, !self.projectCatalog.refreshing else { return }
             self.projectStore.track(self.projectCatalog.resolve(PROJECTS_CFG), live: self.liveProjectKeys())
@@ -1508,6 +1773,61 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 self?.viewerLogin = login
             }
         }
+    }
+
+    // Registers the quick capture shortcut again. Settings → Projects calls it after a save.
+    @discardableResult
+    func applyCaptureHotKey() -> Bool {
+        captureHotKey?.unregister()
+        captureHotKey = nil
+        let c = PROJECTS_CFG.capture
+        guard c.enabled, c.hasShortcut, PROJECTS_CFG.showTab else { return true }
+        captureHotKey = GlobalHotKey(keyCode: c.keyCode, modifiers: c.modifiers) { [weak self] in self?.quickCapture() }
+        if captureHotKey == nil { log.warning("Quick capture shortcut \(c.shortcutLabel) is not available") }
+        return captureHotKey != nil
+    }
+
+    func suspendCaptureHotKey(_ on: Bool) {
+        if on { captureHotKey?.unregister(); captureHotKey = nil } else { applyCaptureHotKey() }
+    }
+
+    // Opens the Projects tab with the New item sheet, from any app.
+    func quickCapture() {
+        guard PROJECTS_CFG.showTab else { return }
+        let c = PROJECTS_CFG.capture
+        let clip = c.pasteClipboard
+            ? NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        selectedTab = .projects
+        if popover.isShown {
+            if let vc = popover.contentViewController as? TabVC, vc.selectedTab == .projects {
+                if vc.sheet != nil { return }
+            } else {
+                showList()
+            }
+        } else {
+            closeTime = .distantPast
+            popover.contentViewController = nil
+            toggle()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        (popover.contentViewController as? TabVC)?.presentNewItem(target: nil, prefill: clip, suggest: c.aiTitle)
+    }
+
+    // The app has no visible menu bar, but text fields need the Edit key equivalents (⌘C, ⌘V, ⌘Z).
+    func installEditMenu() {
+        let main = NSMenu()
+        let item = NSMenuItem()
+        main.addItem(item)
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        item.submenu = edit
+        NSApp.mainMenu = main
     }
 
     // True when macOS actually placed the status item in a menu bar. A screen left
@@ -2014,6 +2334,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         vc.selectedProject = selectedProject
         vc.statusFilter = projectStatusFilter
         vc.showAllProjects = projectShowAll
+        vc.projectQuery = projectQuery
         if pendingProjectItem != nil { selectedTab = .projects; vc.selectedTab = .projects }
         pendingProjectItem = nil
         return vc
@@ -2076,6 +2397,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 || self.popover.contentViewController is ActionsSettingsVC
                 || self.popover.contentViewController is ProjectSettingsVC
                 || self.popover.contentViewController is RelaySettingsVC
+                || self.popover.contentViewController is AISettingsVC
             let settingsTab = self.lastSettingsTab
             let wasShown = self.popover.isShown
             self.popover.close()
@@ -2102,6 +2424,8 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 self.popover.contentViewController = ActionsSettingsVC(catalog: self.catalog, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS))
             case .projects:
                 self.popover.contentViewController = ProjectSettingsVC(catalog: self.projectCatalog, store: self.projectStore, cfg: PROJECTS_CFG)
+            case .ai:
+                self.popover.contentViewController = AISettingsVC()
             case .live:
                 self.popover.contentViewController = RelaySettingsVC(deployer: self.relayDeployer, client: self.relay)
             }

@@ -1,5 +1,15 @@
 import Foundation
 
+enum NewItemKind: Equatable { case draft, issue(repo: String) }
+
+struct NewItem {
+    var projectKey: String
+    var title: String
+    var body: String
+    var kind: NewItemKind
+    var fieldOptions: [String: String]      // field id → option id
+}
+
 // Last snapshots, the activity feed, and unread state. Fetches run off the main
 // queue. The first snapshot of a project creates no activity, so launch is quiet.
 
@@ -22,7 +32,7 @@ final class ProjectStore {
     private var readItems = Set<String>()
     private var activityCache: [ActivityEntry] = []
     private var timelineCache: [String: (stamp: String, entries: [ActivityEntry])] = [:]
-    private var timelineFlight = Set<String>()
+    private var timelineWaiters: [String: [([ActivityEntry]) -> Void]] = [:]
     private var issueIndex: [String: Set<String>] = [:]   // "repo#number" lowercased → project keys
     private var suppressNotify = Set<String>()
     var relayIsLive: () -> Bool = { false }
@@ -115,14 +125,14 @@ final class ProjectStore {
         let stamp = isoFmt.string(from: found.item.updatedAt)
         let cacheKey = content + "|" + stamp
         if let hit = timelineCache[cacheKey] { done(hit.entries); return }
-        guard !timelineFlight.contains(cacheKey) else { return }
-        timelineFlight.insert(cacheKey)
+        if timelineWaiters[cacheKey] != nil { timelineWaiters[cacheKey]?.append(done); return }
+        timelineWaiters[cacheKey] = [done]
         let projectKey = found.key
         q.async { [weak self] in
             let result = self?.api.timeline(contentId: content, last: 20) ?? .failure(.gh("gone"))
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.timelineFlight.remove(cacheKey)
+                let waiters = self.timelineWaiters.removeValue(forKey: cacheKey) ?? []
                 let entries: [ActivityEntry]
                 if case .success(let list) = result {
                     entries = list.map { e in
@@ -136,7 +146,7 @@ final class ProjectStore {
                 } else {
                     entries = []
                 }
-                done(entries)
+                waiters.forEach { $0(entries) }
                 self.publish()
             }
         }
@@ -177,7 +187,7 @@ final class ProjectStore {
         suppressNotify.insert(itemId)
         let projectId = found.snap.summary.nodeId
         q.async { [weak self] in
-            let ok = self?.api.setStatus(projectId: projectId, itemId: itemId, fieldId: field, optionId: optionId).isOk ?? false
+            let ok = self?.api.setField(projectId: projectId, itemId: itemId, fieldId: field, optionId: optionId).isOk ?? false
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if !ok { self.suppressNotify.remove(itemId); self.lastError = "Could not change the status" }
@@ -196,6 +206,82 @@ final class ProjectStore {
                 if !ok { self.suppressNotify.remove(itemId); self.lastError = "Could not post the comment" }
                 self.timelineCache = self.timelineCache.filter { !$0.key.hasPrefix(content) }
                 self.refresh([found.key], force: true) { done($0 && ok) }
+            }
+        }
+    }
+
+    // `done(created, message)`. A field that fails after the add keeps the item and gives a message.
+    func create(_ new: NewItem, done: @escaping (Bool, String?) -> Void) {
+        guard let snap = snapshots[new.projectKey] else { done(false, "The project is not loaded yet"); return }
+        let projectId = snap.summary.nodeId
+        let fieldNames = Dictionary((snap.fields ?? []).map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        q.async { [weak self] in
+            guard let api = self?.api else { return }
+            let added: Result<String, ProjectAPIError>
+            switch new.kind {
+            case .draft:
+                added = api.addDraft(projectId: projectId, title: new.title, body: new.body)
+            case .issue(let repo):
+                added = api.createIssue(repo: repo, title: new.title, body: new.body).flatMap {
+                    api.addItem(projectId: projectId, contentId: $0)
+                }
+            }
+            var failed: [String] = []
+            if case .success(let itemId) = added {
+                for (field, option) in new.fieldOptions.sorted(by: { $0.key < $1.key }) {
+                    if case .failure = api.setField(projectId: projectId, itemId: itemId, fieldId: field, optionId: option) {
+                        failed.append(fieldNames[field] ?? "a field")
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch added {
+                case .failure(let e):
+                    self.lastError = e.message
+                    done(false, e.message)
+                case .success(let itemId):
+                    self.suppressNotify.insert(itemId)
+                    let msg = failed.isEmpty ? nil : "Created, but \(failed.joined(separator: ", ")) was not set"
+                    self.refresh([new.projectKey], force: true) { _ in done(true, msg) }
+                }
+            }
+        }
+    }
+
+    func edit(itemId: String, title: String, body: String, done: @escaping (Bool) -> Void) {
+        guard let found = item(itemId), let content = found.item.contentId else { done(false); return }
+        suppressNotify.insert(itemId)
+        let kind = found.item.kind
+        q.async { [weak self] in
+            let result = self?.api.edit(contentId: content, kind: kind, title: title, body: body) ?? .failure(.gh("gone"))
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if case .failure(let e) = result { self.suppressNotify.remove(itemId); self.lastError = e.message }
+                self.refresh([found.key], force: true) { done($0 && result.isOk) }
+            }
+        }
+    }
+
+    // The first "in progress" status, plus assign me. A project without such a status only assigns.
+    func start(itemId: String, done: @escaping (Bool) -> Void) {
+        guard let found = item(itemId), let content = found.item.contentId else { done(false); return }
+        suppressNotify.insert(itemId)
+        let snap = found.snap
+        let progress = snap.statusOptions.first { $0.category == .progress }
+        let kind = found.item.kind
+        q.async { [weak self] in
+            guard let api = self?.api else { return }
+            var errors: [String] = []
+            if let field = snap.statusFieldId, let progress, found.item.statusOptionId != progress.id,
+               case .failure(let e) = api.setField(projectId: snap.summary.nodeId, itemId: itemId, fieldId: field, optionId: progress.id) {
+                errors.append(e.message)
+            }
+            if case .failure(let e) = api.assignMe(contentId: content, kind: kind) { errors.append(e.message) }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let e = errors.first { self.lastError = e }
+                self.refresh([found.key], force: true) { done($0 && errors.isEmpty) }
             }
         }
     }

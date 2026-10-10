@@ -208,7 +208,9 @@ final class Toolchain {
 final class SecretStore {
     static let deviceToken = "DEVICE_TOKEN"
     static let webhookSecret = "WEBHOOK_SECRET"
-    let service = "com.flarco.cat-eye.relay"
+    let service: String
+
+    init(service: String = "com.flarco.cat-eye.relay") { self.service = service }
 
     private func query(_ key: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import os
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -18,6 +19,7 @@ struct AppConfig: Codable {
     var notifications: NotificationSettings?
     var tabs: TabVisibility?
     var projects: ProjectsConfig?
+    var ai: AIConfig?
 }
 
 // Which transition events create macOS notifications. Omitted legacy config
@@ -83,6 +85,9 @@ struct ProjectsConfig: Codable {
     var menuDot = true
     var showTab = true
     var notifications = ProjectNotificationSettings()
+    var order: [String] = []          // project keys, top to bottom
+    var folded: [String] = []         // project keys that show only the header
+    var capture = CaptureConfig()
 
     init() {}
 
@@ -97,6 +102,94 @@ struct ProjectsConfig: Codable {
         menuDot = try c.decodeIfPresent(Bool.self, forKey: .menuDot) ?? true
         showTab = try c.decodeIfPresent(Bool.self, forKey: .showTab) ?? true
         notifications = try c.decodeIfPresent(ProjectNotificationSettings.self, forKey: .notifications) ?? ProjectNotificationSettings()
+        order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
+        folded = try c.decodeIfPresent([String].self, forKey: .folded) ?? []
+        capture = try c.decodeIfPresent(CaptureConfig.self, forKey: .capture) ?? CaptureConfig()
+    }
+
+    // Keys in `order` come first. Projects not in it follow by owner, then title.
+    func sorted(_ projects: [ProjectSummary]) -> [ProjectSummary] {
+        var rank: [String: Int] = [:]
+        for (i, k) in order.enumerated() where rank[k.lowercased()] == nil { rank[k.lowercased()] = i }
+        return projects.sorted { a, b in
+            let ra = rank[a.ref.key.lowercased()] ?? .max, rb = rank[b.ref.key.lowercased()] ?? .max
+            if ra != rb { return ra < rb }
+            if a.ref.owner.caseInsensitiveCompare(b.ref.owner) != .orderedSame {
+                return a.ref.owner.localizedCaseInsensitiveCompare(b.ref.owner) == .orderedAscending
+            }
+            return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+        }
+    }
+
+    func isFolded(_ key: String) -> Bool { folded.contains { $0.caseInsensitiveCompare(key) == .orderedSame } }
+
+    mutating func setFolded(_ key: String, _ on: Bool) {
+        folded.removeAll { $0.caseInsensitiveCompare(key) == .orderedSame }
+        if on { folded.append(key) }
+    }
+}
+
+// Global shortcut that opens the New item sheet. Carbon key code and modifier flags.
+struct CaptureConfig: Codable, Equatable {
+    var enabled = true
+    var keyCode: UInt32 = 45            // N
+    var modifiers: UInt32 = 0x1800      // control + option
+    var pasteClipboard = true
+    var aiTitle = true
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        keyCode = try c.decodeIfPresent(UInt32.self, forKey: .keyCode) ?? 45
+        modifiers = try c.decodeIfPresent(UInt32.self, forKey: .modifiers) ?? 0x1800
+        pasteClipboard = try c.decodeIfPresent(Bool.self, forKey: .pasteClipboard) ?? true
+        aiTitle = try c.decodeIfPresent(Bool.self, forKey: .aiTitle) ?? true
+    }
+}
+
+enum AIFormat: String, Codable { case openai, anthropic }
+
+// The API key is in the Keychain, not here.
+struct AIConfig: Codable, Equatable {
+    var format = AIFormat.openai
+    var baseURL = ""
+    var model = ""
+    var effort = "low"                  // OpenAI only. "none" leaves out the field.
+    var maxTokens = 1024                // Anthropic only
+    var extraContext = ""
+    var enabled = false
+    var verified = ""                   // fingerprint of the last passed test
+    var titleAndFields = true
+    var tidy = true
+    var pickProject = true
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        format = try c.decodeIfPresent(AIFormat.self, forKey: .format) ?? .openai
+        baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
+        effort = try c.decodeIfPresent(String.self, forKey: .effort) ?? "low"
+        maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens) ?? 1024
+        extraContext = try c.decodeIfPresent(String.self, forKey: .extraContext) ?? ""
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        verified = try c.decodeIfPresent(String.self, forKey: .verified) ?? ""
+        titleAndFields = try c.decodeIfPresent(Bool.self, forKey: .titleAndFields) ?? true
+        tidy = try c.decodeIfPresent(Bool.self, forKey: .tidy) ?? true
+        pickProject = try c.decodeIfPresent(Bool.self, forKey: .pickProject) ?? true
+    }
+
+    func fingerprint(key: String) -> String {
+        let raw = "\(format.rawValue)|\(baseURL)|\(model)|\(key)"
+        return SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func isOn(key: String?) -> Bool {
+        guard enabled, let key, !key.isEmpty, !verified.isEmpty else { return false }
+        return verified == fingerprint(key: key)
     }
 }
 
@@ -138,6 +231,7 @@ var AUTO_UPDATE: Bool = true
 var NOTIFICATIONS = NotificationSettings()
 var TABS = TabVisibility()
 var PROJECTS_CFG = ProjectsConfig()
+var AI_CFG = AIConfig()
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
 let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -166,6 +260,7 @@ func loadConfig() {
     if let r = c.relay { RELAY = r }
     if let t = c.tabs { TABS = t }
     if let p = c.projects { PROJECTS_CFG = p }
+    if let a = c.ai { AI_CFG = a }
 }
 
 func saveConfig() {
@@ -176,7 +271,7 @@ func saveConfig() {
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
                       oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW,
                       repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE,
-                      relay: RELAY, notifications: NOTIFICATIONS, tabs: TABS, projects: PROJECTS_CFG)
+                      relay: RELAY, notifications: NOTIFICATIONS, tabs: TABS, projects: PROJECTS_CFG, ai: AI_CFG)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {

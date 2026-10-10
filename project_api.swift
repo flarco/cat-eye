@@ -133,7 +133,7 @@ final class ProjectAPI {
                                          itemCount: count, ownerKind: kind)
             return items(nodeId: id, limit: max(1, limit)).map { page in
                 ProjectSnapshot(summary: summary, statusFieldId: page.fieldId, statusOptions: page.options,
-                                items: page.items, fetchedAt: Date())
+                                items: page.items, fetchedAt: Date(), fields: page.fields)
             }
         }
     }
@@ -156,7 +156,7 @@ final class ProjectAPI {
         }
     }
 
-    func setStatus(projectId: String, itemId: String, fieldId: String, optionId: String) -> Result<Void, ProjectAPIError> {
+    func setField(projectId: String, itemId: String, fieldId: String, optionId: String) -> Result<Void, ProjectAPIError> {
         let q = """
         mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
           updateProjectV2ItemFieldValue(input: {
@@ -166,6 +166,91 @@ final class ProjectAPI {
         }
         """
         return graphql(q, ["projectId": projectId, "itemId": itemId, "fieldId": fieldId, "optionId": optionId]).map { _ in () }
+    }
+
+    // Returns the new project item id.
+    func addDraft(projectId: String, title: String, body: String) -> Result<String, ProjectAPIError> {
+        let q = """
+        mutation($projectId: ID!, $title: String!, $body: String) {
+          addProjectV2DraftIssue(input: { projectId: $projectId, title: $title, body: $body }) { projectItem { id } }
+        }
+        """
+        return graphql(q, ["projectId": projectId, "title": title, "body": body]).flatMap { data in
+            let id = ((data["addProjectV2DraftIssue"] as? [String: Any])?["projectItem"] as? [String: Any])?["id"] as? String
+            return id.map { .success($0) } ?? .failure(.gh("GitHub did not return the new item"))
+        }
+    }
+
+    // Returns the new issue id.
+    func createIssue(repo: String, title: String, body: String) -> Result<String, ProjectAPIError> {
+        let parts = repo.split(separator: "/").map(String.init)
+        guard parts.count == 2 else { return .failure(.gh("Bad repo name: \(repo)")) }
+        let rq = "query($o: String!, $n: String!) { repository(owner: $o, name: $n) { id } }"
+        return graphql(rq, ["o": parts[0], "n": parts[1]]).flatMap { data -> Result<String, ProjectAPIError> in
+            guard let repoId = (data["repository"] as? [String: Any])?["id"] as? String else { return .failure(.notFound) }
+            let q = """
+            mutation($repo: ID!, $title: String!, $body: String) {
+              createIssue(input: { repositoryId: $repo, title: $title, body: $body }) { issue { id } }
+            }
+            """
+            return self.graphql(q, ["repo": repoId, "title": title, "body": body]).flatMap { data in
+                let id = ((data["createIssue"] as? [String: Any])?["issue"] as? [String: Any])?["id"] as? String
+                return id.map { .success($0) } ?? .failure(.gh("GitHub did not return the new issue"))
+            }
+        }
+    }
+
+    // Returns the project item id.
+    func addItem(projectId: String, contentId: String) -> Result<String, ProjectAPIError> {
+        let q = """
+        mutation($projectId: ID!, $contentId: ID!) {
+          addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) { item { id } }
+        }
+        """
+        return graphql(q, ["projectId": projectId, "contentId": contentId]).flatMap { data in
+            let id = ((data["addProjectV2ItemById"] as? [String: Any])?["item"] as? [String: Any])?["id"] as? String
+            return id.map { .success($0) } ?? .failure(.gh("GitHub did not return the project item"))
+        }
+    }
+
+    func edit(contentId: String, kind: ItemKind, title: String, body: String) -> Result<Void, ProjectAPIError> {
+        let q: String
+        switch kind {
+        case .draft:
+            q = "mutation($id: ID!, $title: String!, $body: String) { updateProjectV2DraftIssue(input: { draftIssueId: $id, title: $title, body: $body }) { draftIssue { id } } }"
+        case .issue:
+            q = "mutation($id: ID!, $title: String!, $body: String) { updateIssue(input: { id: $id, title: $title, body: $body }) { issue { id } } }"
+        case .pullRequest:
+            q = "mutation($id: ID!, $title: String!, $body: String) { updatePullRequest(input: { pullRequestId: $id, title: $title, body: $body }) { pullRequest { id } } }"
+        }
+        return graphql(q, ["id": contentId, "title": title, "body": body]).map { _ in () }
+    }
+
+    // A draft takes the full assignee list, so keep the current assignees.
+    func assignMe(contentId: String, kind: ItemKind) -> Result<Void, ProjectAPIError> {
+        viewerId().flatMap { me in
+            guard kind == .draft else {
+                let q = "mutation($id: ID!, $who: [ID!]!) { addAssigneesToAssignable(input: { assignableId: $id, assigneeIds: $who }) { clientMutationId } }"
+                return self.graphql(q, ["id": contentId, "who": [me]]).map { _ in () }
+            }
+            let rq = "query($id: ID!) { node(id: $id) { ... on DraftIssue { assignees(first: 20) { nodes { id } } } } }"
+            return self.graphql(rq, ["id": contentId]).flatMap { data in
+                let nodes = (((data["node"] as? [String: Any])?["assignees"] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
+                var ids = nodes.compactMap { $0["id"] as? String }
+                if !ids.contains(me) { ids.append(me) }
+                let q = "mutation($id: ID!, $who: [ID!]) { updateProjectV2DraftIssue(input: { draftIssueId: $id, assigneeIds: $who }) { draftIssue { id } } }"
+                return self.graphql(q, ["id": contentId, "who": ids]).map { _ in () }
+            }
+        }
+    }
+
+    func viewerId() -> Result<String, ProjectAPIError> {
+        if let id = _viewerId { return .success(id) }
+        return graphql("query { viewer { id } }").flatMap { data in
+            guard let id = (data["viewer"] as? [String: Any])?["id"] as? String else { return .failure(.gh("Could not read the GitHub user")) }
+            _viewerId = id
+            return .success(id)
+        }
     }
 
     func comment(contentId: String, body: String) -> Result<Void, ProjectAPIError> {
@@ -242,6 +327,7 @@ final class ProjectAPI {
         var fieldId: String?
         var options: [StatusOption]
         var items: [ProjectItem]
+        var fields: [ProjectField] = []
     }
 
     private func items(nodeId: String, limit: Int) -> Result<ItemPage, ProjectAPIError> {
@@ -251,6 +337,9 @@ final class ProjectAPI {
             ... on ProjectV2 {
               field(name: "Status") {
                 ... on ProjectV2SingleSelectField { id options { id name color } }
+              }
+              fields(first: 30) {
+                nodes { ... on ProjectV2SingleSelectField { id name options { id name color } } }
               }
               items(first: 100, after: $after) {
                 pageInfo { hasNextPage endCursor }
@@ -281,6 +370,17 @@ final class ProjectAPI {
                     page.options = opts.compactMap { o in
                         guard let id = o["id"] as? String, let name = o["name"] as? String else { return nil }
                         return StatusOption(id: id, name: name, color: (o["color"] as? String) ?? "GRAY")
+                    }
+                }
+                if page.fields.isEmpty {
+                    let raw = ((node["fields"] as? [String: Any])?["nodes"] as? [[String: Any]]) ?? []
+                    page.fields = raw.compactMap { f in
+                        guard let id = f["id"] as? String, let name = f["name"] as? String else { return nil }
+                        let opts = (f["options"] as? [[String: Any]] ?? []).compactMap { o -> StatusOption? in
+                            guard let oid = o["id"] as? String, let n = o["name"] as? String else { return nil }
+                            return StatusOption(id: oid, name: n, color: (o["color"] as? String) ?? "GRAY")
+                        }
+                        return ProjectField(id: id, name: name, options: opts)
                     }
                 }
                 let items = node["items"] as? [String: Any] ?? [:]
@@ -340,14 +440,15 @@ final class ProjectAPI {
                            updatedAt: parseISO(n["updatedAt"] as? String) ?? Date(),
                            commentCount: comments?["totalCount"] as? Int ?? 0,
                            lastComment: last,
-                           mentionsMe: mentions)
+                           mentionsMe: mentions,
+                           body: content["body"] as? String)
     }
 
     private func parseComment(_ n: [String: Any]) -> CommentRef? {
         guard let id = n["id"] as? String else { return nil }
         return CommentRef(id: id, author: (n["author"] as? [String: Any])?["login"] as? String,
                           createdAt: parseISO(n["createdAt"] as? String) ?? Date(),
-                          url: n["url"] as? String ?? "")
+                          url: n["url"] as? String ?? "", body: n["body"] as? String)
     }
 
     private func parseTimeline(_ n: [String: Any], url: String) -> ActivityEntry? {
@@ -384,11 +485,12 @@ final class ProjectAPI {
 }
 
 private var _viewerLogin: String?
+private var _viewerId: String?
 
 private let contentFields = """
 __typename
 ... on Issue {
-  id title url number state
+  id title url number state body
   author { login }
   assignees(first: 10) { nodes { login } }
   labels(first: 8) { nodes { name } }
@@ -396,14 +498,14 @@ __typename
   repository { nameWithOwner }
 }
 ... on PullRequest {
-  id title url number state
+  id title url number state body
   author { login }
   assignees(first: 10) { nodes { login } }
   labels(first: 8) { nodes { name } }
   comments(last: 1) { totalCount nodes { id author { login } createdAt url body } }
   repository { nameWithOwner }
 }
-... on DraftIssue { id title assignees(first: 10) { nodes { login } } }
+... on DraftIssue { id title body assignees(first: 10) { nodes { login } } }
 """
 
 private let fieldValueFields = """

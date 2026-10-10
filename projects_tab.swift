@@ -137,35 +137,128 @@ final class StackedBar: NSView {
     }
 }
 
+// A plain click target with a hand cursor.
+final class TapArea: NSView {
+    var onTap: (() -> Void)?
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onTap?() }
+    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
+enum DragPhase { case began, moved, ended }
+
+// Drag handle of a project header. It runs its own event loop, so no pasteboard is needed.
+final class GripView: NSView {
+    var onDrag: ((DragPhase, NSEvent) -> Void)?
+    override func draw(_ dirtyRect: NSRect) {
+        guard let img = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag to reorder")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold)) else { return }
+        let tinted = NSImage(size: img.size, flipped: false) { r in
+            img.draw(in: r)
+            NSColor.tertiaryLabelColor.set()
+            r.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.draw(at: NSPoint(x: (bounds.width - img.size.width) / 2, y: (bounds.height - img.size.height) / 2),
+                    from: .zero, operation: .sourceOver, fraction: 1)
+    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+    override func mouseDown(with event: NSEvent) {
+        NSCursor.closedHand.push()
+        defer { NSCursor.pop() }
+        onDrag?(.began, event)
+        while let e = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if e.type == .leftMouseUp { onDrag?(.ended, e); return }
+            onDrag?(.moved, e)
+        }
+    }
+}
+
 final class ProjectHeader: NSView {
+    static let foldedH: CGFloat = 36
     let key: String
+    let folded: Bool
     var onRefresh: (() -> Void)?
     var onFilter: ((String) -> Void)?
+    var onFold: (() -> Void)?
+    var onAdd: (() -> Void)?
+    var onDrag: ((DragPhase, NSEvent) -> Void)? { didSet { grip?.onDrag = onDrag } }
+    private var grip: GripView?
 
-    init(snap: ProjectSnapshot, live: Bool, refreshing: Bool, filter: String?, updated: String, w: CGFloat) {
+    init(snap: ProjectSnapshot, live: Bool, refreshing: Bool, filter: String?, updated: String, w: CGFloat,
+         folded: Bool, canReorder: Bool) {
         self.key = snap.summary.ref.key
+        self.folded = folded
         let chips = snap.statusOptions
-        let rows = chips.isEmpty ? 1 : 1
-        let h: CGFloat = 36 + CGFloat(rows) * 22 + 14
+        let h: CGFloat = folded ? ProjectHeader.foldedH : 72
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: h))
         wantsLayer = true
         layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.9).cgColor
+        let rowY = h - 26
 
+        if canReorder {
+            let g = GripView(frame: NSRect(x: 2, y: rowY, width: 14, height: 20))
+            g.alphaValue = 0
+            addSubview(g)
+            grip = g
+        }
+        let chevron = NSButton(image: NSImage(systemSymbolName: folded ? "chevron.right" : "chevron.down",
+                                              accessibilityDescription: folded ? "Expand" : "Collapse")!,
+                               target: self, action: #selector(fold))
+        chevron.isBordered = false
+        chevron.contentTintColor = .secondaryLabelColor
+        chevron.symbolConfiguration = .init(pointSize: 10, weight: .semibold)
+        chevron.frame = NSRect(x: 16, y: rowY, width: 16, height: 20)
+        addSubview(chevron)
         let owner = Badge(snap.summary.ref.owner, maxChars: 16, tint: repoColor(snap.summary.ref.owner))
-        owner.frame.origin = NSPoint(x: 12, y: h - 26)
+        owner.frame.origin = NSPoint(x: 34, y: rowY)
         addSubview(owner)
-        let title = NSTextField(labelWithString: snap.summary.ref.owner.uppercased() + "  ›  " + snap.summary.title)
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
-        title.lineBreakMode = .byTruncatingTail
-        title.frame = NSRect(x: 12 + owner.frame.width + 8, y: h - 26, width: w - 280, height: 18)
-        addSubview(title)
 
         let chip = Badge(live ? "Live" : "Every \(PROJECTS_CFG.pollMinutes) min", tint: live ? C_SUCCESS : nil)
-        chip.frame.origin = NSPoint(x: w - 250, y: h - 26)
+        chip.frame.origin = NSPoint(x: w - 182 - chip.frame.width, y: rowY)
         addSubview(chip)
 
+        // Fixed frames, so the bars of folded headers line up in one column.
+        let barX = w - 372
+        let titleX = owner.frame.maxX + 8
+        let titleMaxX = folded ? barX - 10 : chip.frame.minX - 8
+        let title = NSTextField(labelWithString: snap.summary.title)
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        title.frame = NSRect(x: titleX, y: rowY + 1, width: max(40, titleMaxX - titleX), height: 18)
+        title.toolTip = "\(snap.summary.ref.owner) › \(snap.summary.title)"
+        addSubview(title)
+        let tap = TapArea(frame: NSRect(x: owner.frame.minX, y: rowY, width: min(title.frame.maxX, titleX + title.intrinsicContentSize.width + 4) - owner.frame.minX, height: 20))
+        tap.onTap = { [weak self] in self?.onFold?() }
+        tap.toolTip = folded ? "Expand" : "Collapse"
+        addSubview(tap)
+
+        let parts = chips.map { chip in
+            (projectColor(chip.color), snap.items.filter { $0.statusOptionId == chip.id }.count)
+        }
+        if folded {
+            addSubview(StackedBar(parts: parts, frame: NSRect(x: barX, y: rowY + 7, width: 64, height: 6)))
+            let n = NSTextField(labelWithString: "\(snap.notDoneCount)")
+            n.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+            n.textColor = .secondaryLabelColor
+            n.alignment = .right
+            n.frame = NSRect(x: barX + 70, y: rowY + 2, width: 26, height: 16)
+            n.toolTip = "Items not done"
+            addSubview(n)
+        }
+
+        let add = NSButton(image: NSImage(systemSymbolName: "plus", accessibilityDescription: "New item in \(snap.summary.title)")!,
+                           target: self, action: #selector(addItem))
+        add.isBordered = false
+        add.contentTintColor = .secondaryLabelColor
+        add.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
+        add.frame = NSRect(x: w - 174, y: rowY, width: 20, height: 20)
+        add.toolTip = "New item in \(snap.summary.title)"
+        addSubview(add)
         if refreshing {
-            let sp = NSProgressIndicator(frame: NSRect(x: w - 148, y: h - 24, width: 16, height: 16))
+            let sp = NSProgressIndicator(frame: NSRect(x: w - 148, y: rowY + 2, width: 16, height: 16))
             sp.style = .spinning; sp.controlSize = .small; sp.startAnimation(nil)
             addSubview(sp)
         } else {
@@ -174,18 +267,21 @@ final class ProjectHeader: NSView {
             reload.isBordered = false
             reload.contentTintColor = .secondaryLabelColor
             reload.symbolConfiguration = .init(pointSize: 11, weight: .semibold)
-            reload.frame = NSRect(x: w - 150, y: h - 26, width: 20, height: 20)
+            reload.frame = NSRect(x: w - 150, y: rowY, width: 20, height: 20)
             reload.toolTip = "Get the latest items from GitHub · updated \(updated)"
             addSubview(reload)
         }
         let link = NSTextField(labelWithString: "Open Project")
         link.font = .systemFont(ofSize: 11, weight: .medium); link.textColor = .linkColor
-        link.frame = NSRect(x: w - 120, y: h - 24, width: 108, height: 16); link.alignment = .right
+        link.frame = NSRect(x: w - 120, y: rowY + 2, width: 108, height: 16); link.alignment = .right
         addSubview(link)
         let click = Clicker(snap.summary.url)
-        click.frame = NSRect(x: w - 124, y: h - 32, width: 124, height: 28)
+        click.frame = NSRect(x: w - 124, y: rowY - 6, width: 124, height: 28)
         addSubview(click)
 
+        let counts = snap.counts.map { "\($0.value) \($0.key.label.lowercased())" }.sorted().joined(separator: ", ")
+        toolTip = counts
+        guard !folded else { return }
         var x: CGFloat = 12
         for opt in chips {
             let on = filter == opt.id
@@ -201,20 +297,26 @@ final class ProjectHeader: NSView {
             x += b.frame.width + 4
             if x > w - 140 { break }
         }
-        let parts = chips.map { chip in
-            (projectColor(chip.color), snap.items.filter { $0.statusOptionId == chip.id }.count)
-        }
         addSubview(StackedBar(parts: parts, frame: NSRect(x: 12, y: 6, width: w - 24, height: 6)))
-        let counts = snap.counts.map { "\($0.value) \($0.key.label.lowercased())" }.sorted().joined(separator: ", ")
-        toolTip = counts
     }
     required init?(coder: NSCoder) { fatalError() }
     @objc func refresh() { onRefresh?() }
+    @objc func fold() { onFold?() }
+    @objc func addItem() { onAdd?() }
     @objc func chip(_ sender: NSButton) { onFilter?(sender.identifier?.rawValue ?? "") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self))
+    }
+    override func mouseEntered(with event: NSEvent) { grip?.alphaValue = 1 }
+    override func mouseExited(with event: NSEvent) { grip?.alphaValue = 0 }
 }
 
 final class ProjectItemRow: NSView {
     var onToggle: (() -> Void)?
+    var onAgent: (() -> Void)?
     let urlStr: String
     let expanded: Bool
     init(item: ProjectItem, snap: ProjectSnapshot, unread: Bool, last: String?, w: CGFloat, expanded: Bool) {
@@ -271,16 +373,23 @@ final class ProjectItemRow: NSView {
         }
         let cp = NSButton(frame: NSRect(x: w - 36, y: (ROW_H - 22) / 2, width: 28, height: 22))
         cp.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy link")
-        cp.isBordered = false; cp.target = self; cp.action = #selector(copyLink)
-        cp.toolTip = "Copy item link"
+        cp.isBordered = false; cp.target = self; cp.action = #selector(copyMenu(_:))
+        cp.toolTip = "Copy"
         addSubview(cp)
         setAccessibilityLabel("\(item.title), \(opt?.name ?? "no status")")
     }
     required init?(coder: NSCoder) { fatalError() }
+    @objc func copyMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Copy link", action: #selector(copyLink), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Copy for agent", action: #selector(copyAgent), keyEquivalent: "").target = self
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
     @objc func copyLink() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(urlStr, forType: .string)
     }
+    @objc func copyAgent() { onAgent?() }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
@@ -377,21 +486,40 @@ final class ActivityLine: NSView {
     }
 }
 
-final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
+// Draft text of an item in edit mode. TabVC keeps it, so a rebuild does not lose it.
+struct ItemEdit {
+    var title: String
+    var body: String
+    var saving = false
+    var busy: String?          // "tidy" or "title" while AI runs
+}
+
+final class ProjectItemDetail: Flipped, NSTextFieldDelegate, NSTextViewDelegate {
     var onStatus: ((String) -> Void)?
     var onComment: ((String) -> Void)?
     var onRead: (() -> Void)?
+    var onStart: (() -> Void)?
+    var onAgent: (() -> Void)?
+    var onEdit: (() -> Void)?
+    var onEditChange: ((String, String) -> Void)?
+    var onSave: (() -> Void)?
+    var onCancel: (() -> Void)?
+    var onMore: (() -> Void)?
+    var onAI: ((String) -> Void)?
     var commentField: NSTextField?
+    var titleEdit: NSTextField?
+    var bodyEdit: NSTextView?
     let optionIds: [String]
 
-    init(item: ProjectItem, snap: ProjectSnapshot, activity: [ActivityEntry]?, error: String?, w: CGFloat) {
+    init(item: ProjectItem, snap: ProjectSnapshot, activity: [ActivityEntry]?, error: String?, w: CGFloat,
+         me: String?, edit: ItemEdit?, showAll: Bool) {
         optionIds = snap.statusOptions.map(\.id)
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
         let pad: CGFloat = 42
         let contentW = w - pad - 16
-        var y: CGFloat = 8
+        var y: CGFloat = 10
         func line(_ name: String, _ value: String) {
             let n = NSTextField(labelWithString: name)
             n.font = .systemFont(ofSize: 10.5); n.textColor = .tertiaryLabelColor
@@ -403,6 +531,87 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
             addSubview(v)
             y += 18
         }
+        func button(_ title: String, _ action: Selector, x: CGFloat, y: CGFloat, width: CGFloat) -> NSButton {
+            let b = NSButton(title: title, target: self, action: action)
+            b.bezelStyle = .inline; b.font = .systemFont(ofSize: 11)
+            b.frame = NSRect(x: x, y: y, width: width, height: 22)
+            addSubview(b)
+            return b
+        }
+        let editable = item.contentId != nil
+        let ai = AIClient.current
+        if let edit {
+            let tf = NSTextField(frame: NSRect(x: pad, y: y, width: contentW, height: 24))
+            tf.stringValue = edit.title
+            tf.font = .systemFont(ofSize: 13, weight: .semibold)
+            tf.placeholderString = "Title"
+            tf.delegate = self
+            tf.isEnabled = !edit.saving
+            addSubview(tf); titleEdit = tf
+            y += 30
+            let scroll = NSScrollView(frame: NSRect(x: pad, y: y, width: contentW, height: 170))
+            scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.borderType = .bezelBorder
+            let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: scroll.contentSize.width, height: 170))
+            tv.string = edit.body
+            tv.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+            tv.isRichText = false; tv.allowsUndo = true
+            tv.isAutomaticQuoteSubstitutionEnabled = false; tv.isAutomaticDashSubstitutionEnabled = false
+            tv.textContainerInset = NSSize(width: 4, height: 6)
+            tv.isVerticallyResizable = true; tv.autoresizingMask = [.width]
+            tv.textContainer?.widthTracksTextView = true
+            tv.isEditable = !edit.saving
+            tv.delegate = self
+            scroll.documentView = tv
+            addSubview(scroll); bodyEdit = tv
+            y += 176
+            var x = pad
+            if let ai {
+                if ai.cfg.tidy {
+                    let t = button(edit.busy == "tidy" ? "✦ Tidying…" : "✦ Tidy", #selector(aiTidy), x: x, y: y, width: 80)
+                    t.isEnabled = edit.busy == nil && !edit.saving
+                    x += 86
+                }
+                if ai.cfg.titleAndFields {
+                    let t = button(edit.busy == "title" ? "✦ Writing…" : "✦ Suggest title", #selector(aiTitle), x: x, y: y, width: 110)
+                    t.isEnabled = edit.busy == nil && !edit.saving
+                }
+            }
+            _ = button("Cancel", #selector(cancelEdit), x: pad + contentW - 170, y: y, width: 70)
+            let save = button(edit.saving ? "Saving…" : "Save  ⌘↩", #selector(saveEdit), x: pad + contentW - 94, y: y, width: 94)
+            save.isEnabled = !edit.saving
+            y += 32
+        } else {
+            let text = (item.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let font = NSFont.systemFont(ofSize: 12)
+            let full = text.isEmpty ? 16 : textHeight(text, font: font, width: contentW - 30)
+            let cap: CGFloat = 12 * 15
+            let h = showAll ? full : min(full, cap)
+            let body = NSTextField(wrappingLabelWithString: text.isEmpty ? (item.body == nil && item.kind != .draft ? "Description not loaded yet" : "No description") : text)
+            body.font = font
+            body.textColor = text.isEmpty ? .tertiaryLabelColor : .labelColor
+            body.isSelectable = false
+            body.frame = NSRect(x: pad, y: y, width: contentW - 30, height: h)
+            addSubview(body)
+            if editable {
+                let tap = TapArea(frame: body.frame)
+                tap.toolTip = "Click to edit the title and description"
+                tap.onTap = { [weak self] in self?.onEdit?() }
+                addSubview(tap)
+                let pencil = NSButton(image: NSImage(systemSymbolName: "pencil", accessibilityDescription: "Edit")!,
+                                      target: self, action: #selector(beginEdit))
+                pencil.isBordered = false; pencil.contentTintColor = .secondaryLabelColor
+                pencil.frame = NSRect(x: pad + contentW - 22, y: y, width: 20, height: 18)
+                pencil.toolTip = "Edit the title and description"
+                addSubview(pencil)
+            }
+            y += h + 4
+            if full > cap {
+                _ = button(showAll ? "Show less" : "Show more", #selector(toggleMore), x: pad - 4, y: y, width: 80)
+                y += 24
+            }
+            y += 8
+        }
+
         let popup = NSPopUpButton(frame: NSRect(x: pad + 94, y: y - 2, width: 180, height: 22), pullsDown: false)
         popup.addItem(withTitle: "No status")
         for opt in snap.statusOptions { popup.addItem(withTitle: opt.name) }
@@ -412,14 +621,27 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
         let nl = NSTextField(labelWithString: "Status")
         nl.font = .systemFont(ofSize: 10.5); nl.textColor = .tertiaryLabelColor
         nl.frame = NSRect(x: pad, y: y, width: 90, height: 16)
-        addSubview(nl); addSubview(popup); y += 26
+        addSubview(nl); addSubview(popup)
+        let inProgress = snap.option(item.statusOptionId)?.category == .progress
+        let mine = me.map { m in item.assignees.contains { $0.caseInsensitiveCompare(m) == .orderedSame } } ?? false
+        if inProgress && mine {
+            let on = NSTextField(labelWithString: "● @\(me ?? "me") is on it")
+            on.font = .systemFont(ofSize: 11, weight: .medium); on.textColor = C_SUCCESS
+            on.frame = NSRect(x: pad + 282, y: y, width: 200, height: 16)
+            addSubview(on)
+        } else if editable {
+            let start = button("▶ Start", #selector(start), x: pad + 282, y: y - 1, width: 70)
+            start.toolTip = "Set In progress and assign me"
+        }
+        y += 26
         if let repo = item.repo { line("Repo", repo + (item.number.map { "#\($0)" } ?? "")) }
         if !item.assignees.isEmpty { line("Assignees", item.assignees.joined(separator: ", ")) }
         if !item.labels.isEmpty { line("Labels", item.labels.joined(separator: ", ")) }
-        for (k, v) in item.fields.sorted(by: { $0.key < $1.key }) { line(k, v) }
+        for (k, v) in item.fields.sorted(by: { $0.key < $1.key }) where k != "Title" { line(k, v) }
         if let error = error {
             let e = NSTextField(labelWithString: error)
             e.font = .systemFont(ofSize: 11); e.textColor = C_FAILURE
+            e.lineBreakMode = .byTruncatingTail; e.toolTip = error
             e.frame = NSRect(x: pad, y: y, width: contentW, height: 16)
             addSubview(e); y += 18
         }
@@ -448,30 +670,20 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
             addSubview(l); y += 20
         }
         y += 6
-        if item.contentId != nil {
+        if item.contentId != nil && item.kind != .draft {
             let cf = NSTextField(frame: NSRect(x: pad, y: y, width: contentW - 84, height: 22))
             cf.placeholderString = "Leave a comment…"
             cf.font = .systemFont(ofSize: 11.5)
             cf.delegate = self
             addSubview(cf); commentField = cf
-            let send = NSButton(title: "Comment", target: self, action: #selector(sendComment))
-            send.bezelStyle = .inline; send.font = .systemFont(ofSize: 11)
-            send.frame = NSRect(x: pad + contentW - 76, y: y - 1, width: 76, height: 24)
-            addSubview(send)
+            _ = button("Comment", #selector(sendComment), x: pad + contentW - 76, y: y - 1, width: 76)
             y += 30
         }
-        let open = NSButton(title: "Open", target: self, action: #selector(openItem))
-        open.bezelStyle = .inline; open.font = .systemFont(ofSize: 11)
-        open.frame = NSRect(x: pad, y: y, width: 64, height: 22)
-        addSubview(open)
-        let copy = NSButton(title: "Copy link", target: self, action: #selector(copyLink))
-        copy.bezelStyle = .inline; copy.font = .systemFont(ofSize: 11)
-        copy.frame = NSRect(x: pad + 70, y: y, width: 80, height: 22)
-        addSubview(copy)
-        let read = NSButton(title: "Mark as read", target: self, action: #selector(markRead))
-        read.bezelStyle = .inline; read.font = .systemFont(ofSize: 11)
-        read.frame = NSRect(x: pad + 156, y: y, width: 100, height: 22)
-        addSubview(read)
+        _ = button("Open", #selector(openItem), x: pad, y: y, width: 64)
+        _ = button("Copy link", #selector(copyLink), x: pad + 70, y: y, width: 80)
+        let agent = button("Copy for agent", #selector(copyAgent), x: pad + 156, y: y, width: 110)
+        agent.toolTip = "Title, description and comments as Markdown"
+        _ = button("Mark as read", #selector(markRead), x: pad + 272, y: y, width: 100)
         y += 30
         frame = NSRect(x: 0, y: 0, width: w, height: y)
         self.itemURL = item.paneURL(projectURL: snap.summary.url) ?? item.url ?? snap.summary.url
@@ -479,10 +691,18 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
     required init?(coder: NSCoder) { fatalError() }
     private var itemURL = ""
     func controlTextDidChange(_ obj: Notification) {
+        if (obj.object as? NSTextField) === titleEdit {
+            onEditChange?(titleEdit?.stringValue ?? "", bodyEdit?.string ?? "")
+            return
+        }
         let app = NSApp.delegate as? GHActionsBar
         let drafting = !(commentField?.stringValue.isEmpty ?? true)
         app?.popover.behavior = drafting ? .semitransient : .transient
     }
+    func textDidChange(_ notification: Notification) {
+        onEditChange?(titleEdit?.stringValue ?? "", bodyEdit?.string ?? "")
+    }
+    func focusEditor() { window?.makeFirstResponder(titleEdit) }
     @objc func statusChanged(_ sender: NSPopUpButton) {
         let i = sender.indexOfSelectedItem - 1
         guard i >= 0, i < optionIds.count else { return }
@@ -499,7 +719,15 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(itemURL, forType: .string)
     }
+    @objc func copyAgent() { onAgent?() }
     @objc func markRead() { onRead?() }
+    @objc func start() { onStart?() }
+    @objc func beginEdit() { onEdit?() }
+    @objc func saveEdit() { onSave?() }
+    @objc func cancelEdit() { onCancel?() }
+    @objc func toggleMore() { onMore?() }
+    @objc func aiTidy() { onAI?("tidy") }
+    @objc func aiTitle() { onAI?("title") }
 }
 
 final class FeedRow: NSView {
@@ -562,47 +790,62 @@ extension TabVC {
         }
         if projectView == .activity { return buildActivityFeed(w, store: store) }
         var rows: [NSView] = []
+        if let notice = projectNotice { rows.append(EmptyRow(notice, w: w, icon: "checkmark.circle")) }
         let shown = selectedProject.map { key in tracked.filter { $0.ref.key == key } } ?? tracked
+        let query = projectQuery.trimmingCharacters(in: .whitespaces)
+        let canReorder = selectedProject == nil && shown.count > 1
         for summary in shown {
-            guard let snap = store.snapshots[summary.ref.key] else {
+            let key = summary.ref.key
+            guard let snap = store.snapshots[key] else {
                 rows.append(LoadingRow(w: w))
                 continue
             }
-            let live = store.liveKeys.contains(summary.ref.key)
-            let header = ProjectHeader(snap: snap, live: live, refreshing: store.refreshing.contains(summary.ref.key),
-                                       filter: statusFilter[summary.ref.key],
-                                       updated: relativeTime(snap.fetchedAt), w: w)
-            header.onRefresh = { [weak store] in store?.refresh([summary.ref.key], force: true) { _ in } }
-            header.onFilter = { [weak self] id in
-                guard let self = self else { return }
-                if self.statusFilter[summary.ref.key] == id { self.statusFilter[summary.ref.key] = nil }
-                else { self.statusFilter[summary.ref.key] = id }
-                self.rebuildContent()
-            }
-            rows.append(header)
             var items = snap.items.sorted { $0.updatedAt > $1.updatedAt }
-            items = items.filter { !isHiddenDone($0, snap: snap) }
+            items = items.filter { !isHiddenDone($0, snap: snap) && $0.matches(query) }
             if assignedOnly { items = items.filter { $0.isMine(app?.viewerLogin) } }
             if unreadOnly { items = items.filter { store.isUnread(itemId: $0.id) } }
-            if let fid = statusFilter[summary.ref.key] { items = items.filter { $0.statusOptionId == fid } }
+            if let fid = statusFilter[key] { items = items.filter { $0.statusOptionId == fid } }
+            // A query opens the projects with matches and folds the rest. The saved fold state stays.
+            let folded = query.isEmpty ? PROJECTS_CFG.isFolded(key) : items.isEmpty
+            let live = store.liveKeys.contains(key)
+            let header = ProjectHeader(snap: snap, live: live, refreshing: store.refreshing.contains(key),
+                                       filter: statusFilter[key], updated: relativeTime(snap.fetchedAt), w: w,
+                                       folded: folded, canReorder: canReorder)
+            header.onRefresh = { [weak store] in store?.refresh([key], force: true) { _ in } }
+            header.onFilter = { [weak self] id in
+                guard let self = self else { return }
+                if self.statusFilter[key] == id { self.statusFilter[key] = nil }
+                else { self.statusFilter[key] = id }
+                self.rebuildContent()
+            }
+            header.onFold = { [weak self] in
+                PROJECTS_CFG.setFolded(key, !PROJECTS_CFG.isFolded(key))
+                saveConfig()
+                self?.rebuildContent()
+            }
+            header.onAdd = { [weak self] in self?.presentNewItem(target: key, prefill: nil) }
+            header.onDrag = { [weak self] phase, event in self?.dragProject(key, phase: phase, event: event) }
+            rows.append(header)
+            if folded { continue }
             let cap = PROJECTS_CFG.itemsPerProject
-            let limited = (cap > 0 && !showAllProjects.contains(summary.ref.key)) ? Array(items.prefix(cap)) : items
+            let limited = (cap > 0 && !showAllProjects.contains(key)) ? Array(items.prefix(cap)) : items
             if limited.isEmpty {
                 rows.append(EmptyRow("No items match these filters", w: w))
             }
             for item in limited {
-                let last = store.activity(limit: 20, project: summary.ref.key).first { $0.itemId == item.id }?.text
+                let last = store.activity(limit: 20, project: key).first { $0.itemId == item.id }?.text
                 let row = ProjectItemRow(item: item, snap: snap, unread: store.isUnread(itemId: item.id),
                                          last: last, w: w, expanded: expandedItem == item.id)
                 row.onToggle = { [weak self] in self?.toggleItem(item.id) }
+                row.onAgent = { [weak self] in self?.copyForAgent(item.id) }
                 rows.append(row)
                 if expandedItem == item.id {
                     rows.append(detail(for: item, snap: snap, store: store, w: w))
                 }
             }
-            if cap > 0 && items.count > cap && !showAllProjects.contains(summary.ref.key) {
+            if cap > 0 && items.count > cap && !showAllProjects.contains(key) {
                 let more = NSButton(title: "\(limited.count) of \(items.count) items · Show all", target: self, action: #selector(showAll(_:)))
-                more.identifier = NSUserInterfaceItemIdentifier(summary.ref.key)
+                more.identifier = NSUserInterfaceItemIdentifier(key)
                 more.bezelStyle = .inline; more.font = .systemFont(ofSize: 11)
                 more.frame = NSRect(x: 0, y: 0, width: w, height: 28)
                 rows.append(more)
@@ -652,9 +895,10 @@ extension TabVC {
     }
 
     func detail(for item: ProjectItem, snap: ProjectSnapshot, store: ProjectStore, w: CGFloat) -> NSView {
-        let cached = store.activity(limit: 1, project: nil)
-        _ = cached
-        let detail = ProjectItemDetail(item: item, snap: snap, activity: timelineCache[item.id], error: projectError, w: w)
+        let app = NSApp.delegate as? GHActionsBar
+        let edit = editingItem == item.id ? itemEdit : nil
+        let detail = ProjectItemDetail(item: item, snap: snap, activity: timelineCache[item.id], error: projectError, w: w,
+                                       me: app?.viewerLogin, edit: edit, showAll: bodyExpanded.contains(item.id))
         if timelineCache[item.id] == nil {
             store.timeline(itemId: item.id) { [weak self] entries in
                 self?.timelineCache[item.id] = entries
@@ -662,15 +906,9 @@ extension TabVC {
             }
         }
         detail.onStatus = { [weak self, weak store] option in
-            let old = item.statusOptionId
             store?.setStatus(itemId: item.id, optionId: option) { ok in
-                if !ok {
-                    self?.projectError = store?.lastError ?? "Could not change the status"
-                    self?.rebuildContent()
-                    _ = old
-                } else {
-                    self?.projectError = nil
-                }
+                self?.projectError = ok ? nil : (store?.lastError ?? "Could not change the status")
+                if !ok { self?.rebuildContent() }
             }
         }
         detail.onComment = { [weak self, weak store] body in
@@ -681,11 +919,151 @@ extension TabVC {
             }
         }
         detail.onRead = { [weak store] in store?.markRead(itemId: item.id) }
+        detail.onStart = { [weak self, weak store] in
+            store?.start(itemId: item.id) { ok in
+                self?.projectError = ok ? nil : (store?.lastError ?? "Could not start the item")
+                self?.timelineCache[item.id] = nil
+                self?.rebuildContent()
+            }
+        }
+        detail.onAgent = { [weak self] in self?.copyForAgent(item.id) }
+        detail.onMore = { [weak self] in
+            guard let self else { return }
+            if self.bodyExpanded.contains(item.id) { self.bodyExpanded.remove(item.id) } else { self.bodyExpanded.insert(item.id) }
+            self.rebuildContent()
+        }
+        detail.onEdit = { [weak self] in
+            guard let self else { return }
+            self.editingItem = item.id
+            self.itemEdit = ItemEdit(title: item.title, body: item.body ?? "")
+            self.rebuildContent()
+            self.focusEditor()
+        }
+        detail.onEditChange = { [weak self] title, body in
+            self?.itemEdit?.title = title
+            self?.itemEdit?.body = body
+        }
+        detail.onCancel = { [weak self] in self?.endEdit() }
+        detail.onSave = { [weak self] in self?.saveEdit() }
+        detail.onAI = { [weak self] what in self?.editWithAI(what) }
         return detail
+    }
+
+    func focusEditor() {
+        (doc.subviews.first { $0 is ProjectItemDetail } as? ProjectItemDetail)?.focusEditor()
+    }
+
+    func endEdit() {
+        editingItem = nil
+        itemEdit = nil
+        rebuildContent()
+    }
+
+    func saveEdit() {
+        guard let id = editingItem, var edit = itemEdit, !edit.saving,
+              let store = (NSApp.delegate as? GHActionsBar)?.projectStore else { return }
+        let title = edit.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { projectError = "Add a title"; rebuildContent(); return }
+        edit.saving = true
+        itemEdit = edit
+        rebuildContent()
+        store.edit(itemId: id, title: title, body: edit.body) { [weak self, weak store] ok in
+            guard let self else { return }
+            if ok {
+                self.projectError = nil
+                self.endEdit()
+            } else {
+                self.projectError = store?.lastError ?? "Could not save the item"
+                self.itemEdit?.saving = false
+                self.rebuildContent()
+            }
+        }
+    }
+
+    func editWithAI(_ what: String) {
+        guard let ai = AIClient.current, let edit = itemEdit, edit.busy == nil, !edit.body.isEmpty else { return }
+        itemEdit?.busy = what
+        rebuildContent()
+        let finish: (String?) -> Void = { [weak self] err in
+            self?.itemEdit?.busy = nil
+            self?.projectError = err
+            self?.rebuildContent()
+        }
+        if what == "tidy" {
+            ai.tidy(body: edit.body) { [weak self] r in
+                switch r {
+                case .success(let text): self?.itemEdit?.body = text; finish(nil)
+                case .failure(let e): finish(e.message)
+                }
+            }
+        } else {
+            ai.draft(body: edit.body, ctx: DraftContext()) { [weak self] r in
+                switch r {
+                case .success(let s): self?.itemEdit?.title = s.title; finish(nil)
+                case .failure(let e): finish(e.message)
+                }
+            }
+        }
+    }
+
+    // Loads the comments first when the timeline is not cached.
+    func copyForAgent(_ id: String) {
+        guard let store = (NSApp.delegate as? GHActionsBar)?.projectStore, store.item(id) != nil else { return }
+        let copy: ([ActivityEntry]) -> Void = { entries in
+            guard let found = store.item(id) else { return }
+            let comments = entries.compactMap { e -> CommentRef? in
+                if case .comments(_, let last) = e.change { return last }
+                return nil
+            }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(found.item.agentMarkdown(snap: found.snap, comments: comments), forType: .string)
+        }
+        if let cached = timelineCache[id] { copy(cached); return }
+        store.timeline(itemId: id) { [weak self] entries in
+            self?.timelineCache[id] = entries
+            copy(entries)
+        }
+    }
+
+    // Drop position = the number of headers above the pointer.
+    func dragProject(_ key: String, phase: DragPhase, event: NSEvent) {
+        let headers = doc.subviews.compactMap { $0 as? ProjectHeader }.sorted { $0.frame.minY < $1.frame.minY }
+        switch phase {
+        case .began:
+            let line = NSView(frame: NSRect(x: 8, y: 0, width: doc.frame.width - 16, height: 2))
+            line.wantsLayer = true
+            line.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            line.isHidden = true
+            doc.addSubview(line)
+            dragLine = line
+            dragTarget = nil
+        case .moved:
+            doc.autoscroll(with: event)
+            let p = doc.convert(event.locationInWindow, from: nil)
+            let target = headers.filter { $0.frame.midY < p.y }.count
+            dragTarget = target
+            let y = target < headers.count ? headers[target].frame.minY : doc.frame.height
+            dragLine?.frame.origin.y = max(0, min(doc.frame.height - 2, y - 1))
+            dragLine?.isHidden = false
+        case .ended:
+            dragLine?.removeFromSuperview()
+            dragLine = nil
+            guard let target = dragTarget else { return }
+            var keys = headers.map(\.key)
+            guard let from = keys.firstIndex(of: key) else { return }
+            keys.remove(at: from)
+            keys.insert(key, at: from < target ? target - 1 : target)
+            let rest = PROJECTS_CFG.order.filter { k in !keys.contains { $0.caseInsensitiveCompare(k) == .orderedSame } }
+            PROJECTS_CFG.order = keys + rest
+            saveConfig()
+            rebuildContent()
+        }
     }
 
     func toggleItem(_ id: String) {
         expandedItem = expandedItem == id ? nil : id
+        editingItem = nil
+        itemEdit = nil
         let app = NSApp.delegate as? GHActionsBar
         app?.popover.behavior = expandedItem != nil ? .semitransient : .transient
         app?.expandedItem = expandedItem

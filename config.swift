@@ -80,7 +80,7 @@ struct ProjectsConfig: Codable {
     var allOf: [String] = []
     var pollMinutes = 5
     var itemsPerProject = 10          // 0 = all
-    var hideDoneAfterDays = 7         // 0 = never hide
+    var hideDoneAfterDays = 1         // 0 = never hide, -1 = always hide
     var defaultView = ProjectView.board
     var menuDot = true
     var showTab = true
@@ -97,7 +97,7 @@ struct ProjectsConfig: Codable {
         allOf = try c.decodeIfPresent([String].self, forKey: .allOf) ?? []
         pollMinutes = min(30, max(2, try c.decodeIfPresent(Int.self, forKey: .pollMinutes) ?? 5))
         itemsPerProject = try c.decodeIfPresent(Int.self, forKey: .itemsPerProject) ?? 10
-        hideDoneAfterDays = try c.decodeIfPresent(Int.self, forKey: .hideDoneAfterDays) ?? 7
+        hideDoneAfterDays = try c.decodeIfPresent(Int.self, forKey: .hideDoneAfterDays) ?? 1
         defaultView = try c.decodeIfPresent(ProjectView.self, forKey: .defaultView) ?? .board
         menuDot = try c.decodeIfPresent(Bool.self, forKey: .menuDot) ?? true
         showTab = try c.decodeIfPresent(Bool.self, forKey: .showTab) ?? true

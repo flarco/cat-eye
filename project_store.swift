@@ -36,6 +36,7 @@ final class ProjectStore {
     private var issueIndex: [String: Set<String>] = [:]   // "repo#number" lowercased → project keys
     private var suppressNotify = Set<String>()
     var relayIsLive: () -> Bool = { false }
+    var viewer: () -> String? = { nil }
     var onChange: (() -> Void)?
 
     init(api: ProjectAPI, notifier: ProjectNotifier, statePath: String, activityPath: String) {
@@ -347,14 +348,20 @@ final class ProjectStore {
         rebuildIndex()
         guard old != nil, !changes.isEmpty else { return }
         let at = snap.fetchedAt
+        let me = viewer()?.lowercased()
+        var own = Set<String>()
         let entries = changes.map { pair -> ActivityEntry in
             let item = snap.items.first { $0.id == pair.itemId } ?? old?.items.first { $0.id == pair.itemId }
-            return ActivityEntry.make(projectKey: key, itemId: pair.itemId, change: pair.1,
-                                      actor: pair.1.commentAuthor,
-                                      url: item?.paneURL(projectURL: snap.summary.url) ?? item?.url ?? snap.summary.url, at: at)
+            let actor: String? = pair.1 == .added ? item?.creator : pair.1.commentAuthor
+            let e = ActivityEntry.make(projectKey: key, itemId: pair.itemId, change: pair.1, actor: actor,
+                                       url: item?.paneURL(projectURL: snap.summary.url) ?? item?.url ?? snap.summary.url, at: at)
+            // Changes made in Cat Eye or by me are not news.
+            if suppressNotify.contains(pair.itemId) || (me != nil && actor?.lowercased() == me) { own.insert(e.id) }
+            return e
         }
         append(entries)
-        let filtered = changes.filter { !suppressNotify.contains($0.itemId) }
+        readActivity.formUnion(own)
+        let filtered = zip(changes, entries).filter { !own.contains($1.id) }.map(\.0)
         suppressNotify.subtract(changes.map(\.itemId))
         notifier.handle(filtered, in: snap, settings: PROJECTS_CFG.notifications)
     }

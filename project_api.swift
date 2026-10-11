@@ -344,7 +344,7 @@ final class ProjectAPI {
               items(first: 100, after: $after) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  id fullDatabaseId updatedAt
+                  id fullDatabaseId updatedAt creator { login }
                   content { \(contentFields) }
                   fieldValues(first: 20) { nodes { \(fieldValueFields) } }
                 }
@@ -441,7 +441,8 @@ final class ProjectAPI {
                            commentCount: comments?["totalCount"] as? Int ?? 0,
                            lastComment: last,
                            mentionsMe: mentions,
-                           body: content["body"] as? String)
+                           body: content["body"] as? String,
+                           creator: (n["creator"] as? [String: Any])?["login"] as? String)
     }
 
     private func parseComment(_ n: [String: Any]) -> CommentRef? {

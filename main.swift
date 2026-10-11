@@ -897,7 +897,7 @@ func runSelfTest() {
     // Projects: order, fold, filter.
     let oldProjects = try? JSONDecoder().decode(ProjectsConfig.self, from: Data(#"{"picked":["a/1"],"pollMinutes":5}"#.utf8))
     check(oldProjects?.order == [] && oldProjects?.folded == [] && oldProjects?.capture == CaptureConfig()
-            && oldProjects?.picked == ["a/1"], "old projects config gets the new defaults")
+            && oldProjects?.picked == ["a/1"] && oldProjects?.hideDoneAfterDays == 1, "old projects config gets the new defaults")
     func summary(_ owner: String, _ n: Int, _ title: String) -> ProjectSummary {
         ProjectSummary(ref: ProjectRef(owner: owner, number: n), nodeId: "N\(n)", title: title, url: "", closed: false,
                        itemCount: 0, ownerKind: .org)
@@ -1304,15 +1304,16 @@ class TabVC: NSViewController {
         (footerView as? Footer)?.showUpdated(updated)
         // A rebuild would take the focus from the editor.
         if editingItem != nil || dragLine != nil { return }
-        let origin = scrollView.contentView.bounds.origin
         JobSummary.close()  // the rebuild removes its chip
         rebuildContent()
-        let maxY = max(0, doc.frame.height - scrollView.contentView.bounds.height)
-        scrollView.contentView.scroll(to: NSPoint(x: origin.x, y: min(origin.y, maxY)))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
-    func rebuildContent() {
+    // Keeps the scroll position. With `anchor`, that row keeps its place on screen.
+    // With `reveal`, that row scrolls into view, but the anchor row stays visible.
+    func rebuildContent(anchor: String? = nil, reveal: String? = nil) {
+        func row(_ id: String?) -> NSView? { id.flatMap { id in doc.subviews.first { $0.identifier?.rawValue == id } } }
+        var top = scrollView.contentView.bounds.origin.y
+        let anchorOffset = row(anchor).map { $0.frame.minY - top }
         NSApp.withPinnedAppearance {
             doc.subviews.forEach { $0.removeFromSuperview() }
             let w = POP_W
@@ -1336,6 +1337,13 @@ class TabVC: NSViewController {
             doc.frame.size.height = max(y, 60)
             relayout()
         }
+        let visH = scrollView.contentView.bounds.height
+        if let a = row(anchor), let off = anchorOffset { top = a.frame.minY - off }
+        if let r = row(reveal), r.frame.maxY > top + visH {
+            top = min(r.frame.maxY - visH, row(anchor)?.frame.minY ?? r.frame.minY)
+        }
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, top), max(0, doc.frame.height - visH))))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     // Resize the scroll area / footer / popover to fit the content, so inline
@@ -1493,7 +1501,7 @@ class TabVC: NSViewController {
             unread.state = unreadOnly ? .on : .off
             unread.frame = NSRect(x: 326, y: 6, width: 104, height: 20)
             bar.addSubview(unread)
-            let search = NSSearchField(frame: NSRect(x: 436, y: 5, width: w - 436 - 40, height: 22))
+            let search = NSSearchField(frame: NSRect(x: 436, y: 5, width: w - 436 - 44, height: 22))
             search.placeholderString = "Filter  ⌘F"
             search.font = .systemFont(ofSize: 11)
             search.stringValue = projectQuery
@@ -1504,12 +1512,14 @@ class TabVC: NSViewController {
             searchField = search
             let add = NSButton(image: NSImage(systemSymbolName: "plus", accessibilityDescription: "New item")!,
                                target: self, action: #selector(newItem))
-            add.bezelStyle = .rounded
-            add.isBordered = true
-            add.bezelColor = .controlAccentColor
+            // A rounded bezel has a minimum width and draws too thin here.
+            add.isBordered = false
+            add.wantsLayer = true
+            add.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            add.layer?.cornerRadius = 6
             add.contentTintColor = .white
-            add.symbolConfiguration = .init(pointSize: 11, weight: .bold)
-            add.frame = NSRect(x: w - 34, y: 4, width: 26, height: 24)
+            add.symbolConfiguration = .init(pointSize: 12, weight: .bold)
+            add.frame = NSRect(x: w - 36, y: 5, width: 28, height: 22)
             add.toolTip = "New item (⌘N)"
             bar.addSubview(add)
         }
@@ -1661,6 +1671,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         let s = ProjectStore(api: ProjectAPI(), notifier: projectNotifier,
                              statePath: PROJECT_STATE_PATH, activityPath: PROJECT_ACTIVITY_PATH)
         s.relayIsLive = { [weak self] in self?.relay.state == .live }
+        s.viewer = { [weak self] in self?.viewerLogin }
         s.onChange = { [weak self] in
             self?.updateIcon()
             self?.reloadList()

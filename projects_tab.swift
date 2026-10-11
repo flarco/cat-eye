@@ -428,7 +428,7 @@ final class ActivityLine: NSView {
         let who = entry.actor.map { $0 + " · " } ?? ""
         let line = NSTextField(labelWithString: who + entry.text + " · " + relativeTime(entry.at))
         line.font = .systemFont(ofSize: 11)
-        line.textColor = .secondaryLabelColor
+        line.textColor = entry.unread ? .controlAccentColor : .secondaryLabelColor
         line.lineBreakMode = .byTruncatingTail
         line.frame = NSRect(x: 8, y: 3, width: w - 40, height: 16)
         line.identifier = NSUserInterfaceItemIdentifier("line")
@@ -821,8 +821,9 @@ extension TabVC {
             header.onFold = { [weak self] in
                 PROJECTS_CFG.setFolded(key, !PROJECTS_CFG.isFolded(key))
                 saveConfig()
-                self?.rebuildContent()
+                self?.rebuildContent(anchor: "project:" + key)
             }
+            header.identifier = NSUserInterfaceItemIdentifier("project:" + key)
             header.onAdd = { [weak self] in self?.presentNewItem(target: key, prefill: nil) }
             header.onDrag = { [weak self] phase, event in self?.dragProject(key, phase: phase, event: event) }
             rows.append(header)
@@ -838,9 +839,12 @@ extension TabVC {
                                          last: last, w: w, expanded: expandedItem == item.id)
                 row.onToggle = { [weak self] in self?.toggleItem(item.id) }
                 row.onAgent = { [weak self] in self?.copyForAgent(item.id) }
+                row.identifier = NSUserInterfaceItemIdentifier("item:" + item.id)
                 rows.append(row)
                 if expandedItem == item.id {
-                    rows.append(detail(for: item, snap: snap, store: store, w: w))
+                    let d = detail(for: item, snap: snap, store: store, w: w)
+                    d.identifier = NSUserInterfaceItemIdentifier("detail:" + item.id)
+                    rows.append(d)
                 }
             }
             if cap > 0 && items.count > cap && !showAllProjects.contains(key) {
@@ -897,7 +901,13 @@ extension TabVC {
     func detail(for item: ProjectItem, snap: ProjectSnapshot, store: ProjectStore, w: CGFloat) -> NSView {
         let app = NSApp.delegate as? GHActionsBar
         let edit = editingItem == item.id ? itemEdit : nil
-        let detail = ProjectItemDetail(item: item, snap: snap, activity: timelineCache[item.id], error: projectError, w: w,
+        // Drafts have no timeline. The changes Cat Eye saw show what is new.
+        let seen = store.activity(limit: 500, project: snap.summary.ref.key).filter { e in
+            guard e.itemId == item.id, e.change != .mention else { return false }
+            if case .comments = e.change { return false }
+            return true
+        }
+        let detail = ProjectItemDetail(item: item, snap: snap, activity: timelineCache[item.id].map { $0.map { var e = $0; e.unread = false; return e } + seen }, error: projectError, w: w,
                                        me: app?.viewerLogin, edit: edit, showAll: bodyExpanded.contains(item.id))
         if timelineCache[item.id] == nil {
             store.timeline(itemId: item.id) { [weak self] entries in
@@ -1067,15 +1077,15 @@ extension TabVC {
         let app = NSApp.delegate as? GHActionsBar
         app?.popover.behavior = expandedItem != nil ? .semitransient : .transient
         app?.expandedItem = expandedItem
-        rebuildContent()
+        rebuildContent(anchor: "item:" + id, reveal: expandedItem.map { "detail:" + $0 })
     }
 
     func isHiddenDone(_ item: ProjectItem, snap: ProjectSnapshot) -> Bool {
         let days = PROJECTS_CFG.hideDoneAfterDays
-        guard days > 0 else { return false }
+        guard days != 0 else { return false }
         let done = item.isClosedState || snap.option(item.statusOptionId)?.category == .done
         guard done else { return false }
-        return Date().timeIntervalSince(item.updatedAt) > Double(days) * 86400
+        return days < 0 || Date().timeIntervalSince(item.updatedAt) > Double(days) * 86400
     }
 
     func scopeRow(_ w: CGFloat) -> NSView {

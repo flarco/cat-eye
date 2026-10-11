@@ -43,6 +43,7 @@ Cat Eye is built on three principles:
 - **Start** — ▶ Start sets the first "in progress" status and assigns you
 - **Copy for agent** — copies the item as Markdown: title, facts, link, description and all comments. Paste it into a coding agent
 - **Fold and reorder** — click a project header to fold it. A folded header shows one number: the items that are not done. Drag the grip to change the order
+- **Hide Done items** — Settings → Projects → "Hide Done items" is Always, older than 1, 7 or 30 days, or Never. The default is older than 1 day
 - **Filter** — press ⌘F and type. The filter looks in titles and descriptions. Esc clears it
 - **Quick capture** — press ⌃⌥N in any app. Cat Eye opens New item with the clipboard text. Change the shortcut in Settings → Projects
 - **macOS notifications** — mentions, comments, status, assignment, and closed items. "My items" means you are an assignee or the author. Your own comments are skipped
@@ -233,6 +234,7 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `projects.allOf` | `[]` | Owners whose projects are all tracked, including ones they add later |
 | `projects.pollMinutes` | `5` | How often to poll projects that are not live. One of 2, 5, 10, 15, 30 |
 | `projects.showTab` | `true` | Show the Projects tab |
+| `projects.hideDoneAfterDays` | `1` | Hide Done items older than this many days. `-1` always hides them. `0` never hides them |
 | `projects.order` | `[]` | The project order, written when you drag a header. Projects not in the list come after, by owner and title |
 | `projects.folded` | `[]` | Folded projects |
 | `projects.capture` | on, ⌃⌥N | Quick capture: `enabled`, the Carbon `keyCode` and `modifiers`, `pasteClipboard` and `aiTitle`. Set it in Settings → Projects |

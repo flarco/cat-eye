@@ -241,8 +241,9 @@ final class ProjectSettingsVC: NSViewController {
         y = popupRow("Default view", ["Board", "Activity"], cfg.defaultView == .activity ? 1 : 0, #selector(viewChanged(_:)), y: y, in: doc)
         let itemIdx = cfg.itemsPerProject == 0 ? 2 : (cfg.itemsPerProject == 25 ? 1 : 0)
         y = popupRow("Items per project", ["10", "25", "All"], itemIdx, #selector(itemsChanged(_:)), y: y, in: doc)
-        let hideIdx = [1, 7, 30, 0].firstIndex(of: cfg.hideDoneAfterDays) ?? 1
-        y = popupRow("Hide Done items older than", ["1 day", "7 days", "30 days", "Never"], hideIdx, #selector(hideChanged(_:)), y: y, in: doc)
+        let hideIdx = ProjectSettingsVC.hideDays.firstIndex(of: cfg.hideDoneAfterDays) ?? 1
+        y = popupRow("Hide Done items", ["Always", "Older than 1 day", "Older than 7 days", "Older than 30 days", "Never"],
+                     hideIdx, #selector(hideChanged(_:)), y: y, in: doc)
         let dot = NSButton(checkboxWithTitle: "Show a blue dot on the menu bar icon", target: self, action: #selector(toggleDot(_:)))
         dot.font = .systemFont(ofSize: 12)
         dot.state = cfg.menuDot ? .on : .off
@@ -337,7 +338,7 @@ final class ProjectSettingsVC: NSViewController {
         l.font = .systemFont(ofSize: 12)
         l.frame = NSRect(x: 16, y: y + 4, width: 280, height: 18)
         doc.addSubview(l)
-        let pop = NSPopUpButton(frame: NSRect(x: 310, y: y, width: 140, height: 24), pullsDown: false)
+        let pop = NSPopUpButton(frame: NSRect(x: 310, y: y, width: 160, height: 24), pullsDown: false)
         pop.addItems(withTitles: items)
         pop.selectItem(at: selected)
         pop.target = self; pop.action = action
@@ -403,7 +404,8 @@ final class ProjectSettingsVC: NSViewController {
     }
     @objc func viewChanged(_ sender: NSPopUpButton) { cfg.defaultView = sender.indexOfSelectedItem == 1 ? .activity : .board }
     @objc func itemsChanged(_ sender: NSPopUpButton) { cfg.itemsPerProject = [10, 25, 0][sender.indexOfSelectedItem] }
-    @objc func hideChanged(_ sender: NSPopUpButton) { cfg.hideDoneAfterDays = [1, 7, 30, 0][sender.indexOfSelectedItem] }
+    static let hideDays = [-1, 1, 7, 30, 0]
+    @objc func hideChanged(_ sender: NSPopUpButton) { cfg.hideDoneAfterDays = ProjectSettingsVC.hideDays[sender.indexOfSelectedItem] }
     @objc func toggleDot(_ sender: NSButton) { cfg.menuDot = sender.state == .on }
     @objc func pollChanged(_ sender: NSPopUpButton) { cfg.pollMinutes = [2, 5, 10, 15, 30][sender.indexOfSelectedItem] }
 

@@ -136,6 +136,7 @@ struct ProjectItem: Codable, Hashable {
     let lastComment: CommentRef?
     var mentionsMe: Bool
     var body: String? = nil
+    var creator: String? = nil   // the user who added the item to the project
 
     // https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=268087835
     func paneURL(projectURL: String) -> String? {

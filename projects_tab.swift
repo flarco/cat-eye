@@ -371,6 +371,11 @@ final class ProjectItemRow: NSView {
         if let last = last, !last.isEmpty {
             title.toolTip = (title.toolTip ?? item.title) + "\n" + last
         }
+        let lk = NSButton(frame: NSRect(x: w - 64, y: (ROW_H - 22) / 2, width: 28, height: 22))
+        lk.image = NSImage(systemSymbolName: "arrow.up.right.square", accessibilityDescription: "Open in GitHub")
+        lk.isBordered = false; lk.target = self; lk.action = #selector(openLink)
+        lk.toolTip = "Open on GitHub"
+        addSubview(lk)
         let cp = NSButton(frame: NSRect(x: w - 36, y: (ROW_H - 22) / 2, width: 28, height: 22))
         cp.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy link")
         cp.isBordered = false; cp.target = self; cp.action = #selector(copyMenu(_:))
@@ -385,6 +390,7 @@ final class ProjectItemRow: NSView {
         menu.addItem(withTitle: "Copy for agent", action: #selector(copyAgent), keyEquivalent: "").target = self
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
     }
+    @objc func openLink() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
     @objc func copyLink() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(urlStr, forType: .string)
@@ -512,7 +518,7 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate, NSTextViewDelegate 
     let optionIds: [String]
 
     init(item: ProjectItem, snap: ProjectSnapshot, activity: [ActivityEntry]?, error: String?, w: CGFloat,
-         me: String?, edit: ItemEdit?, showAll: Bool) {
+         me: String?, edit: ItemEdit?, savingStatus: String?) {
         optionIds = snap.statusOptions.map(\.id)
         super.init(frame: .zero)
         wantsLayer = true
@@ -585,7 +591,7 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate, NSTextViewDelegate 
             let font = NSFont.systemFont(ofSize: 12)
             let full = text.isEmpty ? 16 : textHeight(text, font: font, width: contentW - 30)
             let cap: CGFloat = 12 * 15
-            let h = showAll ? full : min(full, cap)
+            let h = min(full, cap)
             let body = NSTextField(wrappingLabelWithString: text.isEmpty ? (item.body == nil && item.kind != .draft ? "Description not loaded yet" : "No description") : text)
             body.font = font
             body.textColor = text.isEmpty ? .tertiaryLabelColor : .labelColor
@@ -606,7 +612,8 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate, NSTextViewDelegate 
             }
             y += h + 4
             if full > cap {
-                _ = button(showAll ? "Show less" : "Show more", #selector(toggleMore), x: pad - 4, y: y, width: 80)
+                let more = button("Show more", #selector(showMore), x: pad - 4, y: y, width: 80)
+                more.toolTip = "Open the full description in a window"
                 y += 24
             }
             y += 8
@@ -615,16 +622,24 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate, NSTextViewDelegate 
         let popup = NSPopUpButton(frame: NSRect(x: pad + 94, y: y - 2, width: 180, height: 22), pullsDown: false)
         popup.addItem(withTitle: "No status")
         for opt in snap.statusOptions { popup.addItem(withTitle: opt.name) }
-        if let id = item.statusOptionId, let i = optionIds.firstIndex(of: id) { popup.selectItem(at: i + 1) }
+        if let id = savingStatus ?? item.statusOptionId, let i = optionIds.firstIndex(of: id) { popup.selectItem(at: i + 1) }
         popup.target = self; popup.action = #selector(statusChanged(_:))
-        popup.isEnabled = snap.statusFieldId != nil
+        popup.isEnabled = snap.statusFieldId != nil && savingStatus == nil
         let nl = NSTextField(labelWithString: "Status")
         nl.font = .systemFont(ofSize: 10.5); nl.textColor = .tertiaryLabelColor
         nl.frame = NSRect(x: pad, y: y, width: 90, height: 16)
         addSubview(nl); addSubview(popup)
         let inProgress = snap.option(item.statusOptionId)?.category == .progress
         let mine = me.map { m in item.assignees.contains { $0.caseInsensitiveCompare(m) == .orderedSame } } ?? false
-        if inProgress && mine {
+        if savingStatus != nil {
+            let sp = NSProgressIndicator(frame: NSRect(x: pad + 282, y: y, width: 16, height: 16))
+            sp.style = .spinning; sp.controlSize = .small; sp.startAnimation(nil)
+            addSubview(sp)
+            let l = NSTextField(labelWithString: "Saving…")
+            l.font = .systemFont(ofSize: 11); l.textColor = .secondaryLabelColor
+            l.frame = NSRect(x: pad + 304, y: y, width: 120, height: 16)
+            addSubview(l)
+        } else if inProgress && mine {
             let on = NSTextField(labelWithString: "● @\(me ?? "me") is on it")
             on.font = .systemFont(ofSize: 11, weight: .medium); on.textColor = C_SUCCESS
             on.frame = NSRect(x: pad + 282, y: y, width: 200, height: 16)
@@ -725,9 +740,73 @@ final class ProjectItemDetail: Flipped, NSTextFieldDelegate, NSTextViewDelegate 
     @objc func beginEdit() { onEdit?() }
     @objc func saveEdit() { onSave?() }
     @objc func cancelEdit() { onCancel?() }
-    @objc func toggleMore() { onMore?() }
+    @objc func showMore() { onMore?() }
     @objc func aiTidy() { onAI?("tidy") }
     @objc func aiTitle() { onAI?("title") }
+}
+
+// Window with the full title and description of an item. One window is reused.
+final class ItemWindow: NSWindow {
+    private static var shared: ItemWindow?
+    private var url = ""
+
+    static func show(_ item: ProjectItem, url: String) {
+        let w = shared ?? ItemWindow()
+        shared = w
+        w.url = url
+        w.fill(item)
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    private init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
+                   styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        isReleasedWhenClosed = false
+        minSize = NSSize(width: 360, height: 240)
+        center()
+    }
+
+    private func fill(_ item: ProjectItem) {
+        title = item.title
+        let content = contentView!
+        content.subviews.forEach { $0.removeFromSuperview() }
+        let pad: CGFloat = 16
+        let bounds = content.bounds
+
+        let open = NSButton(title: "Open on GitHub", target: self, action: #selector(openLink))
+        open.bezelStyle = .inline; open.font = .systemFont(ofSize: 11)
+        open.sizeToFit()
+        open.frame = NSRect(x: bounds.width - pad - open.frame.width - 8, y: bounds.height - 34, width: open.frame.width + 8, height: 22)
+        open.autoresizingMask = [.minXMargin, .minYMargin]
+        content.addSubview(open)
+
+        let font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        let titleW = open.frame.minX - pad - 8
+        let titleH = textHeight(item.title, font: font, width: titleW) + 4
+        let heading = NSTextField(wrappingLabelWithString: item.title)
+        heading.font = font
+        heading.isSelectable = true
+        heading.frame = NSRect(x: pad, y: bounds.height - 12 - titleH, width: titleW, height: titleH)
+        heading.autoresizingMask = [.width, .minYMargin]
+        content.addSubview(heading)
+
+        let scroll = NSScrollView(frame: NSRect(x: pad, y: pad, width: bounds.width - pad * 2, height: heading.frame.minY - pad - 10))
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.autoresizingMask = [.width, .height]
+        let tv = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+        tv.string = (item.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        tv.font = .systemFont(ofSize: 13)
+        tv.textColor = .labelColor
+        tv.isEditable = false; tv.drawsBackground = false
+        tv.isVerticallyResizable = true; tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        scroll.documentView = tv
+        content.addSubview(scroll)
+    }
+
+    @objc func openLink() { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }
 }
 
 final class FeedRow: NSView {
@@ -800,7 +879,7 @@ extension TabVC {
                 rows.append(LoadingRow(w: w))
                 continue
             }
-            var items = snap.items.sorted { $0.updatedAt > $1.updatedAt }
+            var items = snap.sortedItems
             items = items.filter { !isHiddenDone($0, snap: snap) && $0.matches(query) }
             if assignedOnly { items = items.filter { $0.isMine(app?.viewerLogin) } }
             if unreadOnly { items = items.filter { store.isUnread(itemId: $0.id) } }
@@ -908,7 +987,7 @@ extension TabVC {
             return true
         }
         let detail = ProjectItemDetail(item: item, snap: snap, activity: timelineCache[item.id].map { $0.map { var e = $0; e.unread = false; return e } + seen }, error: projectError, w: w,
-                                       me: app?.viewerLogin, edit: edit, showAll: bodyExpanded.contains(item.id))
+                                       me: app?.viewerLogin, edit: edit, savingStatus: statusSaving[item.id])
         if timelineCache[item.id] == nil {
             store.timeline(itemId: item.id) { [weak self] entries in
                 self?.timelineCache[item.id] = entries
@@ -916,9 +995,13 @@ extension TabVC {
             }
         }
         detail.onStatus = { [weak self, weak store] option in
+            guard let self, self.statusSaving[item.id] == nil else { return }
+            self.statusSaving[item.id] = option
+            self.rebuildContent()
             store?.setStatus(itemId: item.id, optionId: option) { ok in
-                self?.projectError = ok ? nil : (store?.lastError ?? "Could not change the status")
-                if !ok { self?.rebuildContent() }
+                self.statusSaving[item.id] = nil
+                self.projectError = ok ? nil : (store?.lastError ?? "Could not change the status")
+                self.rebuildContent()
             }
         }
         detail.onComment = { [weak self, weak store] body in
@@ -930,18 +1013,18 @@ extension TabVC {
         }
         detail.onRead = { [weak store] in store?.markRead(itemId: item.id) }
         detail.onStart = { [weak self, weak store] in
+            guard let self, self.statusSaving[item.id] == nil else { return }
+            self.statusSaving[item.id] = snap.statusOptions.first { $0.category == .progress }?.id ?? item.statusOptionId ?? ""
+            self.rebuildContent()
             store?.start(itemId: item.id) { ok in
-                self?.projectError = ok ? nil : (store?.lastError ?? "Could not start the item")
-                self?.timelineCache[item.id] = nil
-                self?.rebuildContent()
+                self.statusSaving[item.id] = nil
+                self.projectError = ok ? nil : (store?.lastError ?? "Could not start the item")
+                self.timelineCache[item.id] = nil
+                self.rebuildContent()
             }
         }
         detail.onAgent = { [weak self] in self?.copyForAgent(item.id) }
-        detail.onMore = { [weak self] in
-            guard let self else { return }
-            if self.bodyExpanded.contains(item.id) { self.bodyExpanded.remove(item.id) } else { self.bodyExpanded.insert(item.id) }
-            self.rebuildContent()
-        }
+        detail.onMore = { ItemWindow.show(item, url: item.paneURL(projectURL: snap.summary.url) ?? item.url ?? snap.summary.url) }
         detail.onEdit = { [weak self] in
             guard let self else { return }
             self.editingItem = item.id

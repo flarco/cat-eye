@@ -28,7 +28,8 @@ let ghEnv: [String: String] = {
 }()
 
 let POP_W: CGFloat = 660
-let POP_MAX_H: CGFloat = 700
+// macOS cuts off the top of a popover that is taller than the space below the menu bar.
+var POP_MAX_H: CGFloat { min(700, (NSScreen.main?.visibleFrame.height ?? 740) - 40) }
 let ROW_H: CGFloat = 56
 let HDR_H: CGFloat = 32
 let FTR_H: CGFloat = 40
@@ -1362,6 +1363,10 @@ class TabVC: NSViewController {
         }
         view.frame.size.height = totalH
         preferredContentSize = NSSize(width: POP_W, height: totalH)
+        // An open popover does not always shrink to a new preferredContentSize.
+        if let pop = (NSApp.delegate as? GHActionsBar)?.popover, pop.contentViewController === self, pop.isShown {
+            pop.contentSize = preferredContentSize
+        }
     }
 
     override func viewDidAppear() {

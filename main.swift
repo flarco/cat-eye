@@ -1228,7 +1228,7 @@ class TabVC: NSViewController {
     var projectNotice: String?
     var editingItem: String?
     var itemEdit: ItemEdit?
-    var bodyExpanded: Set<String> = []
+    var statusSaving: [String: String] = [:]   // item id → target option id
     var sheet: NewItemSheet?
     var searchField: NSSearchField?
     var keyMonitor: Any?

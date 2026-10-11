@@ -40,6 +40,17 @@ enum StatusCategory: String, Codable, CaseIterable {
         case .done: return "Done"
         }
     }
+
+    // List order: active work first, done last.
+    var rank: Int {
+        switch self {
+        case .progress: return 0
+        case .review: return 1
+        case .blocked: return 2
+        case .todo: return 3
+        case .done: return 4
+        }
+    }
 }
 
 struct StatusOption: Codable, Hashable {
@@ -215,6 +226,16 @@ struct ProjectSnapshot: Codable {
 
     func option(_ id: String?) -> StatusOption? { statusOptions.first { $0.id == id } }
     func statusName(_ id: String?) -> String? { option(id)?.name }
+
+    // Status rank first, then title A to Z.
+    var sortedItems: [ProjectItem] {
+        func rank(_ i: ProjectItem) -> Int { i.isClosedState ? StatusCategory.done.rank : (option(i.statusOptionId)?.category ?? .todo).rank }
+        return items.sorted { a, b in
+            let (ra, rb) = (rank(a), rank(b))
+            if ra != rb { return ra < rb }
+            return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+        }
+    }
 }
 
 enum ItemChange: Codable, Hashable {

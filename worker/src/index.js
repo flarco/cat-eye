@@ -1,11 +1,10 @@
-// Cat Eye relay: verifies GitHub webhooks, keeps a short event log in one
+// Cat Eye relay: verifies GitHub and Plane webhooks, keeps a short event log in one
 // Durable Object, and pokes connected Macs over WebSocket.
 // Logs never contain headers or bodies.
 import { DurableObject } from "cloudflare:workers";
 
 const KINDS = new Set([
   "workflow_run", "workflow_job", "pull_request", "pull_request_review",
-  "projects_v2_item", "projects_v2", "issues", "issue_comment",
 ]);
 const HOUR_MS = 3600_000;
 const enc = new TextEncoder();
@@ -23,6 +22,18 @@ export default {
     }
     if (url.pathname === "/webhook" && request.method === "POST") {
       return handleWebhook(request, env, hub);
+    }
+    const plane = /^\/plane\/([a-z0-9_-]{1,64})$/i.exec(url.pathname);
+    if (plane && request.method === "POST") {
+      // The Hub has the secret of each workspace, so it checks the signature.
+      return hub.fetch(`https://hub/internal/plane/${plane[1].toLowerCase()}`, {
+        method: "POST", body: await request.arrayBuffer(),
+        headers: {
+          "x-plane-signature": request.headers.get("x-plane-signature") || "",
+          "x-plane-event": request.headers.get("x-plane-event") || "",
+          "x-plane-delivery": request.headers.get("x-plane-delivery") || "",
+        },
+      });
     }
     if (url.pathname.startsWith("/v1/")) {
       const deviceId = await authenticate(request, env);
@@ -52,24 +63,18 @@ async function handleWebhook(request, env, hub) {
   let p;
   try { p = JSON.parse(new TextDecoder().decode(body)); } catch { return json({ error: "bad json" }, 400); }
   const repo = p.repository?.full_name;
-  const org = p.organization?.login;
   const deliveryId = request.headers.get("x-github-delivery");
-  // Org project events have no repository. A repo event has no organization requirement.
-  if ((!repo && !org) || !deliveryId) return json({ error: "missing fields" }, 400);
+  if (!repo || !deliveryId) return json({ error: "missing fields" }, 400);
 
-  // Keep only IDs and status. Titles, branches, users, bodies and field values stay out.
+  // Keep only IDs and status. Titles, branches, users and bodies stay out.
   const event = {
     deliveryId,
-    repo: repo ? repo.toLowerCase() : "",
-    org: org ? org.toLowerCase() : null,
+    repo: repo.toLowerCase(),
     kind,
     action: p.action ?? null,
     runId: p.workflow_run?.id ?? p.workflow_job?.run_id ?? null,
     jobId: p.workflow_job?.id ?? null,
     prNumber: p.pull_request?.number ?? null,
-    projectId: p.projects_v2_item?.project_node_id ?? p.projects_v2?.node_id ?? null,
-    itemId: p.projects_v2_item?.node_id ?? null,
-    issueNumber: p.issue?.number ?? null,
   };
   console.log(`webhook ${kind}`);
   return hub.fetch("https://hub/internal/event", { method: "POST", body: JSON.stringify(event) });
@@ -77,11 +82,46 @@ async function handleWebhook(request, env, hub) {
 
 export async function verifySignature(secret, body, header) {
   if (!header || !header.startsWith("sha256=")) return false;
-  const hex = header.slice(7);
+  return verifyHex(secret, body, header.slice(7));
+}
+
+// Plane sends the hex digest, sometimes with a "sha256=" prefix.
+export async function verifyPlaneSignature(secret, body, header) {
+  if (!header) return false;
+  return verifyHex(secret, body, header.startsWith("sha256=") ? header.slice(7) : header);
+}
+
+async function verifyHex(secret, body, hex) {
   if (!/^[0-9a-f]{64}$/i.test(hex)) return false;
   const sig = new Uint8Array(hex.match(/../g).map((b) => parseInt(b, 16)));
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
   return crypto.subtle.verify("HMAC", key, sig, body);
+}
+
+// Plane may send `data` as a JSON string.
+function planeObject(v) {
+  if (typeof v === "string") { try { return JSON.parse(v); } catch { return null; } }
+  return v && typeof v === "object" ? v : null;
+}
+
+// Keep only IDs and the event name. Names, bodies and users stay out.
+export function planeEvent(workspace, p, headers) {
+  const id = (v) => (typeof v === "string" && v.length <= 64 ? v : null);
+  const data = planeObject(p.data) || planeObject(p.previous_attributes) || {};
+  const header = headers.get("x-plane-event") || "";
+  const event = /^[a-z_.]+$/.test(header) ? header : (typeof p.event === "string" && /^[a-z_.]+$/.test(p.event) ? p.event : "");
+  const type = String(p.entity_type || "");
+  const deliveryId = id(p.event_id) || id(headers.get("x-plane-delivery")) || id(p.delivery_id);
+  if (!deliveryId) return null;
+  return {
+    deliveryId: `plane:${deliveryId}`,
+    repo: "",
+    org: `plane:${workspace}`,
+    kind: "plane",
+    action: (event || type).slice(0, 64) || null,
+    projectId: type === "project" ? id(p.entity_id) : id(data.project_id) || id(data.project),
+    itemId: type === "issue" || type === "workitem" ? id(p.entity_id) : id(data.issue_id) || id(data.issue),
+  };
 }
 
 // Returns the device ID of the DEVICE_<id> secret that matches the bearer token.
@@ -111,8 +151,9 @@ const EVENTS_TABLE = `
     action TEXT,
     run_id INTEGER, job_id INTEGER, pr_number INTEGER,
     received_at INTEGER NOT NULL,
-    org TEXT, project_id TEXT, item_id TEXT, issue_number INTEGER
+    org TEXT, project_id TEXT, item_id TEXT
   )`;
+const PLANE_TABLE = "CREATE TABLE IF NOT EXISTS plane_hooks (workspace TEXT PRIMARY KEY, hook_id TEXT, secret TEXT NOT NULL)";
 
 export class Hub extends DurableObject {
   constructor(ctx, env) {
@@ -124,7 +165,7 @@ export class Hub extends DurableObject {
       CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT, cursor INTEGER NOT NULL DEFAULT 0,
         repos TEXT NOT NULL DEFAULT '[]', orgs TEXT NOT NULL DEFAULT '[]', last_seen INTEGER);
       CREATE TABLE IF NOT EXISTS hooks (repo TEXT PRIMARY KEY, hook_id INTEGER);
-      CREATE TABLE IF NOT EXISTS org_hooks (org TEXT PRIMARY KEY, hook_id INTEGER);
+      ${PLANE_TABLE};
       CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
     `);
     this.migrate();
@@ -139,11 +180,13 @@ export class Hub extends DurableObject {
     const exists = this.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'").toArray()[0];
     if (!exists) this.sql.exec(EVENTS_TABLE);
     const eventCols = new Set(this.sql.exec("SELECT name FROM pragma_table_info('events')").toArray().map((r) => r.name));
-    for (const [col, type] of [["org", "TEXT"], ["project_id", "TEXT"], ["item_id", "TEXT"], ["issue_number", "INTEGER"]]) {
+    for (const [col, type] of [["org", "TEXT"], ["project_id", "TEXT"], ["item_id", "TEXT"]]) {
       if (!eventCols.has(col)) this.sql.exec(`ALTER TABLE events ADD COLUMN ${col} ${type}`);
     }
     this.sql.exec("CREATE INDEX IF NOT EXISTS events_org ON events(org)");
-    this.sql.exec("CREATE TABLE IF NOT EXISTS org_hooks (org TEXT PRIMARY KEY, hook_id INTEGER)");
+    // GitHub org hooks were for GitHub Projects. Plane replaces them.
+    this.sql.exec("DROP TABLE IF EXISTS org_hooks");
+    this.sql.exec(PLANE_TABLE);
     const deviceCols = new Set(this.sql.exec("SELECT name FROM pragma_table_info('devices')").toArray().map((r) => r.name));
     if (deviceCols.size && !deviceCols.has("orgs")) {
       this.sql.exec("ALTER TABLE devices ADD COLUMN orgs TEXT NOT NULL DEFAULT '[]'");
@@ -189,6 +232,8 @@ export class Hub extends DurableObject {
     const device = request.headers.get("x-device-id");
 
     if (path === "/internal/event" && method === "POST") return this.addEvent(await request.json());
+    const inPlane = /^\/internal\/plane\/([a-z0-9_-]+)$/.exec(path);
+    if (inPlane && method === "POST") return this.planeWebhook(inPlane[1], request);
     if (!device) return json({ error: "unauthorized" }, 401);
 
     if (path === "/v1/connect") {
@@ -259,33 +304,52 @@ export class Hub extends DurableObject {
         return json({ ok: true });
       }
     }
-    const orgHook = /^\/v1\/org-hooks\/([^/]+)$/.exec(path);
-    if (orgHook) {
-      const org = decodeURIComponent(orgHook[1]).toLowerCase();
-      if (!org) return json({ error: "bad org" }, 400);
+    const planeHook = /^\/v1\/plane-hooks\/([a-z0-9_-]{1,64})$/i.exec(path);
+    if (planeHook) {
+      const workspace = planeHook[1].toLowerCase();
       if (method === "PUT") {
-        const { hookId } = await request.json();
-        if (!Number.isInteger(hookId)) return json({ error: "bad hookId" }, 400);
+        const { hookId, secret } = await request.json();
+        if (typeof hookId !== "string" || !hookId) return json({ error: "bad hookId" }, 400);
+        if (typeof secret !== "string" || secret.length < 16) return json({ error: "bad secret" }, 400);
         this.sql.exec(
-          "INSERT INTO org_hooks (org, hook_id) VALUES (?, ?) ON CONFLICT(org) DO UPDATE SET hook_id = excluded.hook_id",
-          org, hookId);
+          `INSERT INTO plane_hooks (workspace, hook_id, secret) VALUES (?, ?, ?)
+           ON CONFLICT(workspace) DO UPDATE SET hook_id = excluded.hook_id, secret = excluded.secret`,
+          workspace, hookId, secret);
         return json({ ok: true });
       }
       if (method === "DELETE") {
-        this.sql.exec("DELETE FROM org_hooks WHERE org = ?", org);
+        this.sql.exec("DELETE FROM plane_hooks WHERE workspace = ?", workspace);
         return json({ ok: true });
       }
     }
     return json({ error: "not found" }, 404);
   }
 
+  // Plane disables a webhook after 5 failed deliveries. Only a bad signature fails.
+  async planeWebhook(workspace, request) {
+    const row = this.sql.exec("SELECT secret FROM plane_hooks WHERE workspace = ?", workspace).toArray()[0];
+    if (!row) return json({ error: "unknown workspace" }, 404);
+    const body = await request.arrayBuffer();
+    if (!(await verifyPlaneSignature(row.secret, body, request.headers.get("x-plane-signature")))) {
+      console.log("plane webhook 401");
+      return json({ error: "bad signature" }, 401);
+    }
+    let p;
+    try { p = JSON.parse(new TextDecoder().decode(body)); } catch { return json({ ok: true, ignored: "bad json" }); }
+    const event = planeEvent(workspace, p, request.headers);
+    if (!event) return json({ ok: true, ignored: "no event id" });
+    console.log(`plane webhook ${event.action}`);
+    const res = this.addEvent(event);
+    return new Response(res.body, { status: 200, headers: res.headers });
+  }
+
   addEvent(e) {
     const now = Date.now();
     const inserted = this.sql.exec(
-      `INSERT INTO events (delivery_id, repo, kind, action, run_id, job_id, pr_number, received_at, org, project_id, item_id, issue_number)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(delivery_id) DO NOTHING RETURNING seq`,
-      e.deliveryId, e.repo || "", e.kind, e.action, e.runId, e.jobId, e.prNumber, now,
-      e.org ?? null, e.projectId ?? null, e.itemId ?? null, e.issueNumber ?? null).toArray();
+      `INSERT INTO events (delivery_id, repo, kind, action, run_id, job_id, pr_number, received_at, org, project_id, item_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(delivery_id) DO NOTHING RETURNING seq`,
+      e.deliveryId, e.repo || "", e.kind, e.action ?? null, e.runId ?? null, e.jobId ?? null, e.prNumber ?? null, now,
+      e.org ?? null, e.projectId ?? null, e.itemId ?? null).toArray();
     if (inserted.length === 0) return json({ duplicate: true }, 202);
     const msg = JSON.stringify({ type: "poke", head: inserted[0].seq });
     for (const ws of this.ctx.getWebSockets()) {
@@ -316,7 +380,6 @@ export class Hub extends DurableObject {
         seq: r.seq, deliveryId: r.delivery_id, repo: r.repo ?? "", kind: r.kind, action: r.action,
         runId: r.run_id, jobId: r.job_id, prNumber: r.pr_number, receivedAt: r.received_at,
         org: r.org ?? null, projectId: r.project_id ?? null, itemId: r.item_id ?? null,
-        issueNumber: r.issue_number ?? null,
       })),
       head,
       next: more ? rows[rows.length - 1].seq : head,
@@ -337,7 +400,7 @@ export class Hub extends DurableObject {
     const stats = this.sql.exec(
       "SELECT COUNT(*) AS n, MIN(received_at) AS oldest, SUM(received_at >= ?) AS today FROM events", dayStart).one();
     const projectToday = this.sql.exec(
-      "SELECT COUNT(*) AS n FROM events WHERE received_at >= ? AND kind LIKE 'projects_v2%'", dayStart).one().n;
+      "SELECT COUNT(*) AS n FROM events WHERE received_at >= ? AND kind = 'plane'", dayStart).one().n;
     const connected = new Set(this.ctx.getWebSockets().flatMap((ws) => this.ctx.getTags(ws)));
     const last = new Map(this.sql.exec("SELECT repo, MAX(received_at) AS at FROM events GROUP BY repo").toArray()
       .map((r) => [r.repo, r.at]));
@@ -362,8 +425,8 @@ export class Hub extends DurableObject {
       hooks: this.sql.exec("SELECT repo, hook_id FROM hooks ORDER BY repo").toArray().map((h) => ({
         repo: h.repo, hookId: h.hook_id, lastDelivery: last.get(h.repo) ?? null,
       })),
-      orgHooks: this.sql.exec("SELECT org, hook_id FROM org_hooks ORDER BY org").toArray().map((h) => ({
-        org: h.org, hookId: h.hook_id, lastDelivery: lastOrg.get(h.org) ?? null,
+      planeHooks: this.sql.exec("SELECT workspace, hook_id FROM plane_hooks ORDER BY workspace").toArray().map((h) => ({
+        workspace: h.workspace, hookId: h.hook_id, lastDelivery: lastOrg.get(`plane:${h.workspace}`) ?? null,
       })),
     };
   }

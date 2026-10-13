@@ -792,22 +792,28 @@ func runSelfTest() {
     check(StatusOption(id: "1", name: "Doing", color: "YELLOW").category == .progress, "doing category")
     check(StatusOption(id: "1", name: "Backlog", color: "GRAY").category == .todo, "todo category")
 
+    let wsUUID = "11111111-2222-3333-4444-555555555555"
     func projectItem(_ id: String, status: String?, fields: [String: String] = [:], assignees: [String] = [],
                      author: String? = "bea", comments: Int = 0, last: CommentRef? = nil) -> ProjectItem {
-        ProjectItem(id: id, contentId: "C\(id)", kind: .issue, title: "Item \(id)", url: "https://example/\(id)",
-                    databaseId: nil, repo: "o/r", number: 1, state: "OPEN", statusOptionId: status, fields: fields,
-                    assignees: assignees, labels: [], author: author, updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
-                    commentCount: comments, lastComment: last, mentionsMe: false)
+        ProjectItem(id: id, key: "ENG-\(id)", title: "Item \(id)", url: "https://app.plane.so/acme/browse/ENG-\(id)/",
+                    statusOptionId: status, fields: fields, assignees: assignees, labels: [], author: author,
+                    updatedBy: author, updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                    activityAt: Date(timeIntervalSince1970: 1_700_000_000), commentCount: comments, lastComment: last,
+                    mentionsMe: false)
     }
-    let todoOpt = StatusOption(id: "s1", name: "Todo", color: "GRAY")
-    let doingOpt = StatusOption(id: "s2", name: "In progress", color: "YELLOW")
-    func projectSnap(_ items: [ProjectItem]) -> ProjectSnapshot {
-        let summary = ProjectSummary(ref: ProjectRef(owner: "acme", number: 4), nodeId: "PVT_1", title: "Board",
-                                     url: "https://github.com/orgs/acme/projects/4", closed: false,
-                                     itemCount: items.count, ownerKind: .org)
-        return ProjectSnapshot(summary: summary, statusFieldId: "F", statusOptions: [todoOpt, doingOpt],
-                               items: items, fetchedAt: Date(timeIntervalSince1970: 1_700_000_100))
+    let todoOpt = StatusOption(id: "s1", name: "Todo", color: "#888888", group: "unstarted")
+    let doingOpt = StatusOption(id: "s2", name: "In progress", color: "#F59E0B", group: "started")
+    func summary(_ ws: String, _ id: String, _ title: String) -> ProjectSummary {
+        ProjectSummary(ref: ProjectRef(workspace: ws, id: id), identifier: "ENG", title: title, url: "", closed: false)
     }
+    func projectSnap(_ items: [ProjectItem], me: String? = "ada") -> ProjectSnapshot {
+        ProjectSnapshot(summary: summary("acme", wsUUID, "Board"), statusOptions: [todoOpt, doingOpt],
+                        items: items, fetchedAt: Date(timeIntervalSince1970: 1_700_000_040), me: me)
+    }
+    check(StatusOption(id: "1", name: "Blocked", color: "", group: "started").category == .blocked, "started group splits blocked")
+    check(StatusOption(id: "1", name: "Ready", color: "", group: "completed").category == .done, "completed group is done")
+    check(StatusOption(id: "1", name: "Won't do", color: "", group: "cancelled").category == .done, "cancelled group is done")
+    check(StatusOption(id: "1", name: "Done soon", color: "", group: "backlog").category == .todo, "group wins over name")
     check(ProjectStore.diff(nil, projectSnap([projectItem("a", status: "s1")])).isEmpty, "first snapshot is quiet")
     let before = projectSnap([projectItem("a", status: "s1", fields: ["Priority": "Low"], assignees: ["ada"])])
     let comment = CommentRef(id: "c1", author: "grace", createdAt: Date(timeIntervalSince1970: 1_700_000_050), url: "https://example/c1")
@@ -823,12 +829,21 @@ func runSelfTest() {
     check(changed("a") { if case .status(let from, let to) = $0 { return from == "Todo" && to == "In progress" }; return false }, "diff status")
     check(changed("a") { if case .field(let name, let from, let to) = $0 { return name == "Priority" && from == "Low" && to == "High" }; return false }, "diff field")
     check(changed("a") { if case .assigned(let who) = $0 { return who == "grace" }; return false }, "diff assigned")
-    check(changed("a") { if case .comments(let n, let last) = $0 { return n == 2 && last.id == "c1" }; return false }, "diff comments")
+    check(changed("a") { if case .comments(_, let last) = $0 { return last.id == "c1" }; return false }, "diff comments")
     let removed = ProjectStore.diff(after, projectSnap([projectItem("b", status: "s1")]))
     check(removed.contains { $0.itemId == "a" && $0.1 == .removed }, "diff removed")
+    let oldComment = CommentRef(id: "c0", author: "grace", createdAt: Date(timeIntervalSince1970: 1_600_000_000), url: "")
+    let lateLoad = ProjectStore.diff(before, projectSnap([projectItem("a", status: "s1", fields: ["Priority": "Low"],
+                                                                       assignees: ["ada"], comments: 1, last: oldComment)]))
+    check(lateLoad.isEmpty, "an old comment that loads late is quiet \(lateLoad)")
+    let doneOpt0 = StatusOption(id: "s9", name: "Done", color: "", group: "completed")
+    let closeSnap = ProjectSnapshot(summary: summary("acme", wsUUID, "Board"), statusOptions: [todoOpt, doneOpt0],
+                                    items: [projectItem("a", status: "s9", fields: ["Priority": "Low"], assignees: ["ada"])],
+                                    fetchedAt: Date())
+    check(ProjectStore.diff(before, closeSnap).contains { $0.1 == .closed }, "done state closes")
 
     var notes: [(title: String, subtitle: String, body: String, id: String)] = []
-    let notifier = ProjectNotifier(me: { "ada" }, post: { notes.append(($0, $1, $2, $3)) })
+    let notifier = ProjectNotifier(post: { notes.append(($0, $1, $2, $3)) })
     var clock = Date(timeIntervalSince1970: 1_000_000)
     notifier.now = { clock }
     let mine = projectSnap([projectItem("a", status: "s1", assignees: ["ada"])])
@@ -837,6 +852,7 @@ func runSelfTest() {
     notifier.handle([("a", .mention)], in: mine, settings: settings)
     notifier.handle([("b", .mention)], in: theirs, settings: settings)
     check(notes.count == 1 && notes[0].id == "project:a", "mention only on my items")
+    check(notes[0].title == "acme › Board" && notes[0].subtitle == "ENG-a Item a", "notification title \(notes[0])")
     notes = []
     notifier.handle([("b", .status(from: "Todo", to: "Done"))], in: theirs, settings: settings)
     notifier.handle([("a", .status(from: "Todo", to: "Done"))], in: mine, settings: settings)
@@ -855,6 +871,8 @@ func runSelfTest() {
     check(notes.isEmpty, "own comments are skipped")
     notifier.handle([("a", .field(name: "Priority", from: "Low", to: "High"))], in: mine, settings: settings)
     check(notes.isEmpty, "other fields stay quiet")
+    notifier.handle([("a", .mention)], in: projectSnap(mine.items, me: nil), settings: settings)
+    check(notes.isEmpty, "no owner, no mine")
     notes = []
     notifier.handle([("a", .status(from: "Todo", to: "In progress"))], in: mine, settings: settings)
     clock = clock.addingTimeInterval(60)
@@ -870,26 +888,67 @@ func runSelfTest() {
     }
     let plan = relayApplyPlan([
         relayEvent(#"{"seq":1,"deliveryId":"a","repo":"o/kept","kind":"workflow_run","action":"completed","runId":9}"#),
-        relayEvent(#"{"seq":2,"deliveryId":"b","repo":"","kind":"projects_v2_item","projectId":"PVT_1","itemId":"PVTI_1"}"#),
-        relayEvent(#"{"seq":3,"deliveryId":"c","repo":"acme/app","kind":"issues","issueNumber":4}"#),
+        relayEvent(#"{"seq":2,"deliveryId":"b","repo":"","org":"plane:acme","kind":"plane","action":"workitem.updated","projectId":"P1","itemId":"I1"}"#),
+        relayEvent(#"{"seq":3,"deliveryId":"c","repo":"","org":"plane:acme","kind":"plane","action":"workitem.comment.created","projectId":"P1"}"#),
         relayEvent(#"{"seq":4,"deliveryId":"d","repo":"o/other","kind":"pull_request","prNumber":3}"#),
+        relayEvent(#"{"seq":5,"deliveryId":"e","repo":"","org":"plane:beta","kind":"plane","action":"workitem.updated","projectId":"P2"}"#),
+        relayEvent(#"{"seq":6,"deliveryId":"f","repo":"","org":"plane:beta","kind":"plane","action":"project.updated"}"#),
+        relayEvent(#"{"seq":7,"deliveryId":"g","repo":"","org":"plane:beta","kind":"plane","action":"workitem.created","projectId":"P3"}"#),
+        relayEvent(#"{"seq":8,"deliveryId":"h","repo":"","org":"acme","kind":"plane","projectId":"P9"}"#),
     ], knownRepos: ["O/Kept"])
     check(plan.repos == ["O/Kept"] && plan.completedRuns.count == 1
             && plan.completedRuns[0].0 == "O/Kept" && plan.completedRuns[0].1 == 9, "relay plan keeps known repos")
     check(plan.includePRs, "pull request events refresh PRs")
-    check(plan.projectNodeIds == ["PVT_1"] && plan.issues.count == 1
-            && plan.issues[0].repo == "acme/app" && plan.issues[0].number == 4, "relay plan splits project events")
+    let planned = plan.plane.map { "\($0.workspace)/\($0.project ?? "*")" }
+    check(planned == ["acme/P1", "beta/*"], "relay plan groups plane events \(planned)")
 
-    let nodes: [Any] = [
-        NSNull(),
-        ["id": "PVT_1", "number": NSNumber(value: 3), "title": "Fritz Tasks", "url": "https://github.com/users/flarco/projects/3",
-         "closed": false, "items": ["totalCount": 1]],
-    ]
-    let parsed = projectSummaries(from: nodes, owner: "flarco", kind: .user)
-    check(parsed.count == 1 && parsed[0].title == "Fritz Tasks" && parsed[0].ref.number == 3, "null project nodes are skipped")
-    check(projectItemDatabaseId(nodeId: "PVTI_lAHOAHUM4s4BmgROzg_6shs") == "268087835", "item id from node")
-    check(projectItemURL(projectURL: "https://github.com/users/flarco/projects/3/", nodeId: "PVTI_x", databaseId: "268087835")
-            == "https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=268087835", "item pane url")
+    let ws = PlaneWorkspace(slug: "acme")
+    check(ws.itemURL("ENG-4") == "https://app.plane.so/acme/browse/ENG-4/" && ws.url == "https://app.plane.so/acme/",
+          "cloud item url")
+    check(PlaneWorkspace(slug: "acme", host: "https://plane.example.com").itemURL("ENG-4")
+            == "https://plane.example.com/acme/browse/ENG-4/", "self-hosted item url")
+    let oldWs = try? JSONDecoder().decode(PlaneWorkspace.self, from: Data(#"{"slug":"acme"}"#.utf8))
+    check(oldWs?.host == PlaneWorkspace.cloudHost, "workspace host default")
+
+    // Plane activity rows.
+    let names = ["u1": "Ada"]
+    let states = [todoOpt, doingOpt]
+    check(PlaneClient.change(["verb": "created"], names: names, states: states) == .added, "activity created")
+    check(PlaneClient.change(["verb": "updated", "field": "state", "old_value": "Todo", "new_value": NSNull(),
+                              "new_identifier": "s2"], names: names, states: states)
+            == .status(from: "Todo", to: "In progress"), "activity state from id")
+    check(PlaneClient.change(["verb": "updated", "field": "assignees", "new_value": "", "new_identifier": "u1"],
+                             names: names, states: states) == .assigned("Ada"), "activity assigned")
+    check(PlaneClient.change(["verb": "updated", "field": "priority", "old_value": "low", "new_value": "urgent"],
+                             names: names, states: states) == .field(name: "Priority", from: "Low", to: "Urgent"), "activity priority")
+    check(PlaneClient.change(["verb": "updated", "field": "description"], names: names, states: states) == nil,
+          "unknown activity is skipped")
+
+    // Plane rich text.
+    let html = #"<h2>Context</h2><p>Hi <mention-component entity_identifier="u1" entity_name="user_mention"></mention-component>, see <a href="https://x.dev">this</a> &amp; <strong>that</strong>.</p><ul data-type="taskList"><li data-type="taskItem" data-checked="true"><p>one</p></li><li data-type="taskItem" data-checked="false"><p>two</p></li></ul><pre><code>let a = 1 &lt; 2</code></pre>"#
+    let pmd = PlaneMarkup.markdown(fromHTML: html, mention: { names[$0] })
+    check(pmd.contains("## Context") && pmd.contains("Hi @Ada, see [this](https://x.dev) & **that**."), "html to markdown \(pmd)")
+    check(pmd.contains("- [x] one") && pmd.contains("- [ ] two") && pmd.contains("```\nlet a = 1 < 2\n```"), "tasks and code \(pmd)")
+    let back = PlaneMarkup.html(fromMarkdown: pmd)
+    check(back.contains(#"data-type="taskList""#) && back.contains("<h2>Context</h2>") && back.contains("&lt; 2"),
+          "markdown to html \(back)")
+    check(PlaneMarkup.markdown(fromHTML: PlaneMarkup.html(fromMarkdown: pmd)) == PlaneMarkup.markdown(fromHTML: back), "round trip")
+    check(PlaneMarkup.html(fromMarkdown: "a <b> & c") == "<p>a &lt;b&gt; &amp; c</p>", "plain text is escaped")
+    let planeTable = "<p>Work items</p><table><tbody><tr><th colspan=\"1\" rowspan=\"1\"><p>Plane</p></th><th><p>Repo</p></th></tr>"
+        + "<tr><td><p>TREBI-286</p></td><td><p>Connector <code>internal/host</code></p><p>a|b</p></td></tr></tbody></table><p>After</p>"
+    let tableMD = PlaneMarkup.markdown(fromHTML: planeTable)
+    check(tableMD == "Work items\n\n| Plane | Repo |\n| --- | --- |\n| TREBI-286 | Connector `internal/host` a\\|b |\n\nAfter",
+          "table to Markdown: \(tableMD)")
+    let tableHTML = PlaneMarkup.html(fromMarkdown: tableMD)
+    check(tableHTML.contains("<table><tbody><tr><th><p>Plane</p></th>") && tableHTML.contains("<td><p>Connector <code>internal/host</code> a|b</p></td>"),
+          "table to HTML: \(tableHTML)")
+    check(PlaneMarkup.markdown(fromHTML: tableHTML) == tableMD, "table round trip")
+    let asset = "a246509a-505b-46c2-80a1-7e0dd05b475d"
+    let imgMD = PlaneMarkup.markdown(fromHTML: "<p>See</p><image-component src=\"\(asset)\" width=\"200\"></image-component>")
+    check(imgMD == "See\n\n![](\(asset))", "image to Markdown: \(imgMD)")
+    let imgHTML = PlaneMarkup.html(fromMarkdown: imgMD)
+    check(imgHTML.contains("<image-component src=\"\(asset)\"></image-component>"), "image to HTML: \(imgHTML)")
+    check(PlaneMarkup.html(fromMarkdown: "![x](https://e.com/a.png)").contains("<img src=\"https://e.com/a.png\" alt=\"x\">"), "web image")
 
     let oldConfig = #"{"repos":["o/r"],"pollInterval":30}"#.data(using: .utf8)!
     let decoded = try? JSONDecoder().decode(AppConfig.self, from: oldConfig)
@@ -898,15 +957,15 @@ func runSelfTest() {
     // Projects: order, fold, filter.
     let oldProjects = try? JSONDecoder().decode(ProjectsConfig.self, from: Data(#"{"picked":["a/1"],"pollMinutes":5}"#.utf8))
     check(oldProjects?.order == [] && oldProjects?.folded == [] && oldProjects?.capture == CaptureConfig()
-            && oldProjects?.picked == ["a/1"] && oldProjects?.hideDoneAfterDays == 1, "old projects config gets the new defaults")
-    func summary(_ owner: String, _ n: Int, _ title: String) -> ProjectSummary {
-        ProjectSummary(ref: ProjectRef(owner: owner, number: n), nodeId: "N\(n)", title: title, url: "", closed: false,
-                       itemCount: 0, ownerKind: .org)
-    }
+            && oldProjects?.picked == [] && oldProjects?.hideDoneAfterDays == 1, "old GitHub picks are dropped")
+    let planeCfg = try? JSONDecoder().decode(ProjectsConfig.self, from: Data("""
+    {"workspaces":[{"slug":"acme"}],"picked":["acme/\(wsUUID)","gone/\(wsUUID)","acme/3"],"allOf":["acme","gone"]}
+    """.utf8))
+    check(planeCfg?.picked == ["acme/\(wsUUID)"] && planeCfg?.allOf == ["acme"], "picks of unknown workspaces are dropped")
     var orderCfg = ProjectsConfig()
     orderCfg.order = ["zed/9", "ACME/2", "gone/7"]
-    let ordered = orderCfg.sorted([summary("acme", 1, "Beta"), summary("acme", 2, "Alpha"), summary("zed", 9, "Zed"),
-                                   summary("bolt", 3, "Bolt"), summary("acme", 4, "Aardvark")]).map(\.ref.key)
+    let ordered = orderCfg.sorted([summary("acme", "1", "Beta"), summary("acme", "2", "Alpha"), summary("zed", "9", "Zed"),
+                                   summary("bolt", "3", "Bolt"), summary("acme", "4", "Aardvark")]).map(\.ref.key)
     check(ordered == ["zed/9", "acme/2", "acme/4", "acme/1", "bolt/3"], "project order \(ordered)")
     orderCfg.setFolded("acme/1", true)
     check(orderCfg.isFolded("ACME/1"), "fold is case-insensitive")
@@ -915,15 +974,44 @@ func runSelfTest() {
     let nextOpt = StatusOption(id: "s3", name: "Next", color: "BLUE")
     let reviewOpt = StatusOption(id: "s4", name: "In review", color: "PURPLE")
     let doneOpt = StatusOption(id: "s5", name: "Done", color: "GREEN")
-    let foldSnap = ProjectSnapshot(summary: summary("acme", 4, "Board"), statusFieldId: "F",
+    let foldSnap = ProjectSnapshot(summary: summary("acme", "4", "Board"),
                                    statusOptions: [todoOpt, nextOpt, reviewOpt, doneOpt],
                                    items: [projectItem("1", status: "s3"), projectItem("2", status: "s4"),
                                            projectItem("3", status: "s5"), projectItem("4", status: nil)],
                                    fetchedAt: Date())
-    check(foldSnap.notDoneCount == 3, "fold count is items not done")
+    check(foldSnap.notDoneCount(foldSnap.items) == 3, "fold count is items not done")
+    check(foldSnap.sortedItems.map(\.id) == ["2", "1", "4", "3"], "status order \(foldSnap.sortedItems.map(\.id))")
+    func pri(_ id: String, _ status: String, _ p: String?) -> ProjectItem {
+        projectItem(id, status: status, fields: p.map { ["Priority": $0] } ?? [:])
+    }
+    let priSnap = ProjectSnapshot(summary: summary("acme", "5", "Board"), statusOptions: [todoOpt, doingOpt, doneOpt],
+                                  items: [pri("a", "s1", "Low"), pri("b", "s1", nil), pri("c", "s1", "Urgent"),
+                                          pri("d", "s5", "Urgent"), pri("e", "s2", "Low"), pri("f", "s2", "High")],
+                                  fetchedAt: Date())
+    check(priSnap.sortedItems.map(\.id) == ["f", "e", "c", "a", "b", "d"], "priority order \(priSnap.sortedItems.map(\.id))")
+    // Sub-items: a tree from parentId, progress from the index.
+    func child(_ id: String, _ parent: String?, _ status: String) -> ProjectItem {
+        var i = projectItem(id, status: status); i.parentId = parent; return i
+    }
+    var treeSnap = ProjectSnapshot(summary: summary("acme", "4", "Board"), statusOptions: [todoOpt, doingOpt, doneOpt],
+                                   items: [child("p", nil, "s1"), child("c1", "p", "s5"), child("c2", "p", "s1"),
+                                           child("g1", "c2", "s5"), child("o", "gone", "s1")], fetchedAt: Date())
+    check(treeSnap.rootItems.map(\.id) == ["p", "o"], "roots keep orphans \(treeSnap.rootItems.map(\.id))")
+    check(treeSnap.listed(subItems: true).count == 5, "listed with sub-items")
+    check(treeSnap.children(of: "p").map(\.id) == ["c2", "c1"], "children sort done last")
+    check(treeSnap.progress(of: "p") == (1, 2) && treeSnap.progress(of: "c1") == (0, 0), "progress from items")
+    check(treeSnap.ancestors(of: "g1") == ["c2", "p"] && treeSnap.ancestors(of: "o").isEmpty, "ancestors")
+    treeSnap.index = [ItemStub(id: "c1", parentId: "p", stateId: "s5", activityAt: nil),
+                      ItemStub(id: "c2", parentId: "p", stateId: "s1", activityAt: nil),
+                      ItemStub(id: "c3", parentId: "p", stateId: "s5", activityAt: nil)]
+    check(treeSnap.progress(of: "p") == (2, 3), "progress counts sub-items that are not loaded")
+    check(treeSnap.notDoneCount(treeSnap.rootItems) == 2, "folded count uses the listed items")
+    let oldItem = try? JSONDecoder().decode(ProjectItem.self, from: JSONEncoder().encode(projectItem("z", status: nil)))
+    check(oldItem?.parentId == nil, "item without parent decodes")
+
     var bodyItem = projectItem("9", status: nil)
     bodyItem.body = "The Relay drops events"
-    check(bodyItem.matches("relay") && bodyItem.matches("ITEM 9") && bodyItem.matches("  ") && !bodyItem.matches("nope"),
+    check(bodyItem.matches("relay") && bodyItem.matches("ITEM 9") && bodyItem.matches("eng-9") && bodyItem.matches("  ") && !bodyItem.matches("nope"),
           "filter matches title and body")
 
     // AI dialects, without network.
@@ -963,18 +1051,18 @@ func runSelfTest() {
     // Suggestion parsing.
     let sizeField = ProjectField(id: "FS", name: "Size", options: [StatusOption(id: "o1", name: "S", color: "GRAY"),
                                                                    StatusOption(id: "o2", name: "L", color: "GRAY")])
-    let draftCtx = DraftContext(projects: [("flarco/3", "Fritz Tasks"), ("acme/1", "Board")], fields: [sizeField])
+    let draftCtx = DraftContext(projects: [("ocral/\(wsUUID)", "Fritz Tasks"), ("acme/1", "Board")], fields: [sizeField])
     let reply = """
     Sure! Here it is:
     ```json
     {"title": "  \(String(repeating: "x", count: 80)).", "alternatives": ["Other", "Third"],
-     "fields": {"size": "l", "Priority": "P0", "Size2": "S"}, "project": "FLARCO/3", "reason": "personal"}
+     "fields": {"size": "l", "Priority": "P0", "Size2": "S"}, "project": "OCRAL/\(wsUUID)", "reason": "personal"}
     ```
     """
     let sug = DraftSuggestion.parse(reply, ctx: draftCtx)
     check(sug?.title.count == 70 && sug?.alternatives == ["Other", "Third"], "suggestion title and alternatives")
     check(sug?.fields == ["Size": "L"], "unknown fields and options are dropped \(sug?.fields ?? [:])")
-    check(sug?.project == "flarco/3" && sug?.reason == "personal", "project key is normalized")
+    check(sug?.project == "ocral/\(wsUUID)" && sug?.reason == "personal", "project key is normalized")
     check(DraftSuggestion.parse(#"{"title":"Fix it","project":"nope/1"}"#, ctx: draftCtx)?.project == nil, "unknown project dropped")
     check(DraftSuggestion.parse("no json here", ctx: draftCtx) == nil, "no JSON gives nil")
     check(unfenced("```markdown\n## Context\nText\n```") == "## Context\nText", "fence removed")
@@ -996,37 +1084,36 @@ func runSelfTest() {
           "ai config defaults")
 
     // Copy for agent.
-    let agentSnap = ProjectSnapshot(summary: ProjectSummary(ref: ProjectRef(owner: "flarco", number: 3), nodeId: "P",
-                                                            title: "Fritz Tasks", url: "https://github.com/users/flarco/projects/3",
-                                                            closed: false, itemCount: 2, ownerKind: .user),
-                                    statusFieldId: "F", statusOptions: [todoOpt, doingOpt], items: [], fetchedAt: Date())
-    let draftItem = ProjectItem(id: "PVTI_x", contentId: "DI_1", kind: .draft, title: "Add quick capture", url: nil,
-                                databaseId: "42", repo: nil, number: nil, state: nil, statusOptionId: "s1",
-                                fields: ["Size": "L", "Title": "Add quick capture"], assignees: [], labels: [], author: nil,
-                                updatedAt: Date(), commentCount: 0, lastComment: nil, mentionsMe: false, body: "Use ⌃⌥N.\n")
+    let agentSnap = ProjectSnapshot(summary: ProjectSummary(ref: ProjectRef(workspace: "ocral", id: wsUUID), identifier: "FRITZ",
+                                                            title: "Fritz", url: "https://app.plane.so/ocral/projects/x/issues/",
+                                                            closed: false),
+                                    statusOptions: [todoOpt, doingOpt], items: [], fetchedAt: Date())
+    let draftItem = ProjectItem(id: "u-1", key: "FRITZ-7", title: "Add quick capture", url: "https://app.plane.so/ocral/browse/FRITZ-7/",
+                                statusOptionId: "s1", fields: ["Priority": "High", "Title": "Add quick capture"], assignees: [],
+                                labels: ["ui"], author: nil, updatedBy: nil, updatedAt: Date(), activityAt: Date(),
+                                commentCount: 0, lastComment: nil, mentionsMe: false, body: "Use ⌃⌥N.\n")
     check(draftItem.agentMarkdown(snap: agentSnap, comments: []) == """
     # Add quick capture
 
-    Project: flarco/Fritz Tasks · Status: Todo · Draft · Size: L
-    https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=42
+    Project: ocral/Fritz · Work item: FRITZ-7 · Status: Todo · Priority: High · Labels: ui
+    https://app.plane.so/ocral/browse/FRITZ-7/
 
     Use ⌃⌥N.
 
     ## Comments
     _None_
 
-    """, "agent markdown for a draft")
-    let issueItem = ProjectItem(id: "PVTI_y", contentId: "I_1", kind: .issue, title: "Fix login", url: "https://github.com/o/r/issues/5",
-                                databaseId: "43", repo: "o/r", number: 5, state: "OPEN", statusOptionId: "s2",
-                                fields: [:], assignees: ["ada"], labels: [], author: "bea", updatedAt: Date(),
-                                commentCount: 2, lastComment: nil, mentionsMe: false, body: nil)
+    """, "agent markdown without comments \(draftItem.agentMarkdown(snap: agentSnap, comments: []))")
+    let issueItem = ProjectItem(id: "u-2", key: "FRITZ-5", title: "Fix login", url: "https://app.plane.so/ocral/browse/FRITZ-5/",
+                                statusOptionId: "s2", fields: [:], assignees: ["ada"], labels: [], author: "bea", updatedBy: "bea",
+                                updatedAt: Date(), activityAt: Date(), commentCount: 2, lastComment: nil, mentionsMe: false, body: nil)
     let c1 = CommentRef(id: "c1", author: "bea", createdAt: Date(timeIntervalSince1970: 1_700_000_000), url: "", body: "First\nline two")
     let c2 = CommentRef(id: "c2", author: "ada", createdAt: Date(timeIntervalSince1970: 1_700_100_000), url: "", body: "Done?")
     check(issueItem.agentMarkdown(snap: agentSnap, comments: [c2, c1]) == """
     # Fix login
 
-    Project: flarco/Fritz Tasks · Status: In progress · Issue: o/r#5 · Assignees: @ada
-    https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=43
+    Project: ocral/Fritz · Work item: FRITZ-5 · Status: In progress · Assignees: @ada
+    https://app.plane.so/ocral/browse/FRITZ-5/
 
     _No description_
 
@@ -1035,7 +1122,7 @@ func runSelfTest() {
       line two
     - @ada (2023-11-16): Done?
 
-    """, "agent markdown for an issue with comments")
+    """, "agent markdown with comments")
 
     // Quick capture shortcut label.
     check(CaptureConfig().shortcutLabel == "⌃⌥N", "default shortcut label")
@@ -1222,13 +1309,8 @@ class TabVC: NSViewController {
     var statusFilter: [String: String] = [:]
     var showAllProjects: Set<String> = []
     var selectedProject: String?
-    var projectError: String?
-    var timelineCache: [String: [ActivityEntry]] = [:]
     var projectQuery = ""
     var projectNotice: String?
-    var editingItem: String?
-    var itemEdit: ItemEdit?
-    var statusSaving: [String: String] = [:]   // item id → target option id
     var sheet: NewItemSheet?
     var searchField: NSSearchField?
     var keyMonitor: Any?
@@ -1303,8 +1385,7 @@ class TabVC: NSViewController {
         self.updated = updated; self.loading = loading
         guard isViewLoaded else { return }
         (footerView as? Footer)?.showUpdated(updated)
-        // A rebuild would take the focus from the editor.
-        if editingItem != nil || dragLine != nil { return }
+        if dragLine != nil { return }
         JobSummary.close()  // the rebuild removes its chip
         rebuildContent()
     }
@@ -1375,11 +1456,6 @@ class TabVC: NSViewController {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self, e.window == self.view.window, self.sheet == nil, self.selectedTab == .projects else { return e }
             let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if self.editingItem != nil {
-                if e.keyCode == 53 { self.endEdit(); return nil }
-                if e.keyCode == 36 && mods.contains(.command) { self.saveEdit(); return nil }
-                return e
-            }
             if e.keyCode == 53, self.view.window?.firstResponder === self.searchField?.currentEditor(), !self.projectQuery.isEmpty {
                 self.searchField?.stringValue = ""
                 self.projectQuery = ""
@@ -1407,8 +1483,7 @@ class TabVC: NSViewController {
         let projects = app.projectCatalog.resolve(PROJECTS_CFG).filter { app.projectStore.snapshots[$0.ref.key] != nil }
         guard !projects.isEmpty else { return }
         sheet?.removeFromSuperview()
-        let s = NewItemSheet(store: app.projectStore, projects: projects, repoCatalog: app.catalog,
-                             target: target, prefill: prefill, w: POP_W)
+        let s = NewItemSheet(store: app.projectStore, projects: projects, target: target, prefill: prefill, w: POP_W)
         s.onClose = { [weak self] key, notice in self?.closeNewItem(key: key, notice: notice) }
         s.onResize = { [weak self] in self?.relayout() }
         view.addSubview(s)
@@ -1423,7 +1498,7 @@ class TabVC: NSViewController {
         sheet?.removeFromSuperview()
         sheet = nil
         let app = NSApp.delegate as? GHActionsBar
-        app?.popover.behavior = expandedItem != nil ? .semitransient : .transient
+        app?.popover.behavior = .transient
         if let key, PROJECTS_CFG.isFolded(key) {
             PROJECTS_CFG.setFolded(key, false)
             saveConfig()
@@ -1446,13 +1521,13 @@ class TabVC: NSViewController {
         if selectedTab == .projects {
             popup.addItem(withTitle: "All projects")
             let projects = (NSApp.delegate as? GHActionsBar)?.projectCatalog.resolve(PROJECTS_CFG) ?? []
-            var lastOwner = ""
+            var lastWorkspace = ""
             for p in projects {
-                if p.ref.owner.caseInsensitiveCompare(lastOwner) != .orderedSame {
-                    let head = NSMenuItem(title: p.ref.owner, action: nil, keyEquivalent: "")
+                if p.ref.workspace != lastWorkspace {
+                    let head = NSMenuItem(title: p.ref.workspace, action: nil, keyEquivalent: "")
                     head.isEnabled = false
                     popup.menu?.addItem(head)
-                    lastOwner = p.ref.owner
+                    lastWorkspace = p.ref.workspace
                 }
                 let item = NSMenuItem(title: "  " + p.title, action: nil, keyEquivalent: "")
                 item.representedObject = p.ref.key
@@ -1597,10 +1672,15 @@ class TabVC: NSViewController {
     }
 
     @objc func scrolled(_ note: Notification) {
-                for row in doc.subviews {
+        for row in doc.subviews {
             (row as? RunRow)?.syncHover()
             (row as? PRRow)?.syncHover()
         }
+        // Project rows can be inside group views.
+        func projectRows(_ v: NSView) {
+            for s in v.subviews { if let r = s as? ProjectItemRow { r.syncHover() } else { projectRows(s) } }
+        }
+        projectRows(doc)
     }
 
     @objc func toggleSortByRecent(_ sender: NSButton) {
@@ -1655,28 +1735,24 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     var projectStatusFilter: [String: String] = [:]
     var projectShowAll: Set<String> = []
     var projectQuery = ""
-    var pendingProjectItem: String?
     var lastSettingsTab: SettingsTab = .general
-    var lastSyncedOrgs: [String] = []
-    var ghScopes = Set<String>()
-    var scopesKnown = false
-    var viewerLogin: String?
+    var lastSyncedWorkspaces: [String] = []
     var appearanceObs: NSKeyValueObservation?
     var warnedStatusItemMissing = false
     var statusItemRecheckDone = false
     let relayDeployer = RelayDeployer()
     let catalog = RepoCatalog(path: REPO_CACHE_PATH)
-    let projectCatalog = ProjectCatalog(api: ProjectAPI(), path: PROJECT_CACHE_PATH)
+    let planeAccounts = PlaneAccounts()
+    lazy var projectCatalog = ProjectCatalog(accounts: planeAccounts, path: PROJECT_CACHE_PATH)
     lazy var projectNotifier: ProjectNotifier = {
-        ProjectNotifier(me: { [weak self] in self?.viewerLogin }, post: { [weak self] title, subtitle, body, id in
+        ProjectNotifier(post: { [weak self] title, subtitle, body, id in
             self?.notify(title: title, subtitle: subtitle, body: body, id: id)
         })
     }()
     lazy var projectStore: ProjectStore = {
-        let s = ProjectStore(api: ProjectAPI(), notifier: projectNotifier,
+        let s = ProjectStore(accounts: planeAccounts, notifier: projectNotifier,
                              statePath: PROJECT_STATE_PATH, activityPath: PROJECT_ACTIVITY_PATH)
         s.relayIsLive = { [weak self] in self?.relay.state == .live }
-        s.viewer = { [weak self] in self?.viewerLogin }
         s.onChange = { [weak self] in
             self?.updateIcon()
             self?.reloadList()
@@ -1771,23 +1847,22 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             self?.catalog.refreshIfStale()
             self?.projectCatalog.refreshIfStale()
         }
+        relayDeployer.planeClient = { [weak self] in self?.planeAccounts.client(for: $0) }
+        relayDeployer.trackedWorkspaces = { [weak self] in self?.trackedPlaneWorkspaces() ?? [] }
         projectStore.track(projectCatalog.resolve(PROJECTS_CFG), live: liveProjectKeys())
-        syncProjectOrgs()
+        syncPlaneWorkspaces()
         projectCatalog.refreshIfStale()
+        relayDeployer.updateIfOld { [weak self] ok in
+            guard let self else { return }
+            self.notify(title: "Cat Eye", subtitle: ok ? "Relay updated to v\(RELAY_BUNDLED_VERSION)" : "Relay update failed",
+                        body: ok ? "Live updates now include Plane." : "Open Settings → Live updates to see the log.", id: "relay-update")
+            self.projectStore.track(self.projectCatalog.resolve(PROJECTS_CFG), live: self.liveProjectKeys())
+        }
         applyCaptureHotKey()
         NotificationCenter.default.addObserver(forName: ProjectCatalog.changed, object: projectCatalog, queue: .main) { [weak self] _ in
             guard let self = self, !self.projectCatalog.refreshing else { return }
             self.projectStore.track(self.projectCatalog.resolve(PROJECTS_CFG), live: self.liveProjectKeys())
-            self.syncProjectOrgs()
-        }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let scopes = ProjectAPI().scopes()
-            let login = getGHUser()
-            DispatchQueue.main.async {
-                self?.ghScopes = scopes
-                self?.scopesKnown = true
-                self?.viewerLogin = login
-            }
+            self.syncPlaneWorkspaces()
         }
     }
 
@@ -2113,22 +2188,21 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 }
             }
             relayDeployer.pruneHooks(removed: removed)
-            syncProjectOrgs()
+            syncPlaneWorkspaces()
         }
     }
 
-    func trackedOrgLogins() -> [String] {
+    // Workspaces of the tracked projects that have a token.
+    func trackedPlaneWorkspaces() -> [String] {
         var seen = Set<String>()
-        return projectCatalog.resolve(PROJECTS_CFG).compactMap { p -> String? in
-            guard p.ownerKind == .org, seen.insert(p.ref.owner.lowercased()).inserted else { return nil }
-            return p.ref.owner
+        return projectCatalog.resolve(PROJECTS_CFG).map(\.ref.workspace).filter {
+            planeAccounts.hasToken($0) && seen.insert($0).inserted
         }
     }
 
     func liveProjectKeys() -> Set<String> {
         Set(projectCatalog.resolve(PROJECTS_CFG).filter { p in
-            guard p.ownerKind == .org else { return false }
-            switch relayDeployer.hooks.statuses["org:\(p.ref.owner)"] {
+            switch relayDeployer.hooks.statuses[HookManager.planeKey(p.ref.workspace)] {
             case .live, .waiting: return true
             default: return false
             }
@@ -2138,32 +2212,28 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     func applyProjectSelection() {
         projectStore.track(projectCatalog.resolve(PROJECTS_CFG), live: liveProjectKeys())
         projectStore.restartTimer()
-        syncProjectOrgs()
+        syncPlaneWorkspaces()
         updateIcon()
         if popover.isShown, popover.contentViewController is ProjectSettingsVC {
             showList()
         }
     }
 
-    func syncProjectOrgs() {
+    // Registers the workspaces with the relay and adds a Plane webhook to new ones.
+    func syncPlaneWorkspaces() {
         guard !RELAY.deviceID.isEmpty, !RELAY.workerURL.isEmpty else { return }
-        let orgs = trackedOrgLogins()
-        let removed = lastSyncedOrgs.filter { old in !orgs.contains { $0.caseInsensitiveCompare(old) == .orderedSame } }
-        lastSyncedOrgs = orgs
+        let slugs = trackedPlaneWorkspaces()
+        let removed = lastSyncedWorkspaces.filter { !slugs.contains($0) }
+        let added = slugs.filter { !lastSyncedWorkspaces.contains($0) }
+        lastSyncedWorkspaces = slugs
         relayDeployer.registerRepos()
-        if !removed.isEmpty { relayDeployer.pruneOrgHooks(removed: removed) }
-        guard !orgs.isEmpty else { return }
+        relayDeployer.prunePlaneHooks(removed: removed)
+        guard !added.isEmpty else { return }
         let d = relayDeployer
-        d.perform("Install org webhooks", { d.installOrgHooks(orgs: orgs) }) { [weak self] _ in
+        d.perform("Install Plane webhooks", { d.installPlaneHooks(added) }) { [weak self] _ in
+            d.checkPlaneHooks(added)
             self?.projectStore.track(self?.projectCatalog.resolve(PROJECTS_CFG) ?? [], live: self?.liveProjectKeys() ?? [])
         }
-    }
-
-    var needsProjectScope: Bool {
-        guard scopesKnown, !ghScopes.isEmpty else {
-            return projectStore.lastError?.localizedCaseInsensitiveContains("scope") == true
-        }
-        return !ghScopes.contains("project") && !ghScopes.contains("read:project")
     }
 
     func onConfigSaved(previous: [String]) {
@@ -2321,11 +2391,16 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         let id = response.notification.request.identifier
         DispatchQueue.main.async {
             self.closeTime = .distantPast
-            if id.hasPrefix("project:") {
-                self.pendingProjectItem = String(id.dropFirst("project:".count))
-                self.selectedTab = .projects
-                self.expandedItem = self.pendingProjectItem
+            if id.hasPrefix("intake:") {
                 if self.popover.isShown { self.popover.close() }
+                let parts = id.dropFirst("intake:".count).split(separator: "|").map(String.init)
+                if let key = parts.first { IntakeWindow.show(projectKey: key, workItemId: parts.count > 1 ? parts[1] : nil) }
+                return
+            }
+            if id.hasPrefix("project:") {
+                if self.popover.isShown { self.popover.close() }
+                ItemWindow.show(String(id.dropFirst("project:".count)))
+                return
             }
             self.toggle()
         }
@@ -2346,13 +2421,11 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         vc.projectView = projectView
         vc.assignedOnly = projectAssignedOnly
         vc.unreadOnly = projectUnreadOnly
-        vc.expandedItem = pendingProjectItem ?? expandedItem
+        vc.expandedItem = expandedItem
         vc.selectedProject = selectedProject
         vc.statusFilter = projectStatusFilter
         vc.showAllProjects = projectShowAll
         vc.projectQuery = projectQuery
-        if pendingProjectItem != nil { selectedTab = .projects; vc.selectedTab = .projects }
-        pendingProjectItem = nil
         return vc
     }
 
@@ -2439,7 +2512,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             case .actions:
                 self.popover.contentViewController = ActionsSettingsVC(catalog: self.catalog, picked: Set(PICKED_REPOS), orgs: Set(PICKED_ORGS))
             case .projects:
-                self.popover.contentViewController = ProjectSettingsVC(catalog: self.projectCatalog, store: self.projectStore, cfg: PROJECTS_CFG)
+                self.popover.contentViewController = ProjectSettingsVC(catalog: self.projectCatalog, store: self.projectStore, accounts: self.planeAccounts, cfg: PROJECTS_CFG)
             case .ai:
                 self.popover.contentViewController = AISettingsVC()
             case .live:
@@ -2494,8 +2567,8 @@ extension GHActionsBar: RelaySink {
         }
     }
 
-    func relayProjectRefresh(projectNodeIds: [String], issues: [(repo: String, number: Int)], done: @escaping (Bool) -> Void) {
-        projectStore.refreshForEvents(projectNodeIds: projectNodeIds, issues: issues, done: done)
+    func relayProjectRefresh(_ events: [(workspace: String, project: String?)], done: @escaping (Bool) -> Void) {
+        projectStore.refreshForEvents(events, done: done)
     }
 
     func relayStateChanged() {

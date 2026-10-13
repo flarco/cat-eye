@@ -31,6 +31,29 @@ async function webhook(kind, payload, { secret = "test-secret", id } = {}) {
   });
 }
 
+const PLANE_SECRET = "plane_wh_test_secret_0123456789";
+
+async function planeHook(workspace, payload, { secret = PLANE_SECRET, event = "workitem.updated", prefix = "" } = {}) {
+  const body = JSON.stringify(payload);
+  return call(`/plane/${workspace}`, {
+    method: "POST",
+    body,
+    headers: {
+      "x-plane-event": event,
+      "x-plane-delivery": `pd-${++delivery}`,
+      "x-plane-signature": prefix + (await sign(secret, body)).slice(7),
+    },
+  });
+}
+
+const planeItem = (eventId, extra = {}) => ({
+  version: "v2", event_id: eventId, entity_type: "issue", entity_id: "11111111-1111-1111-1111-111111111111",
+  event: "WebhookScope.ScopeChoices.WORKITEM_UPDATED",
+  data: { project_id: "22222222-2222-2222-2222-222222222222", name: "hidden-title", description_html: "<p>hidden-body</p>" },
+  previous_attributes: { priority: "none" },
+  ...extra,
+});
+
 const runEvent = (repo, id = 1, action = "completed") => ({
   action,
   repository: { full_name: repo },
@@ -41,7 +64,7 @@ const hub = () => env.HUB.get(env.HUB.idFromName("hub"));
 
 beforeEach(() =>
   runInDurableObject(hub(), (obj) => {
-    obj.sql.exec("DELETE FROM events; DELETE FROM devices; DELETE FROM hooks; DELETE FROM org_hooks; DELETE FROM config");
+    obj.sql.exec("DELETE FROM events; DELETE FROM devices; DELETE FROM hooks; DELETE FROM plane_hooks; DELETE FROM config");
   }));
 afterEach(() => vi.restoreAllMocks());
 
@@ -82,42 +105,13 @@ describe("webhook", () => {
     expect(JSON.stringify(body)).not.toContain("secret");
   });
 
-  it("accepts an org event without a repository", async () => {
+  it("ignores GitHub project events", async () => {
     const r = await webhook("projects_v2_item", {
       action: "edited",
       organization: { login: "Acme" },
       projects_v2_item: { node_id: "PVTI_1", project_node_id: "PVT_9" },
     });
-    expect(r.status).toBe(202);
-    const body = await (await authed("/v1/events?after=0")).json();
-    expect(body.events.at(-1)).toMatchObject({
-      repo: "", org: "acme", kind: "projects_v2_item", projectId: "PVT_9", itemId: "PVTI_1", issueNumber: null,
-    });
-  });
-
-  it("stores no text from a projects_v2_item payload", async () => {
-    await webhook("projects_v2_item", {
-      action: "edited",
-      organization: { login: "Acme" },
-      sender: { login: "hidden-user" },
-      projects_v2_item: {
-        node_id: "PVTI_1",
-        project_node_id: "PVT_9",
-        content_title: "hidden-title",
-        content_body: "hidden-body",
-      },
-    }, { id: "proj-text" });
-    const body = await (await authed("/v1/events?after=0")).json();
-    const row = body.events.find((e) => e.deliveryId === "proj-text");
-    const stored = await runInDurableObject(hub(), (obj) =>
-      JSON.stringify(obj.sql.exec("SELECT * FROM events WHERE delivery_id = 'proj-text'").toArray()));
-    expect(JSON.stringify(row)).not.toContain("hidden-title");
-    expect(JSON.stringify(row)).not.toContain("hidden-body");
-    expect(JSON.stringify(row)).not.toContain("hidden-user");
-    expect(stored).not.toContain("hidden-title");
-    expect(stored).not.toContain("hidden-body");
-    expect(stored).not.toContain("hidden-user");
-    expect((await (await authed("/v1/health")).json()).projectEventsToday).toBeGreaterThan(0);
+    expect(r.status).toBe(204);
   });
 
   it("never logs the body", async () => {
@@ -134,7 +128,7 @@ describe("auth", () => {
   const routes = [
     ["GET", "/v1/events"], ["POST", "/v1/ack"], ["PUT", "/v1/devices/self"], ["DELETE", "/v1/devices/AAAA"],
     ["GET", "/v1/health"], ["PUT", "/v1/config"], ["GET", "/v1/webhook-secret"], ["PUT", "/v1/hooks/o/r"],
-    ["PUT", "/v1/org-hooks/acme"], ["GET", "/v1/connect"],
+    ["PUT", "/v1/plane-hooks/acme"], ["GET", "/v1/connect"],
   ];
   for (const [method, path] of routes) {
     it(`${method} ${path} needs a token`, async () => {
@@ -144,7 +138,7 @@ describe("auth", () => {
   }
 
   it("serves the discovery route without auth", async () => {
-    expect(await (await call("/")).json()).toEqual({ app: "cat-eye-relay", version: "2" });
+    expect(await (await call("/")).json()).toEqual({ app: "cat-eye-relay", version: "3" });
   });
 
   it("returns the webhook secret to a device", async () => {
@@ -189,23 +183,17 @@ describe("devices and events", () => {
     expect(health.devices.some((d) => d.id === "BBBB")).toBe(false);
   });
 
-  it("filters org events by the orgs of the device", async () => {
-    await putJSON("/v1/devices/self", { name: "A", repos: ["o/a"], orgs: ["Acme"] }, "token-a");
+  it("filters Plane events by the workspaces of the device", async () => {
+    await putJSON("/v1/plane-hooks/acme", { hookId: "h-1", secret: PLANE_SECRET });
+    await putJSON("/v1/devices/self", { name: "A", repos: ["o/a"], orgs: ["plane:Acme"] }, "token-a");
     await putJSON("/v1/devices/self", { name: "B", repos: ["o/b"], orgs: [] }, "token-b");
-    await webhook("projects_v2_item", {
-      action: "edited",
-      organization: { login: "Acme" },
-      projects_v2_item: { node_id: "PVTI_1", project_node_id: "PVT_9" },
-    });
+    await planeHook("acme", planeItem("e-filter"));
     await webhook("workflow_run", runEvent("o/b", 2));
-    await webhook("issues", { action: "opened", organization: { login: "Acme" }, repository: { full_name: "Acme/App" }, issue: { number: 4, title: "hidden-title" } });
     const a = await (await authed("/v1/events?after=0", "token-a")).json();
     const b = await (await authed("/v1/events?after=0", "token-b")).json();
-    expect(a.events.map((e) => e.kind)).toEqual(["projects_v2_item", "issues"]);
-    expect(a.events[1]).toMatchObject({ repo: "acme/app", org: "acme", issueNumber: 4 });
-    expect(JSON.stringify(a)).not.toContain("hidden-title");
+    expect(a.events.map((e) => e.kind)).toEqual(["plane"]);
     expect(b.events.map((e) => e.repo)).toEqual(["o/b"]);
-    expect((await (await authed("/v1/health")).json()).devices.find((d) => d.id === "AAAA").orgs).toEqual(["acme"]);
+    expect((await (await authed("/v1/health")).json()).devices.find((d) => d.id === "AAAA").orgs).toEqual(["plane:acme"]);
   });
 
   it("records hooks", async () => {
@@ -216,12 +204,15 @@ describe("devices and events", () => {
     expect((await (await authed("/v1/health")).json()).hooks).toEqual([]);
   });
 
-  it("records org hooks", async () => {
-    await putJSON("/v1/org-hooks/Acme", { hookId: 7 });
+  it("records Plane hooks without the secret in health", async () => {
+    expect((await putJSON("/v1/plane-hooks/Acme", { hookId: 7, secret: PLANE_SECRET })).status).toBe(400);
+    expect((await putJSON("/v1/plane-hooks/Acme", { hookId: "h-7", secret: "short" })).status).toBe(400);
+    await putJSON("/v1/plane-hooks/Acme", { hookId: "h-7", secret: PLANE_SECRET });
     const health = await (await authed("/v1/health")).json();
-    expect(health.orgHooks).toContainEqual({ org: "acme", hookId: 7, lastDelivery: null });
-    await authed("/v1/org-hooks/acme", "token-a", { method: "DELETE" });
-    expect((await (await authed("/v1/health")).json()).orgHooks).toEqual([]);
+    expect(health.planeHooks).toEqual([{ workspace: "acme", hookId: "h-7", lastDelivery: null }]);
+    expect(JSON.stringify(health)).not.toContain(PLANE_SECRET);
+    await authed("/v1/plane-hooks/acme", "token-a", { method: "DELETE" });
+    expect((await (await authed("/v1/health")).json()).planeHooks).toEqual([]);
   });
 
   it("migrates an old events table twice and still reads its rows", async () => {
@@ -246,7 +237,7 @@ describe("devices and events", () => {
     const row = body.events.find((e) => e.deliveryId === "legacy");
     expect(row).toMatchObject({
       repo: "o/legacy", kind: "workflow_run", action: "completed",
-      org: null, projectId: null, itemId: null, issueNumber: null,
+      org: null, projectId: null, itemId: null,
     });
   });
 });
@@ -291,5 +282,60 @@ describe("websocket", () => {
     expect(got[0]).toBe("pong");
     expect(got[1].type).toBe("poke");
     ws.close();
+  });
+});
+
+describe("plane webhook", () => {
+  beforeEach(() => putJSON("/v1/plane-hooks/acme", { hookId: "h-1", secret: PLANE_SECRET }));
+
+  it("stores IDs only and answers 200", async () => {
+    const r = await planeHook("acme", planeItem("e-1"));
+    expect(r.status).toBe(200);
+    const body = await (await authed("/v1/events?after=0")).json();
+    expect(body.events.at(-1)).toMatchObject({
+      deliveryId: "plane:e-1", repo: "", org: "plane:acme", kind: "plane", action: "workitem.updated",
+      projectId: "22222222-2222-2222-2222-222222222222", itemId: "11111111-1111-1111-1111-111111111111",
+    });
+    const stored = await runInDurableObject(hub(), (obj) => JSON.stringify(obj.sql.exec("SELECT * FROM events").toArray()));
+    expect(stored).not.toContain("hidden-title");
+    expect(stored).not.toContain("hidden-body");
+    const health = await (await authed("/v1/health")).json();
+    expect(health.projectEventsToday).toBe(1);
+    expect(health.planeHooks[0].lastDelivery).toBeGreaterThan(0);
+  });
+
+  it("accepts a sha256= prefix and data as a JSON string", async () => {
+    const payload = planeItem("e-2", { data: JSON.stringify({ project_id: "p-str" }) });
+    expect((await planeHook("acme", payload, { prefix: "sha256=", event: "workitem.comment.created" })).status).toBe(200);
+    const body = await (await authed("/v1/events?after=0")).json();
+    expect(body.events.at(-1)).toMatchObject({ projectId: "p-str", action: "workitem.comment.created" });
+  });
+
+  it("uses the entity id of a project event as the project", async () => {
+    await planeHook("acme", { event_id: "e-3", entity_type: "project", entity_id: "p-9", data: {} }, { event: "project.updated" });
+    const body = await (await authed("/v1/events?after=0")).json();
+    expect(body.events.at(-1)).toMatchObject({ projectId: "p-9", itemId: null });
+  });
+
+  it("drops a repeated event id", async () => {
+    await planeHook("acme", planeItem("e-4"));
+    expect((await planeHook("acme", planeItem("e-4"))).status).toBe(200);
+    const body = await (await authed("/v1/events?after=0")).json();
+    expect(body.events.filter((e) => e.deliveryId === "plane:e-4")).toHaveLength(1);
+  });
+
+  it("rejects a bad signature and an unknown workspace", async () => {
+    expect((await planeHook("acme", planeItem("e-5"), { secret: "wrong-secret-0123456789" })).status).toBe(401);
+    expect((await call("/plane/acme", { method: "POST", body: "{}" })).status).toBe(401);
+    expect((await planeHook("other", planeItem("e-6"))).status).toBe(404);
+    const body = await (await authed("/v1/events?after=0")).json();
+    expect(body.events).toHaveLength(0);
+  });
+
+  it("never logs the body", async () => {
+    const spies = ["log", "info", "warn", "error", "debug"].map((m) => vi.spyOn(console, m));
+    await planeHook("acme", planeItem("e-7"));
+    const out = spies.flatMap((s) => s.mock.calls.flat()).join(" ");
+    expect(out).not.toContain("hidden-title");
   });
 });

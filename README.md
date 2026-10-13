@@ -1,6 +1,6 @@
 # Cat Eye — GitHub Actions & PR Monitor for macOS
 
-> A lightweight, native macOS menu bar app for monitoring GitHub Actions, pull request reviews, Projects, and weekly CI health. Open source, about 1.3 MB, accessible, zero Electron.
+> A lightweight, native macOS menu bar app for monitoring GitHub Actions, pull request reviews, Plane projects, and weekly CI health. Open source, about 1.3 MB, accessible, zero Electron.
 
 The octocat's eye never blinks.
 
@@ -35,24 +35,36 @@ Cat Eye is built on three principles:
 - **Safe input** — popover won't dismiss while you're typing a comment
 
 ### Projects Tab
-- **Boards you already use** — GitHub Projects (v2) from your user account and from your organizations, in one tab
+- **Plane projects** — the work items of your [Plane](https://plane.so) projects, in one tab. The layers are workspace → project → work item
+- **Many workspaces** — add each workspace with its own token in Settings → Projects. Plane Cloud and self-hosted Plane both work
 - **By project or activity** — status chips and a stacked bar per project, or a feed of what changed
-- **Item preview** — status, fields, assignees, and the latest comment. Expand a row for the timeline
-- **Change it in place** — set the status, edit the title and description, or comment, without leaving the menu bar
-- **New item** — click **+** next to the filter, or press ⌘N. Make a draft, or an issue in a repo. Set the status and the other single-select fields
-- **Start** — ▶ Start sets the first "in progress" status and assigns you
+- **Item preview** — the key (for example `ENG-12`), a status chip, priority, assignees, and the latest comment
+- **Sort order** — In progress, In review and Blocked items come first. Then Todo and Backlog items. Done and Cancelled items come last. In each state, the order is Urgent, High, Medium, Low, then no priority
+- **Item window** — click a row to open the item in a separate window. The window shows the breadcrumb, the full title and a row of chips: status, priority, labels and assignees. Click a chip to change the value. **▶ Start** sets In progress and assigns you
+- **Tabs** — **Overview** shows the description and the details. A long description stops after some lines: click **Show more**. **Sub-items** shows a progress ring and the sub-items. Click a sub-item to open it in the same window. **‹ KEY** or Esc goes back. **Activity** shows the comment box, the comments and the changes, newest first
+- **Markdown** — the description shows as rendered Markdown, with tables and syntax highlight for code blocks. The switch at the top right of the description shows the Markdown source (**Code**). Comments show bold, code, links and bullets. Images in a description show in the window
+- **Sub-items** — the list shows only top-level items. A ring and a count such as `3/5` show the done sub-items of an item. The ring is blue while sub-items are open, and green when all are done. To also list sub-items as rows, turn on Settings → Projects → "List sub-items as rows"
+- **Change it in place** — set the status, priority, labels and assignees, edit the title and description (**Edit**, ⌘↩ saves, Esc cancels), or comment. Cat Eye changes Markdown to Plane rich text and back. Plane often does not record the new status of a change. Cat Eye then shows the status from the next change, or the status now
+- **New item** — click **+** next to the filter, or press ⌘N. Set the state and the priority
 - **Copy for agent** — copies the item as Markdown: title, facts, link, description and all comments. Paste it into a coding agent
 - **Fold and reorder** — click a project header to fold it. A folded header shows one number: the items that are not done. Drag the grip to change the order
 - **Hide Done items** — Settings → Projects → "Hide Done items" is Always, older than 1, 7 or 30 days, or Never. The default is older than 1 day
 - **Filter** — press ⌘F and type. The filter looks in titles and descriptions. Esc clears it
 - **Quick capture** — press ⌃⌥N in any app. Cat Eye opens New item with the clipboard text. Change the shortcut in Settings → Projects
-- **macOS notifications** — mentions, comments, status, assignment, and closed items. "My items" means you are an assignee or the author. Your own comments are skipped
-- **Two update sources** — an org project with an org webhook and live updates on is **Live**. A personal project, an org project without a webhook, or the relay off is **Polled**
+- **Intake** — each project header shows two number chips: the items that are not done, and a purple chip such as `⇣ 38` for the intake items that wait for triage. A project with no items or no intake shows 0. Click the intake chip to open the intake window. Each row shows the key, for example `TREBI-264`. Type in the filter field (⌘F) to find titles or keys. Click an item to see its description and images. **‹ Intake** or Esc goes back to the list. ↑ and ↓ go to the previous and next item. **Accept** makes the item a work item. **Decline** asks first, then closes the item. The **…** menu has **Snooze** (1 day to 1 month), **Mark as duplicate**, **Copy work item link** and **Delete**
+- **Progress bar** — each project header shows a bar of its items by status. A project without items shows an empty bar
+- **macOS notifications** — mentions, comments, status, assignment, closed items, and intake items that are new, changed or closed. "My items" means you are an assignee or the author. Your own comments are skipped
+- **Two update sources** — a workspace with a Plane webhook and live updates on is **Live**. A workspace without a webhook, or the relay off, is **Polled**
 - **Poll interval** — Settings → Projects → "Poll projects without live updates every" is 2, 5, 10, 15, or 30 minutes. The default is 5. Live projects use the same interval only while the relay is disconnected
 
-GitHub sends `projects_v2_item` only to organization webhooks, so a personal project cannot be live. The relay still stores only IDs: project and item node ids, and issue numbers. No titles, bodies, or user names.
+To add a workspace:
 
-The Projects tab needs the `project` scope (`gh auth refresh -s project`). To make issues, `gh` also needs the `repo` scope. Adding org webhooks also needs `admin:org_hook`, and you must be an owner of that org. If you are not, those projects stay on the poll and the live-updates panel says "Not an org owner".
+1. In Plane, open Profile settings → Personal access tokens and make a token. A token works only in its own workspace.
+2. In Cat Eye, open Settings → Projects → Plane workspaces.
+3. Type the workspace slug (the first part of the Plane URL) and the token. For a self-hosted Plane, change the host.
+4. Click **Test & Add**. Cat Eye reads your user and the projects, and saves the token only if both work.
+
+Cat Eye keeps the tokens in the Keychain, one for each workspace. A Plane webhook needs a workspace admin. If you are not an admin, the workspace stays on the poll and the live-updates panel says "Not a workspace admin".
 
 ### AI (optional)
 AI helps in New item and in the editor. It is off until you set it up. Go to **Settings → AI**:
@@ -201,10 +213,12 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
         "other": true
     },
     "projects": {
-        "picked": ["myorg/4"],
+        "workspaces": [{ "slug": "acme", "host": "https://api.plane.so" }],
+        "picked": ["acme/9e6e2e1d-7721-4957-967e-601332a1ad47"],
+        "allOf": [],
         "pollMinutes": 5,
         "showTab": true,
-        "order": ["myorg/4"],
+        "order": [],
         "folded": [],
         "capture": { "enabled": true, "keyCode": 45, "modifiers": 6144, "pasteClipboard": true, "aiTitle": true }
     },
@@ -230,13 +244,15 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `autoUpdate` | `true` | Install new releases automatically, written by **Settings → Updates** |
 | `notifications` | all `true` | macOS notification switches in **Settings → Notifications**. `failed` includes timeouts and startup failures; `other` covers skipped and other completed conclusions |
 | `relay` | none | Live updates settings, written by **Settings → Live updates** (see below) |
-| `projects.picked` | `[]` | Projects to track, as `owner/number` (for example `myorg/4`) |
-| `projects.allOf` | `[]` | Owners whose projects are all tracked, including ones they add later |
+| `projects.workspaces` | `[]` | Plane workspaces: `slug` and `host`. The tokens are in the Keychain. Add them in Settings → Projects |
+| `projects.picked` | `[]` | Projects to track, as `slug/project-uuid` |
+| `projects.allOf` | `[]` | Workspace slugs whose projects are all tracked, including ones added later |
 | `projects.pollMinutes` | `5` | How often to poll projects that are not live. One of 2, 5, 10, 15, 30 |
 | `projects.showTab` | `true` | Show the Projects tab |
 | `projects.hideDoneAfterDays` | `1` | Hide Done items older than this many days. `-1` always hides them. `0` never hides them |
-| `projects.order` | `[]` | The project order, written when you drag a header. Projects not in the list come after, by owner and title |
+| `projects.order` | `[]` | The project order, written when you drag a header. Projects not in the list come after, by workspace and title |
 | `projects.folded` | `[]` | Folded projects |
+| `projects.showSubItems` | `false` | List sub-items as rows. When it is off, the list shows top-level items only, with a sub-item ring |
 | `projects.capture` | on, ⌃⌥N | Quick capture: `enabled`, the Carbon `keyCode` and `modifiers`, `pasteClipboard` and `aiTitle`. Set it in Settings → Projects |
 | `ai` | off | AI settings, written by **Settings → AI**. The API key is in the Keychain |
 
@@ -260,13 +276,15 @@ Set it up from **Settings → Live updates → Set up**. The panel does these st
 6. Install a webhook on each tracked repo (`gh` must have admin access to the repo; other repos stay on polling).
 7. Connect.
 
-Organization projects need a separate org webhook. **Settings → Live updates → Org webhooks** shows one row per org that owns a tracked project. **Add project events** installs it. That needs `admin:org_hook` and the org owner role. Personal projects have no webhook path: they poll every `pollMinutes` (5 by default). The same note in that section links to Settings → Projects.
+Each Plane workspace gets one webhook to `https://<worker>/plane/<slug>`. **Settings → Live updates → Plane webhooks** shows one row per workspace. Cat Eye adds the webhook when you add a workspace, and deletes it when you remove the workspace. The relay keeps the secret of each webhook and checks the `X-Plane-Signature` of each delivery. A workspace without a webhook polls every `pollMinutes` (5 by default). Note: Plane sends no webhook event for changes made through its v1 API. Cat Eye refreshes after its own changes. Plane has no intake webhook events. An intake item is also a work item, so its changes come as work item events. Cat Eye then reads the intake list again.
+
+**Relay updates:** at launch, and when you open Settings → Live updates, Cat Eye compares the relay version with the version in the app. If the relay is older and wrangler is logged in, Cat Eye deploys the new relay, joins this Mac again and adds the Plane webhooks. Relay v3 removes the GitHub org webhooks of older relays. Cat Eye deletes those webhooks on GitHub. This needs the `admin:org_hook` scope. If `gh` does not have it, run `gh auth refresh -h github.com -s admin:org_hook`. Cat Eye then deletes the webhooks at the next launch.
 
 On a second Mac, log in to the same Cloudflare account and click **Set up**. It joins the same relay. You do not need a pairing code.
 
 - **Cost:** the Cloudflare free plan is enough for up to about 1,000 events per hour.
 - **Retention:** the relay keeps events for 24 hours by default (1 hour to 30 days). A Mac that was offline reads the events it missed. After a longer gap, it does one full refresh.
-- **Privacy:** the relay keeps only repo names, org logins, event types and IDs (run, job, pull request, project, item, issue number). It does not log payloads, titles, bodies, or user names. Each webhook is verified with an HMAC secret.
+- **Privacy:** the relay keeps only repo names, Plane workspace slugs, event types and IDs (run, job, pull request, project, work item). It does not log payloads, titles, bodies, or user names. Each webhook is verified with an HMAC secret.
 - **Remove:** **Remove relay…** deletes the webhooks, the Worker and the Keychain items.
 
 The Worker source is in [`worker/`](worker/).
@@ -295,6 +313,8 @@ xcode-select --install
 ./build.sh
 ```
 
+The Markdown renderer uses [markdown-it](https://github.com/markdown-it/markdown-it) and [highlight.js](https://highlightjs.org) in a `WKWebView`. The files are in [`assets/markdown/`](assets/markdown/), and `build.sh` copies them into the app. The app does not load them from the network.
+
 ## How it works
 
 - Uses the `gh` CLI under the hood — no API tokens to manage, no OAuth flows. If `gh auth status` works, Cat Eye works.
@@ -302,7 +322,7 @@ xcode-select --install
 - The 10-second poll runs only while the popover is open. Closed, Cat Eye falls back to the normal interval — measured on a real machine, that took a long CI run from 1,148 GitHub API calls/hour down to 382.
 - PR actions (approve, comment, merge, close) call `gh pr review`, `gh pr comment`, `gh pr merge`, and `gh pr close` respectively.
 - With live updates on, a workflow or pull request event refreshes only the repo it is about. A project event refreshes the matching project. The footer dot shows the relay state (green = live, grey = polling, orange = relay error). The footer also shows the REST and GraphQL quotas side by side.
-- Project snapshots come from `gh api graphql`. The first snapshot of a project creates no activity, so launch stays quiet.
+- Project snapshots come from the Plane REST API (`/api/v1`, with the `X-Api-Key` header). Cat Eye reads comments only for items with new activity. The first snapshot of a project creates no activity, so launch stays quiet.
 - Runs as a macOS accessory app (no Dock icon, no Cmd+Tab entry).
 - Notifications use the native `UserNotifications` framework — respects Do Not Disturb and Focus modes.
 
@@ -329,11 +349,12 @@ A small blue dot on the icon means a tracked project has unread activity. The CI
 | "Not authenticated" error | Run `gh auth login` in Terminal, or click Login in Settings |
 | "No access" or a 404 from `gh` | The token expired or lost a scope. GitHub answers 404, not 401, for a private repo it cannot see — run `gh auth login` |
 | No PRs showing | The PR tab only shows PRs where **your review is requested** — not all open PRs |
-| Projects tab asks for the project scope | Run `gh auth refresh -s project`, or click Grant access in the tab |
-| Org project stays on polling | GitHub has no webhook for personal projects. For an org, you must be an owner and grant `admin:org_hook` |
+| "Plane does not accept the token" | The token is not for that workspace, or it expired. Make a new token in that workspace |
+| A workspace stays on polling | A Plane webhook needs a workspace admin. Also check that the relay is up to date |
+| "Run: gh auth refresh -h github.com -s admin:org_hook" in the log | Cat Eye cannot delete the GitHub org webhooks of an old relay. Run that command. Cat Eye deletes them at the next launch |
 | Quick capture shortcut does nothing | Another app has the shortcut. Settings → Projects shows the error. Record a different shortcut |
 | AI switch is disabled | Click Test in Settings → AI. A change to the format, URL, model or key needs a new test |
-| Popover closes while typing | Expand a PR first — this switches to semitransient mode |
+| Popover closes while typing | Expand a PR or open an item first — this switches to semitransient mode |
 | Config changes not taking effect | Click "Save & Apply" in Settings — no restart needed |
 | Build fails | Ensure Xcode Command Line Tools are installed: `xcode-select --install` |
 

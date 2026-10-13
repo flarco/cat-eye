@@ -1,11 +1,10 @@
 import Cocoa
 
-// Settings → General: account, scopes, which tabs are shown, and updates.
+// Settings → General: account, which tabs are shown, and updates.
 final class GeneralSettingsVC: NSViewController {
     let catalog: RepoCatalog
     let updater: Updater
     var statusLabel: NSTextField?
-    var scopeLabel: NSTextField?
     var updateLabel: NSTextField?
     var updateBtn: NSButton?
     var observer: NSObjectProtocol?
@@ -43,23 +42,6 @@ final class GeneralSettingsVC: NSViewController {
         logout.frame = NSRect(x: w - 88, y: 10, width: 64, height: 24)
         acc.addSubview(logout)
         container.addSubview(acc); y += 40
-        container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
-
-        container.addSubview(SettingsHeader("SCOPES", y: y, w: w)); y += 28
-        let scope = NSTextField(wrappingLabelWithString: "Checking token scopes…")
-        scope.font = .systemFont(ofSize: 11); scope.textColor = .secondaryLabelColor
-        scope.frame = NSRect(x: 16, y: y + 8, width: w - 200, height: 32)
-        container.addSubview(scope); scopeLabel = scope
-        let grant = NSButton(title: "Grant project", target: self, action: #selector(grantProject))
-        grant.bezelStyle = .inline; grant.font = .systemFont(ofSize: 11)
-        grant.frame = NSRect(x: w - 220, y: y + 10, width: 100, height: 22)
-        container.addSubview(grant)
-        let grantOrg = NSButton(title: "Grant org hooks", target: self, action: #selector(grantOrg))
-        grantOrg.bezelStyle = .inline; grantOrg.font = .systemFont(ofSize: 11)
-        grantOrg.frame = NSRect(x: w - 112, y: y + 10, width: 100, height: 22)
-        grantOrg.toolTip = "admin:org_hook, only needed to add organization webhooks"
-        container.addSubview(grantOrg)
-        y += 48
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
         container.addSubview(SettingsHeader("TAB VISIBILITY", y: y, w: w)); y += 28
@@ -114,7 +96,6 @@ final class GeneralSettingsVC: NSViewController {
         }
         updateAuth(); updateUpdater()
         catalog.checkAuth()
-        refreshScopes()
     }
 
     func updateAuth() {
@@ -134,22 +115,6 @@ final class GeneralSettingsVC: NSViewController {
         updateLabel?.textColor = { if case .failed = updater.state { return NSColor.systemRed }; return .secondaryLabelColor }()
         updateBtn?.title = { if case .ready = updater.state { return "Restart now" }; return "Check now" }()
         updateBtn?.isEnabled = !updater.busy
-    }
-
-    func refreshScopes() {
-        DispatchQueue.global(qos: .utility).async {
-            let scopes = ProjectAPI().scopes()
-            DispatchQueue.main.async { [weak self] in
-                let app = NSApp.delegate as? GHActionsBar
-                app?.ghScopes = scopes
-                app?.scopesKnown = true
-                let hasProject = scopes.contains("project") || scopes.contains("read:project")
-                let hasOrg = scopes.contains("admin:org_hook")
-                let project = scopes.isEmpty ? "project scope: unknown (fine-grained token, or not signed in)" : (hasProject ? "project scope: granted" : "project scope: missing")
-                let org = scopes.isEmpty ? "" : (hasOrg ? " · org hooks: granted" : " · org hooks: not granted")
-                self?.scopeLabel?.stringValue = project + org
-            }
-        }
     }
 
     @objc func toggleTab(_ sender: NSButton) {
@@ -178,6 +143,4 @@ final class GeneralSettingsVC: NSViewController {
     }
     @objc func doLogin() { runInTerminal("gh auth login --web -p https") }
     @objc func doLogout() { runInTerminal("gh auth logout") }
-    @objc func grantProject() { runInTerminal("gh auth refresh -s project") }
-    @objc func grantOrg() { runInTerminal("gh auth refresh -s admin:org_hook") }
 }

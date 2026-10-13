@@ -1,31 +1,27 @@
 import Foundation
 
 // ─── Project model ───────────────────────────────────────────────────────────
-// Snapshots are local. GitHub's GraphQL API has no item history, so the store
+// Layers: Plane workspace → project → work item. Snapshots are local. The store
 // diffs two snapshots to build the activity feed.
 
 struct ProjectRef: Codable, Hashable {
-    let owner: String
-    let number: Int
+    let workspace: String     // slug
+    let id: String            // project UUID
     var key: String
 
-    init(owner: String, number: Int) {
-        self.owner = owner
-        self.number = number
-        self.key = "\(owner)/\(number)"
+    init(workspace: String, id: String) {
+        self.workspace = workspace
+        self.id = id
+        self.key = "\(workspace)/\(id)"
     }
 }
 
-enum OwnerKind: String, Codable { case user, org }
-
 struct ProjectSummary: Codable, Hashable {
     let ref: ProjectRef
-    let nodeId: String
+    let identifier: String    // "ENG"
     let title: String
     let url: String
-    let closed: Bool
-    let itemCount: Int
-    let ownerKind: OwnerKind
+    let closed: Bool          // archived
 }
 
 enum StatusCategory: String, Codable, CaseIterable {
@@ -53,69 +49,31 @@ enum StatusCategory: String, Codable, CaseIterable {
     }
 }
 
+// A Plane state, or an option of another single-select field (Priority).
 struct StatusOption: Codable, Hashable {
     let id: String
     let name: String
-    let color: String
+    let color: String         // "#F59E0B" or a GitHub-style name
+    var group: String? = nil  // Plane state group: backlog, unstarted, started, completed, cancelled
 
-    // Name match. Custom names still get a color from `color`.
+    // The group decides first. The name splits "started" into review and blocked.
     var category: StatusCategory {
         let n = name.lowercased()
-        if n.contains("done") || n.contains("closed") || n.contains("shipped") { return .done }
-        if n.contains("block") { return .blocked }
-        if n.contains("review") { return .review }
-        if n.contains("progress") || n.contains("doing") { return .progress }
-        return .todo
-    }
-}
-
-enum ItemKind: String, Codable { case issue, pullRequest, draft }
-
-// GitHub's side pane uses the item's numeric id, not the issue URL. The node id
-// is a msgpack array whose last value is that number, so a cached item still copies
-// the right link before the next fetch stores `databaseId`.
-func projectItemDatabaseId(nodeId: String, stored: String? = nil) -> String? {
-    if let stored, !stored.isEmpty { return stored }
-    guard nodeId.hasPrefix("PVTI_") else { return nil }
-    var raw = String(nodeId.dropFirst("PVTI_".count))
-    raw = raw.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-    raw += String(repeating: "=", count: (4 - raw.count % 4) % 4)
-    guard let data = Data(base64Encoded: raw), let first = data.first, first & 0xF0 == 0x90 else { return nil }
-    let count = Int(first & 0x0F)
-    var i = 1
-    var last: UInt64?
-    for _ in 0..<count {
-        guard i < data.count else { return nil }
-        let tag = data[i]
-        i += 1
-        if tag <= 0x7F {
-            last = UInt64(tag)
-        } else if tag == 0xCC, i < data.count {
-            last = UInt64(data[i]); i += 1
-        } else if tag == 0xCD, i + 1 < data.count {
-            last = UInt64(data[i]) << 8 | UInt64(data[i + 1]); i += 2
-        } else if tag == 0xCE, i + 3 < data.count {
-            last = UInt64(data[i]) << 24 | UInt64(data[i + 1]) << 16 | UInt64(data[i + 2]) << 8 | UInt64(data[i + 3])
-            i += 4
-        } else if tag == 0xCF, i + 7 < data.count {
-            var v: UInt64 = 0
-            for b in data[i..<(i + 8)] { v = (v << 8) | UInt64(b) }
-            last = v
-            i += 8
-        } else {
-            return nil
+        switch group {
+        case "completed", "cancelled": return .done
+        case "backlog", "unstarted": return .todo
+        case "started":
+            if n.contains("block") { return .blocked }
+            if n.contains("review") { return .review }
+            return .progress
+        default:
+            if n.contains("done") || n.contains("closed") || n.contains("shipped") { return .done }
+            if n.contains("block") { return .blocked }
+            if n.contains("review") { return .review }
+            if n.contains("progress") || n.contains("doing") { return .progress }
+            return .todo
         }
     }
-    return last.map { String($0) }
-}
-
-func projectItemURL(projectURL: String, nodeId: String, databaseId: String?) -> String? {
-    guard let id = projectItemDatabaseId(nodeId: nodeId, stored: databaseId), !projectURL.isEmpty else { return nil }
-    var base = projectURL
-    if let i = base.firstIndex(of: "?") { base = String(base[..<i]) }
-    if let i = base.firstIndex(of: "#") { base = String(base[..<i]) }
-    while base.hasSuffix("/") { base.removeLast() }
-    return "\(base)/views/1?pane=issue&itemId=\(id)"
 }
 
 struct CommentRef: Codable, Hashable {
@@ -128,53 +86,37 @@ struct CommentRef: Codable, Hashable {
 
 struct ProjectItem: Codable, Hashable {
     let id: String
-    let contentId: String?
-    let kind: ItemKind
+    let key: String           // "ENG-123"
     let title: String
-    let url: String?
-    // Numeric ProjectV2Item id used in the side-pane link. Nil on snapshots fetched before it was stored.
-    let databaseId: String?
-    let repo: String?
-    let number: Int?
-    let state: String?
+    let url: String
     let statusOptionId: String?
     let fields: [String: String]
     let assignees: [String]
     let labels: [String]
     let author: String?
+    let updatedBy: String?
     let updatedAt: Date
-    let commentCount: Int
-    let lastComment: CommentRef?
+    let activityAt: Date      // Plane's last_activity_at. A comment changes it, updated_at stays.
+    var commentCount: Int
+    var lastComment: CommentRef?
     var mentionsMe: Bool
-    var body: String? = nil
-    var creator: String? = nil   // the user who added the item to the project
+    var body: String? = nil   // Markdown
+    var parentId: String? = nil
 
-    // https://github.com/users/flarco/projects/3/views/1?pane=issue&itemId=268087835
-    func paneURL(projectURL: String) -> String? {
-        projectItemURL(projectURL: projectURL, nodeId: id, databaseId: databaseId)
-    }
-
-    func isMine(_ login: String?) -> Bool {
-        guard let me = login?.lowercased(), !me.isEmpty else { return false }
+    func isMine(_ me: String?) -> Bool {
+        guard let me = me?.lowercased(), !me.isEmpty else { return false }
         if author?.lowercased() == me { return true }
         return assignees.contains { $0.lowercased() == me }
     }
 
-    var isClosedState: Bool {
-        let s = (state ?? "").uppercased()
-        return s == "CLOSED" || s == "MERGED"
-    }
-
     // Markdown for a coding agent: title, facts, link, description, comments (oldest first).
     func agentMarkdown(snap: ProjectSnapshot, comments: [CommentRef]) -> String {
-        var facts = ["Project: \(snap.summary.ref.owner)/\(snap.summary.title)"]
+        var facts = ["Project: \(snap.summary.ref.workspace)/\(snap.summary.title)", "Work item: \(key)"]
         facts.append("Status: \(snap.statusName(statusOptionId) ?? "None")")
-        if let repo, let number { facts.append("Issue: \(repo)#\(number)") }
-        if kind == .draft { facts.append("Draft") }
         for (k, v) in fields.sorted(by: { $0.key < $1.key }) where k != "Status" && k != "Title" { facts.append("\(k): \(v)") }
+        if !labels.isEmpty { facts.append("Labels: " + labels.joined(separator: ", ")) }
         if !assignees.isEmpty { facts.append("Assignees: " + assignees.map { "@" + $0 }.joined(separator: ", ")) }
-        var out = "# \(title)\n\n" + facts.joined(separator: " · ") + "\n"
-        if let link = paneURL(projectURL: snap.summary.url) ?? url { out += link + "\n" }
+        var out = "# \(title)\n\n" + facts.joined(separator: " · ") + "\n" + url + "\n"
         let text = (body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         out += "\n" + (text.isEmpty ? "_No description_" : text) + "\n\n## Comments\n"
         if comments.isEmpty { return out + "_None_\n" }
@@ -184,20 +126,29 @@ struct ProjectItem: Codable, Hashable {
         df.dateFormat = "yyyy-MM-dd"
         for c in comments.sorted(by: { $0.createdAt < $1.createdAt }) {
             let lines = (c.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
-            out += "- @\(c.author ?? "ghost") (\(df.string(from: c.createdAt))): " + lines.joined(separator: "\n  ") + "\n"
+            out += "- @\(c.author ?? "someone") (\(df.string(from: c.createdAt))): " + lines.joined(separator: "\n  ") + "\n"
         }
         return out
     }
 
-    // Case-insensitive match on the title and the body. An empty query matches all.
+    // Case-insensitive match on the key, the title and the body. An empty query matches all.
     func matches(_ query: String) -> Bool {
         let q = query.trimmingCharacters(in: .whitespaces)
         if q.isEmpty { return true }
-        return title.localizedCaseInsensitiveContains(q) || (body ?? "").localizedCaseInsensitiveContains(q)
+        return key.localizedCaseInsensitiveContains(q) || title.localizedCaseInsensitiveContains(q)
+            || (body ?? "").localizedCaseInsensitiveContains(q)
     }
 }
 
-// A single-select field of a project, such as Status, Size or Priority.
+// One entry for each item of the project, also for the items that the snapshot does not load.
+struct ItemStub: Codable, Hashable {
+    let id: String
+    let parentId: String?
+    let stateId: String?
+    let activityAt: Date?
+}
+
+// A single-select field of a project: Status (the Plane states) or Priority.
 struct ProjectField: Codable, Hashable {
     let id: String
     let name: String
@@ -205,20 +156,28 @@ struct ProjectField: Codable, Hashable {
 }
 
 struct ProjectSnapshot: Codable {
+    static let statusFieldId = "state"
+    static let priorityFieldId = "priority"
+
     let summary: ProjectSummary
-    let statusFieldId: String?
     let statusOptions: [StatusOption]
     let items: [ProjectItem]
     let fetchedAt: Date
-    var fields: [ProjectField]? = nil
+    var fields: [ProjectField] = []
+    var me: String? = nil     // display name of the token owner
+    var meId: String? = nil
+    var index: [ItemStub]? = nil
+    var intake: [IntakeItem]? = nil   // pending intake items; nil when the project has no intake
+
+    var statusFieldId: String? { statusOptions.isEmpty ? nil : ProjectSnapshot.statusFieldId }
 
     // The number on a folded header.
-    var notDoneCount: Int { items.filter { option($0.statusOptionId)?.category != .done }.count }
+    func notDoneCount(_ list: [ProjectItem]) -> Int { list.filter { option($0.statusOptionId)?.category != .done }.count }
 
-    var counts: [StatusCategory: Int] {
+    func counts(_ list: [ProjectItem]) -> [StatusCategory: Int] {
         var c: [StatusCategory: Int] = [:]
-        for item in items {
-            let cat = statusOptions.first { $0.id == item.statusOptionId }?.category ?? .todo
+        for item in list {
+            let cat = option(item.statusOptionId)?.category ?? .todo
             c[cat, default: 0] += 1
         }
         return c
@@ -227,12 +186,47 @@ struct ProjectSnapshot: Codable {
     func option(_ id: String?) -> StatusOption? { statusOptions.first { $0.id == id } }
     func statusName(_ id: String?) -> String? { option(id)?.name }
 
-    // Status rank first, then title A to Z.
-    var sortedItems: [ProjectItem] {
-        func rank(_ i: ProjectItem) -> Int { i.isClosedState ? StatusCategory.done.rank : (option(i.statusOptionId)?.category ?? .todo).rank }
-        return items.sorted { a, b in
+    // Items without a parent, and sub-items whose parent is not loaded.
+    var rootItems: [ProjectItem] {
+        let ids = Set(items.map(\.id))
+        return items.filter { $0.parentId.map { !ids.contains($0) } ?? true }
+    }
+
+    func listed(subItems: Bool) -> [ProjectItem] { subItems ? items : rootItems }
+
+    func children(of id: String) -> [ProjectItem] { sorted(items.filter { $0.parentId == id }) }
+
+    // Direct sub-items. The index counts also the sub-items that are not loaded.
+    func progress(of id: String) -> (done: Int, total: Int) {
+        let states = index.map { $0.filter { $0.parentId == id }.map(\.stateId) }
+            ?? items.filter { $0.parentId == id }.map(\.statusOptionId)
+        return (states.filter { option($0)?.category == .done }.count, states.count)
+    }
+
+    // Parent first, up to the root.
+    func ancestors(of id: String) -> [String] {
+        var out: [String] = []
+        var next = items.first { $0.id == id }?.parentId
+        while let p = next, !out.contains(p), let item = items.first(where: { $0.id == p }) {
+            out.append(p)
+            next = item.parentId
+        }
+        return out
+    }
+
+    var sortedItems: [ProjectItem] { sorted(items) }
+
+    // Status rank, then priority (Urgent first, none last), then title A to Z.
+    func sorted(_ list: [ProjectItem]) -> [ProjectItem] {
+        func rank(_ i: ProjectItem) -> Int { (option(i.statusOptionId)?.category ?? .todo).rank }
+        func priority(_ i: ProjectItem) -> Int {
+            PlaneClient.priorities.firstIndex { $0.name == i.fields["Priority"] } ?? PlaneClient.priorities.count
+        }
+        return list.sorted { a, b in
             let (ra, rb) = (rank(a), rank(b))
             if ra != rb { return ra < rb }
+            let (pa, pb) = (priority(a), priority(b))
+            if pa != pb { return pa < pb }
             return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
         }
     }
@@ -252,7 +246,9 @@ enum ItemChange: Codable, Hashable {
         case .closed: return "Closed"
         case .reopened: return "Reopened"
         case .mention: return "Mentioned you"
-        case .status(let from, let to): return "Status: \(from ?? "none") → \(to ?? "none")"
+        case .status(let from, let to):
+            if let to, from == to { return "Status: \(to) (set again)" }
+            return "Status: \(from ?? "none") → \(to ?? "none")"
         case .field(let name, let from, let to): return "\(name): \(from ?? "none") → \(to ?? "none")"
         case .assigned(let u): return "Assigned \(u)"
         case .unassigned(let u): return "Unassigned \(u)"
@@ -285,4 +281,53 @@ struct ActivityEntry: Codable, Hashable {
         return ActivityEntry(id: id, projectKey: projectKey, itemId: itemId, change: change,
                              actor: actor, text: change.text, url: url, at: at, unread: true)
     }
+}
+
+// Choices for the label and assignee menus of an item.
+struct ItemOptions {
+    let labels: [StatusOption]
+    let members: [StatusOption]
+}
+
+// A pending item in the intake (triage) queue of a project.
+struct IntakeItem: Codable, Hashable {
+    let id: String
+    let workItemId: String
+    let name: String
+    let priority: String?
+    let createdAt: Date
+    let author: String?
+    let source: String?
+}
+
+// What the user can do with a pending intake item.
+enum IntakeAction {
+    case accept, decline, snooze(until: Date), duplicate(of: String), delete
+
+    // The body for the status endpoint. Delete has its own endpoint.
+    var body: [String: Any]? {
+        switch self {
+        case .accept: return ["status": 1]
+        case .decline: return ["status": -1]
+        case .snooze(let d): return ["status": 0, "snoozed_till": ISO8601DateFormatter().string(from: d)]
+        case .duplicate(let id): return ["status": 2, "duplicate_to": id]
+        case .delete: return nil
+        }
+    }
+
+    var failure: String {
+        switch self {
+        case .accept: return "Could not accept: "
+        case .decline: return "Could not decline: "
+        case .snooze: return "Could not snooze: "
+        case .duplicate: return "Could not mark as duplicate: "
+        case .delete: return "Could not delete: "
+        }
+    }
+}
+
+struct IntakeDetail {
+    let sequence: Int?
+    let body: String        // Markdown
+    let labels: [String]
 }

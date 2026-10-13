@@ -1,23 +1,20 @@
 import Foundation
 
-// macOS notifications for project changes. "My items" means the user is an
+// macOS notifications for project changes. "My items" means the token owner is an
 // assignee or the author. The user's own comments are skipped. Changes to one
 // item inside two minutes become one notification (same id, combined body).
 
 final class ProjectNotifier {
     var now: () -> Date = Date.init
-    private let me: () -> String?
     private let post: (_ title: String, _ subtitle: String, _ body: String, _ id: String) -> Void
     private var window: [String: (body: String, at: Date)] = [:]
 
-    init(me: @escaping () -> String?,
-         post: @escaping (_ title: String, _ subtitle: String, _ body: String, _ id: String) -> Void) {
-        self.me = me
+    init(post: @escaping (_ title: String, _ subtitle: String, _ body: String, _ id: String) -> Void) {
         self.post = post
     }
 
     func handle(_ changes: [(itemId: String, ItemChange)], in snapshot: ProjectSnapshot, settings: ProjectNotificationSettings) {
-        let login = me()
+        let login = snapshot.me
         var byItem: [String: [ItemChange]] = [:]
         for (id, change) in changes {
             if isOwn(change, me: login) { continue }
@@ -28,8 +25,8 @@ final class ProjectNotifier {
         for (id, list) in byItem {
             let item = snapshot.items.first { $0.id == id }
             let text = list.map(\.text).joined(separator: "\n")
-            let title = snapshot.summary.ref.owner + " › " + snapshot.summary.title
-            let subtitle = item?.title ?? "Project item"
+            let title = snapshot.summary.ref.workspace + " › " + snapshot.summary.title
+            let subtitle = item.map { "\($0.key) \($0.title)" } ?? "Work item"
             let stamp = now()
             let body: String
             if let prev = window[id], stamp.timeIntervalSince(prev.at) < 120 {
@@ -40,6 +37,13 @@ final class ProjectNotifier {
                 window[id] = (body, stamp)
             }
             post(title, subtitle, body, "project:\(id)")
+        }
+    }
+
+    func intake(_ lines: [(IntakeItem, String)], in snapshot: ProjectSnapshot) {
+        let title = snapshot.summary.ref.workspace + " › " + snapshot.summary.title
+        for (item, text) in lines {
+            post(title, item.name, text, "intake:\(snapshot.summary.ref.key)|\(item.workItemId)")
         }
     }
 

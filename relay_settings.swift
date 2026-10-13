@@ -20,6 +20,7 @@ final class RelaySettingsVC: NSViewController {
     var unitDraft: Int?
     var checked = false
     var autoSetup = false
+    var triedUpdate = false
     var lastHealthCheck = Date.distantPast
 
     init(deployer: RelayDeployer, client: RelayClient) {
@@ -75,11 +76,17 @@ final class RelaySettingsVC: NSViewController {
         checked = true
         if deployer.state.joined && !lastHealthCheckRecent {
             deployer.checkHooks(repos: REPOS)
-            deployer.checkOrgHooks(orgs: (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? [])
+            deployer.checkPlaneHooks((NSApp.delegate as? GHActionsBar)?.trackedPlaneWorkspaces() ?? [])
             lastHealthCheck = Date()
         }
         rebuild()
-        if autoSetup { runNext() }
+        if autoSetup { runNext(); return }
+        // An old relay updates as soon as this Mac can deploy.
+        let s = deployer.state
+        if !triedUpdate, s.relayVersion != nil, s.needsRelayUpdate, isDone(.login), deployer.busy == nil {
+            triedUpdate = true
+            run(.relay)
+        }
     }
 
     var lastHealthCheckRecent: Bool { Date().timeIntervalSince(lastHealthCheck) < 5 }
@@ -117,7 +124,11 @@ final class RelaySettingsVC: NSViewController {
                 rebuild()
             }
         case .relay:
-            d.perform(d.state.relayVersion == nil ? "Deploy relay" : "Update relay", d.deploy, then: after)
+            if d.state.relayVersion == nil {
+                d.perform("Deploy relay", d.deploy, then: after)
+            } else {
+                d.perform(d.state.needsRelayUpdate ? "Update relay" : "Redeploy relay", d.updateRelay, then: after)
+            }
         case .join:
             d.perform("Join this Mac", d.joinThisMac) { [weak self] ok in
                 if ok { RELAY.enabled = true; saveConfig(); self?.client.start() }
@@ -125,14 +136,14 @@ final class RelaySettingsVC: NSViewController {
             }
         case .hooks:
             let repos = REPOS
-            let orgs = (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? []
+            let slugs = (NSApp.delegate as? GHActionsBar)?.trackedPlaneWorkspaces() ?? []
             d.perform("Install webhooks", {
                 let reposOK = d.installHooks(repos: repos)
-                let orgsOK = orgs.isEmpty || d.installOrgHooks(orgs: orgs)
-                return reposOK && orgsOK
+                let planeOK = slugs.isEmpty || d.installPlaneHooks(slugs)
+                return reposOK && planeOK
             }) { ok in
                 d.checkHooks(repos: repos)
-                d.checkOrgHooks(orgs: orgs)
+                d.checkPlaneHooks(slugs)
                 after(ok)
             }
         case .live:
@@ -187,14 +198,14 @@ final class RelaySettingsVC: NSViewController {
                 y += 6
             }
 
-            let orgs = (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? []
-            if s.joined || !orgs.isEmpty {
-                y = section("ORG WEBHOOKS", y: y, buttons: [("Check again", #selector(checkOrgHooks))],
-                            enabled: [deployer.busy == nil && s.joined && !orgs.isEmpty])
-                if orgs.isEmpty {
-                    y = line("Track an organization project to add org webhooks.", y: y)
+            let slugs = (NSApp.delegate as? GHActionsBar)?.trackedPlaneWorkspaces() ?? []
+            if s.joined || !slugs.isEmpty {
+                y = section("PLANE WEBHOOKS", y: y, buttons: [("Check again", #selector(checkPlaneHooks))],
+                            enabled: [deployer.busy == nil && s.joined && !slugs.isEmpty])
+                if slugs.isEmpty {
+                    y = line("Track a Plane project to add a workspace webhook.", y: y)
                 } else {
-                    for org in orgs { y = orgRow(org, y: y) }
+                    for slug in slugs { y = planeRow(slug, y: y) }
                 }
                 y = pollNote(y)
                 y += 6
@@ -379,21 +390,21 @@ final class RelaySettingsVC: NSViewController {
         SetupStep.allCases.filter { $0.rawValue < step.rawValue }.allSatisfy { isDone($0) || $0 == .hooks }
     }
 
-    func orgRow(_ org: String, y: CGFloat) -> CGFloat {
-        let st = deployer.hooks.statuses["org:\(org)"] ?? .unknown
+    func planeRow(_ slug: String, y: CGFloat) -> CGFloat {
+        let st = deployer.hooks.statuses[HookManager.planeKey(slug)] ?? .unknown
         let row = NSView(frame: NSRect(x: 0, y: y, width: POP_W, height: 26))
         row.addSubview(Dot(color: hookColor(st), frame: NSRect(x: 18, y: 8, width: 8, height: 8)))
-        row.addSubview(label(org, x: 34, y: 5, width: 110, size: 12))
-        let pills = label("item · project · issues · comment", x: 148, y: 5, width: 250, size: 11, color: .secondaryLabelColor)
-        pills.toolTip = ORG_RELAY_EVENTS.joined(separator: ", ")
+        row.addSubview(label(slug, x: 34, y: 5, width: 110, size: 12))
+        let pills = label("work item · comment · project", x: 148, y: 5, width: 250, size: 11, color: .secondaryLabelColor)
+        pills.toolTip = deployer.describe(st)
         row.addSubview(pills)
         let title: String
         switch st {
         case .live, .waiting: title = "Check again"
-        default: title = "Add project events"
+        default: title = "Add webhook"
         }
-        let b = button(title, #selector(orgHookAction(_:)), x: POP_W - 156, y: 2, width: 140)
-        b.identifier = NSUserInterfaceItemIdentifier(org)
+        let b = button(title, #selector(planeHookAction(_:)), x: POP_W - 156, y: 2, width: 140)
+        b.identifier = NSUserInterfaceItemIdentifier(slug)
         b.isEnabled = deployer.busy == nil && deployer.state.joined
         b.toolTip = deployer.describe(st)
         row.addSubview(b)
@@ -404,7 +415,7 @@ final class RelaySettingsVC: NSViewController {
     func pollNote(_ y: CGFloat) -> CGFloat {
         let row = NSView(frame: NSRect(x: 0, y: y, width: POP_W, height: 24))
         let minutes = min(30, max(2, PROJECTS_CFG.pollMinutes))
-        row.addSubview(label("Personal projects use polling every \(minutes) min.", x: 16, y: 4, width: 340, size: 11, color: .secondaryLabelColor))
+        row.addSubview(label("Workspaces without a webhook poll every \(minutes) min.", x: 16, y: 4, width: 340, size: 11, color: .secondaryLabelColor))
         let b = button("Settings → Projects", #selector(openProjectSettings), x: 360, y: 1, width: 150)
         row.addSubview(b)
         body.addSubview(row)
@@ -497,20 +508,20 @@ final class RelaySettingsVC: NSViewController {
     @objc func stepJoin() { run(.join) }
     @objc func stepHooks() { run(.hooks) }
 
-    @objc func checkOrgHooks() {
-        deployer.checkOrgHooks(orgs: (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? [])
+    @objc func checkPlaneHooks() {
+        deployer.checkPlaneHooks((NSApp.delegate as? GHActionsBar)?.trackedPlaneWorkspaces() ?? [])
     }
 
-    @objc func orgHookAction(_ sender: NSButton) {
-        guard let org = sender.identifier?.rawValue else { return }
-        let st = deployer.hooks.statuses["org:\(org)"] ?? .unknown
+    @objc func planeHookAction(_ sender: NSButton) {
+        guard let slug = sender.identifier?.rawValue else { return }
+        let st = deployer.hooks.statuses[HookManager.planeKey(slug)] ?? .unknown
         switch st {
         case .live, .waiting:
-            deployer.checkOrgHooks(orgs: [org])
+            deployer.checkPlaneHooks([slug])
         default:
             let d = deployer
-            d.perform("Install org webhook for \(org)", { d.installOrgHooks(orgs: [org]) }) { [weak self] _ in
-                d.checkOrgHooks(orgs: [org])
+            d.perform("Install Plane webhook for \(slug)", { d.installPlaneHooks([slug]) }) { [weak self] _ in
+                d.checkPlaneHooks([slug])
                 self?.rebuild()
             }
         }

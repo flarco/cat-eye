@@ -21,7 +21,7 @@ fi
 BINS=()
 for arch in ${ARCHS:-$(uname -m)}; do
   swiftc -Osize -target "$arch-apple-macos13.0" -o "CatEye.app/Contents/MacOS/cat-eye-$arch" *.swift \
-    -framework Cocoa -framework UserNotifications -framework Network -framework Carbon
+    -framework Cocoa -framework UserNotifications -framework Network -framework Carbon -framework WebKit
   BINS+=("CatEye.app/Contents/MacOS/cat-eye-$arch")
 done
 lipo -create "${BINS[@]}" -output CatEye.app/Contents/MacOS/cat-eye
@@ -29,6 +29,9 @@ rm "${BINS[@]}"
 # AppIcon.icns comes from AppIcon.svg. See CONTRIBUTING.md to make it again.
 mkdir -p CatEye.app/Contents/Resources
 cp AppIcon.icns CatEye.app/Contents/Resources/AppIcon.icns
+# Markdown rendering: markdown-it and highlight.js. See assets/markdown/README.md.
+rm -rf CatEye.app/Contents/Resources/markdown
+cp -R assets/markdown CatEye.app/Contents/Resources/markdown
 # The relay Worker source. Cat Eye copies it to ~/.config/cat-eye/relay at setup.
 rm -rf CatEye.app/Contents/Resources/worker
 mkdir -p CatEye.app/Contents/Resources/worker

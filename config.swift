@@ -58,6 +58,7 @@ struct ProjectNotificationSettings: Codable {
     var assigned = true
     var closed = NotifyScope(any: false, mine: true)
     var otherFields = NotifyScope(any: false, mine: false)
+    var intake = true
 
     init() {}
 
@@ -70,17 +71,20 @@ struct ProjectNotificationSettings: Codable {
         assigned = try c.decodeIfPresent(Bool.self, forKey: .assigned) ?? true
         closed = try c.decodeIfPresent(NotifyScope.self, forKey: .closed) ?? NotifyScope(any: false, mine: true)
         otherFields = try c.decodeIfPresent(NotifyScope.self, forKey: .otherFields) ?? NotifyScope(any: false, mine: false)
+        intake = try c.decodeIfPresent(Bool.self, forKey: .intake) ?? true
     }
 }
 
 enum ProjectView: String, Codable { case board, activity }
 
 struct ProjectsConfig: Codable {
-    var picked: [String] = []
-    var allOf: [String] = []
+    var workspaces: [PlaneWorkspace] = []   // tokens are in the Keychain
+    var picked: [String] = []         // project keys "slug/uuid"
+    var allOf: [String] = []          // workspace slugs
     var pollMinutes = 5
     var itemsPerProject = 10          // 0 = all
     var hideDoneAfterDays = 1         // 0 = never hide, -1 = always hide
+    var showSubItems = false          // also list sub-items as rows. An open item always shows its sub-items
     var defaultView = ProjectView.board
     var menuDot = true
     var showTab = true
@@ -93,11 +97,18 @@ struct ProjectsConfig: Codable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        picked = try c.decodeIfPresent([String].self, forKey: .picked) ?? []
-        allOf = try c.decodeIfPresent([String].self, forKey: .allOf) ?? []
+        workspaces = try c.decodeIfPresent([PlaneWorkspace].self, forKey: .workspaces) ?? []
+        // Keys of GitHub projects ("owner/3") and of removed workspaces are stale.
+        let slugs = Set(workspaces.map(\.slug))
+        picked = (try c.decodeIfPresent([String].self, forKey: .picked) ?? []).filter { k in
+            let parts = k.split(separator: "/")
+            return parts.count == 2 && slugs.contains(String(parts[0])) && parts[1].count == 36
+        }
+        allOf = (try c.decodeIfPresent([String].self, forKey: .allOf) ?? []).filter { slugs.contains($0) }
         pollMinutes = min(30, max(2, try c.decodeIfPresent(Int.self, forKey: .pollMinutes) ?? 5))
         itemsPerProject = try c.decodeIfPresent(Int.self, forKey: .itemsPerProject) ?? 10
         hideDoneAfterDays = try c.decodeIfPresent(Int.self, forKey: .hideDoneAfterDays) ?? 1
+        showSubItems = try c.decodeIfPresent(Bool.self, forKey: .showSubItems) ?? false
         defaultView = try c.decodeIfPresent(ProjectView.self, forKey: .defaultView) ?? .board
         menuDot = try c.decodeIfPresent(Bool.self, forKey: .menuDot) ?? true
         showTab = try c.decodeIfPresent(Bool.self, forKey: .showTab) ?? true
@@ -107,16 +118,14 @@ struct ProjectsConfig: Codable {
         capture = try c.decodeIfPresent(CaptureConfig.self, forKey: .capture) ?? CaptureConfig()
     }
 
-    // Keys in `order` come first. Projects not in it follow by owner, then title.
+    // Keys in `order` come first. Projects not in it follow by workspace, then title.
     func sorted(_ projects: [ProjectSummary]) -> [ProjectSummary] {
         var rank: [String: Int] = [:]
         for (i, k) in order.enumerated() where rank[k.lowercased()] == nil { rank[k.lowercased()] = i }
         return projects.sorted { a, b in
             let ra = rank[a.ref.key.lowercased()] ?? .max, rb = rank[b.ref.key.lowercased()] ?? .max
             if ra != rb { return ra < rb }
-            if a.ref.owner.caseInsensitiveCompare(b.ref.owner) != .orderedSame {
-                return a.ref.owner.localizedCaseInsensitiveCompare(b.ref.owner) == .orderedAscending
-            }
+            if a.ref.workspace != b.ref.workspace { return a.ref.workspace < b.ref.workspace }
             return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
         }
     }
@@ -212,9 +221,9 @@ struct TabVisibility: Codable {
 let CONFIG_DIR  = NSString(string: "~/.config/cat-eye").expandingTildeInPath
 let CONFIG_PATH = (CONFIG_DIR as NSString).appendingPathComponent("config.json")
 let REPO_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("repo-cache.json")
-let PROJECT_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("project-cache.json")
-let PROJECT_STATE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("project-state.json")
-let PROJECT_ACTIVITY_PATH = (CONFIG_DIR as NSString).appendingPathComponent("project-activity.jsonl")
+let PROJECT_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("plane-cache.json")
+let PROJECT_STATE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("plane-state.json")
+let PROJECT_ACTIVITY_PATH = (CONFIG_DIR as NSString).appendingPathComponent("plane-activity.jsonl")
 
 // REPOS is what the app tracks: PICKED_REPOS plus every repo of PICKED_ORGS.
 var REPOS: [String] = []

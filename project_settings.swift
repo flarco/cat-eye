@@ -1,10 +1,17 @@
 import Cocoa
 
-// Settings → Projects: which projects to track, notifications, display, and the poll interval.
+// Settings → Projects: Plane workspaces, which projects to track, notifications,
+// display, and the poll interval.
 final class ProjectSettingsVC: NSViewController {
     let catalog: ProjectCatalog
     let store: ProjectStore
+    let accounts: PlaneAccounts
     var cfg: ProjectsConfig
+    var slugField: NSTextField?
+    var tokenField: NSSecureTextField?
+    var hostField: NSTextField?
+    static var addStatus: (text: String, error: Bool)?
+    static var testing = false
     var filterField: NSTextField?
     var doc: Flipped?
     var scroll: NSScrollView?
@@ -13,9 +20,10 @@ final class ProjectSettingsVC: NSViewController {
     static var captureError: String?
     static var expanded: Set<String> = []
 
-    init(catalog: ProjectCatalog, store: ProjectStore, cfg: ProjectsConfig) {
+    init(catalog: ProjectCatalog, store: ProjectStore, accounts: PlaneAccounts, cfg: ProjectsConfig) {
         self.catalog = catalog
         self.store = store
+        self.accounts = accounts
         self.cfg = cfg
         super.init(nibName: nil, bundle: nil)
     }
@@ -51,6 +59,8 @@ final class ProjectSettingsVC: NSViewController {
             doc.subviews.forEach { $0.removeFromSuperview() }
             let w = POP_W
             var y: CGFloat = 0
+            y = header("PLANE WORKSPACES", y: y, button: nil)
+            y = workspaceSection(y: y, w: w, in: doc)
             y = header("PROJECTS TO TRACK", y: y, button: ("Refresh all", #selector(refreshAll)))
             let filter = NSTextField(frame: NSRect(x: 16, y: y + 4, width: w - 32, height: 22))
             filter.placeholderString = "Filter projects"
@@ -84,85 +94,135 @@ final class ProjectSettingsVC: NSViewController {
             let b = NSButton(title: t, target: self, action: sel)
             b.bezelStyle = .inline; b.font = .systemFont(ofSize: 10)
             b.frame = NSRect(x: POP_W - 96, y: 4, width: 84, height: 20)
-            b.isEnabled = !catalog.listingOwners
+            b.isEnabled = !catalog.workspaces.isEmpty
             hdr.addSubview(b)
         }
         doc?.addSubview(hdr)
         return y + 28
     }
 
+    func workspaceSection(y: CGFloat, w: CGFloat, in doc: NSView) -> CGFloat {
+        var y = y
+        for ws in accounts.workspaces {
+            let host = ws.host == PlaneWorkspace.cloudHost ? "Plane Cloud" : ws.host
+            let token = accounts.hasToken(ws.slug) ? "token in Keychain" : "no token"
+            let l = NSTextField(labelWithString: "\(ws.slug)  ·  \(host)  ·  \(token)")
+            l.font = .systemFont(ofSize: 12)
+            l.lineBreakMode = .byTruncatingTail
+            l.frame = NSRect(x: 16, y: y + 3, width: w - 170, height: 18)
+            doc.addSubview(l)
+            let open = NSButton(title: "Open", target: self, action: #selector(openWorkspace(_:)))
+            open.bezelStyle = .inline; open.font = .systemFont(ofSize: 11)
+            open.frame = NSRect(x: w - 146, y: y + 2, width: 60, height: 20)
+            open.identifier = NSUserInterfaceItemIdentifier(ws.slug)
+            doc.addSubview(open)
+            let rm = NSButton(title: "Remove", target: self, action: #selector(removeWorkspace(_:)))
+            rm.bezelStyle = .inline; rm.font = .systemFont(ofSize: 11)
+            rm.frame = NSRect(x: w - 80, y: y + 2, width: 66, height: 20)
+            rm.identifier = NSUserInterfaceItemIdentifier(ws.slug)
+            doc.addSubview(rm)
+            y += 26
+        }
+        let slug = NSTextField(frame: NSRect(x: 16, y: y + 4, width: 150, height: 22))
+        slug.placeholderString = "Workspace slug"
+        slug.toolTip = "The part after the host in the Plane URL, for example app.plane.so/<slug>/"
+        slug.stringValue = slugField?.stringValue ?? ""
+        let token = NSSecureTextField(frame: NSRect(x: 172, y: y + 4, width: 170, height: 22))
+        token.placeholderString = "API token"
+        token.toolTip = "Plane → Profile settings → Personal access tokens. A token works only in its own workspace."
+        token.stringValue = tokenField?.stringValue ?? ""
+        let host = NSTextField(frame: NSRect(x: 348, y: y + 4, width: w - 348 - 112, height: 22))
+        host.placeholderString = PlaneWorkspace.cloudHost
+        host.toolTip = "Change it only for a self-hosted Plane"
+        host.stringValue = hostField?.stringValue ?? ""
+        for f in [slug, token, host] as [NSTextField] { f.font = .systemFont(ofSize: 12); doc.addSubview(f) }
+        slugField = slug; tokenField = token; hostField = host
+        let add = NSButton(title: ProjectSettingsVC.testing ? "Testing…" : "Test & Add", target: self, action: #selector(addWorkspace))
+        add.bezelStyle = .rounded; add.font = .systemFont(ofSize: 11)
+        add.frame = NSRect(x: w - 108, y: y + 2, width: 96, height: 26)
+        add.isEnabled = !ProjectSettingsVC.testing
+        doc.addSubview(add)
+        y += 30
+        let note = ProjectSettingsVC.addStatus
+            ?? (accounts.workspaces.isEmpty ? ("Add one workspace for each token. Cat Eye keeps the tokens in the Keychain.", false) : nil)
+        if let note {
+            let l = NSTextField(labelWithString: note.text)
+            l.font = .systemFont(ofSize: 11)
+            l.textColor = note.error ? C_FAILURE : .secondaryLabelColor
+            l.lineBreakMode = .byTruncatingTail
+            l.toolTip = note.text
+            l.frame = NSRect(x: 16, y: y, width: w - 32, height: 16)
+            doc.addSubview(l)
+            y += 20
+        }
+        return y + 6
+    }
+
     func tree(y: CGFloat, w: CGFloat, in doc: NSView) -> CGFloat {
         var y = y
         let q = (filterField?.stringValue ?? "").lowercased()
-        let owners = catalog.owners
-        if owners.isEmpty {
-            let text = catalog.refreshing ? "Loading projects…" : (catalog.listError ?? "No projects found. Login, then refresh.")
-            let l = NSTextField(labelWithString: text)
-            l.font = .systemFont(ofSize: 12); l.textColor = catalog.listError == nil ? .secondaryLabelColor : .systemRed
+        let workspaces = catalog.workspaces
+        if workspaces.isEmpty {
+            let l = NSTextField(labelWithString: "Add a Plane workspace above.")
+            l.font = .systemFont(ofSize: 12); l.textColor = .secondaryLabelColor
             l.frame = NSRect(x: 16, y: y + 4, width: w - 32, height: 18)
-            l.lineBreakMode = .byTruncatingTail
-            l.toolTip = catalog.listError
             doc.addSubview(l)
             return y + 28
         }
-        for owner in owners {
-            let projects = cfg.sorted(catalog.projects(of: owner.login)).filter { p in
-                q.isEmpty || p.title.lowercased().contains(q) || owner.login.lowercased().contains(q)
+        for ws in workspaces {
+            let slug = ws.slug
+            let projects = cfg.sorted(catalog.projects(of: slug)).filter { p in
+                q.isEmpty || p.title.lowercased().contains(q) || p.identifier.lowercased().contains(q) || slug.lowercased().contains(q)
             }
-            if !q.isEmpty && projects.isEmpty && owner.login.lowercased().contains(q) == false { continue }
-            let open = ProjectSettingsVC.expanded.contains(owner.login) || !q.isEmpty
+            if !q.isEmpty && projects.isEmpty && !slug.lowercased().contains(q) { continue }
+            let open = ProjectSettingsVC.expanded.contains(slug) || !q.isEmpty
             let disc = NSButton(frame: NSRect(x: 10, y: y + 4, width: 16, height: 16))
             disc.bezelStyle = .disclosure; disc.setButtonType(.pushOnPushOff); disc.title = ""
             disc.state = open ? .on : .off
             disc.target = self; disc.action = #selector(toggleExpand(_:))
-            disc.identifier = NSUserInterfaceItemIdentifier(owner.login)
+            disc.identifier = NSUserInterfaceItemIdentifier(slug)
             doc.addSubview(disc)
-            let kind = owner.kind == .user ? "you" : "org"
             let countLabel: String
-            if !projects.isEmpty {
-                countLabel = "\(projects.count)"
-            } else {
-                switch catalog.fetch(owner.login) {
-                case .loading: countLabel = "…"
-                case .failed: countLabel = "failed"
-                case .idle: countLabel = "0"
-                }
+            switch catalog.fetch(slug) {
+            case .loading: countLabel = "…"
+            case .failed: countLabel = "failed"
+            case .idle: countLabel = "\(projects.count)"
             }
-            let cb = NSButton(checkboxWithTitle: " \(owner.login)  \(kind) · \(countLabel)", target: self, action: #selector(toggleAll(_:)))
+            let cb = NSButton(checkboxWithTitle: " \(slug)  ·  \(countLabel)", target: self, action: #selector(toggleAll(_:)))
             cb.font = .systemFont(ofSize: 12, weight: .semibold)
-            cb.state = cfg.allOf.contains { $0.caseInsensitiveCompare(owner.login) == .orderedSame } ? .on : .off
+            cb.state = cfg.allOf.contains(slug) ? .on : .off
             cb.toolTip = "Track all, also new ones"
             cb.frame = NSRect(x: 30, y: y + 2, width: 280, height: 22)
-            cb.identifier = NSUserInterfaceItemIdentifier(owner.login)
+            cb.identifier = NSUserInterfaceItemIdentifier(slug)
             doc.addSubview(cb)
             let rb = NSButton(frame: NSRect(x: w - 36, y: y + 2, width: 22, height: 20))
             rb.bezelStyle = .inline; rb.isBordered = false
-            rb.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh \(owner.login)")
+            rb.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh \(slug)")
             rb.target = self; rb.action = #selector(refreshOwner(_:))
-            rb.identifier = NSUserInterfaceItemIdentifier(owner.login)
+            rb.identifier = NSUserInterfaceItemIdentifier(slug)
             doc.addSubview(rb)
             y += 26
             guard open else { continue }
+            let live = isLive(slug)
             for p in projects {
-                let row = NSButton(checkboxWithTitle: " \(p.title)  #\(p.ref.number) · \(p.itemCount)", target: self, action: #selector(toggleProject(_:)))
+                let row = NSButton(checkboxWithTitle: " \(p.title)  \(p.identifier)", target: self, action: #selector(toggleProject(_:)))
                 row.font = .systemFont(ofSize: 12)
                 row.identifier = NSUserInterfaceItemIdentifier(p.ref.key)
-                let on = cfg.allOf.contains { $0.caseInsensitiveCompare(p.ref.owner) == .orderedSame } || cfg.picked.contains(p.ref.key)
+                let on = cfg.allOf.contains(slug) || cfg.picked.contains(p.ref.key)
                 row.state = on && !p.closed ? .on : .off
                 row.isEnabled = !p.closed
                 row.frame = NSRect(x: 52, y: y, width: w - 180, height: 22)
                 if p.closed { row.alphaValue = 0.45 }
                 doc.addSubview(row)
-                let live = p.ownerKind == .org && isOrgLive(p.ref.owner)
                 let chip = Badge(live ? "Live" : "\(cfg.pollMinutes) min")
                 chip.frame.origin = NSPoint(x: w - 90, y: y + 1)
                 doc.addSubview(chip)
                 y += 22
             }
-            if open && projects.isEmpty {
+            if projects.isEmpty {
                 let text: String
                 let color: NSColor
-                switch catalog.fetch(owner.login) {
+                switch catalog.fetch(slug) {
                 case .loading:
                     text = "Loading projects…"
                     color = .secondaryLabelColor
@@ -187,11 +247,77 @@ final class ProjectSettingsVC: NSViewController {
         return y
     }
 
-    func isOrgLive(_ org: String) -> Bool {
-        let st = (NSApp.delegate as? GHActionsBar)?.relayDeployer.hooks.statuses["org:\(org)"]
+    func isLive(_ slug: String) -> Bool {
+        let st = (NSApp.delegate as? GHActionsBar)?.relayDeployer.hooks.statuses["plane:\(slug)"]
         if case .live = st { return true }
         if case .waiting = st { return true }
         return false
+    }
+
+    @objc func addWorkspace() {
+        let slug = (slugField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        let token = (tokenField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var host = (hostField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        while host.hasSuffix("/") { host.removeLast() }
+        if host.isEmpty { host = PlaneWorkspace.cloudHost }
+        guard !slug.isEmpty, !slug.contains("/"), !token.isEmpty else {
+            ProjectSettingsVC.addStatus = ("Type the workspace slug and the token.", true)
+            rebuild(); return
+        }
+        guard host.hasPrefix("https://") || host.hasPrefix("http://") else {
+            ProjectSettingsVC.addStatus = ("The host must start with https://", true)
+            rebuild(); return
+        }
+        let ws = PlaneWorkspace(slug: slug, host: host)
+        ProjectSettingsVC.testing = true
+        ProjectSettingsVC.addStatus = ("Testing the token…", false)
+        rebuild()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let client = PlaneClient(workspace: ws, token: token)
+            let result = client.me().flatMap { me in client.projects().map { (me.name, $0.count) } }
+            DispatchQueue.main.async {
+                ProjectSettingsVC.testing = false
+                guard let self = self else { return }
+                switch result {
+                case .success(let (name, count)):
+                    self.accounts.save(ws, token: token)
+                    self.cfg.workspaces = PROJECTS_CFG.workspaces
+                    ProjectSettingsVC.addStatus = ("Added \(slug) as \(name). \(count) projects. Pick them below.", false)
+                    ProjectSettingsVC.expanded.insert(slug)
+                    self.slugField?.stringValue = ""; self.tokenField?.stringValue = ""; self.hostField?.stringValue = ""
+                    self.catalog.refresh(slug, force: true)
+                    (NSApp.delegate as? GHActionsBar)?.applyProjectSelection()
+                case .failure(let e):
+                    ProjectSettingsVC.addStatus = ("\(slug): \(e.message) Nothing was saved.", true)
+                }
+                self.rebuild()
+            }
+        }
+    }
+
+    @objc func removeWorkspace(_ sender: NSButton) {
+        guard let slug = sender.identifier?.rawValue else { return }
+        let alert = NSAlert()
+        alert.messageText = "Remove the workspace \(slug)?"
+        alert.informativeText = "Cat Eye deletes the token from the Keychain and stops to track its projects. Cat Eye also deletes its Plane webhook, if it has one."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let app = NSApp.delegate as? GHActionsBar
+        app?.relayDeployer.removePlaneHook(slug)
+        accounts.remove(slug)
+        cfg.workspaces = PROJECTS_CFG.workspaces
+        cfg.allOf.removeAll { $0 == slug }
+        cfg.picked.removeAll { $0.hasPrefix(slug + "/") }
+        ProjectSettingsVC.addStatus = nil
+        app?.applyProjectSelection()
+        rebuild()
+    }
+
+    @objc func openWorkspace(_ sender: NSButton) {
+        guard let slug = sender.identifier?.rawValue, let ws = accounts.workspace(slug), let url = URL(string: ws.url) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func matrix(y: CGFloat, w: CGFloat, in doc: NSView) -> CGFloat {
@@ -213,8 +339,10 @@ final class ProjectSettingsVC: NSViewController {
             ("Item is assigned to me", "assigned", false, cfg.notifications.assigned),
             ("Item is closed or set to Done", "closed", cfg.notifications.closed.any, cfg.notifications.closed.mine),
             ("Other field changes", "other", cfg.notifications.otherFields.any, cfg.notifications.otherFields.mine),
+            ("Intake item is new, changed or closed", "intake", cfg.notifications.intake, false),
         ]
         let anyDisabled: Set<String> = ["mention", "assigned"]
+        let mineDisabled: Set<String> = ["intake"]
         for row in rows {
             let l = NSTextField(labelWithString: row.0)
             l.font = .systemFont(ofSize: 12)
@@ -229,6 +357,7 @@ final class ProjectSettingsVC: NSViewController {
             let my = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleNotify(_:)))
             my.identifier = NSUserInterfaceItemIdentifier(row.1 + ":mine")
             my.state = row.3 ? .on : .off
+            my.isHidden = mineDisabled.contains(row.1)
             my.frame = NSRect(x: w - 84, y: y - 2, width: 24, height: 20)
             doc.addSubview(my)
             y += 24
@@ -249,13 +378,19 @@ final class ProjectSettingsVC: NSViewController {
         dot.state = cfg.menuDot ? .on : .off
         dot.frame = NSRect(x: 16, y: y, width: w - 32, height: 22)
         doc.addSubview(dot)
-        return y + 28
+        let sub = NSButton(checkboxWithTitle: "List sub-items as rows (an open item always shows its sub-items)",
+                           target: self, action: #selector(toggleSubItems(_:)))
+        sub.font = .systemFont(ofSize: 12)
+        sub.state = cfg.showSubItems ? .on : .off
+        sub.frame = NSRect(x: 16, y: y + 28, width: w - 32, height: 22)
+        doc.addSubview(sub)
+        return y + 56
     }
 
     func refreshSection(y: CGFloat, w: CGFloat, in doc: NSView) -> CGFloat {
         let idx = [2, 5, 10, 15, 30].firstIndex(of: cfg.pollMinutes) ?? 1
         let y = popupRow("Poll projects without live updates every", ["2 min", "5 min", "10 min", "15 min", "30 min"], idx, #selector(pollChanged(_:)), y: y, in: doc)
-        let help = NSTextField(wrappingLabelWithString: "GitHub sends project webhooks only for organizations. Personal projects, and org projects without an org webhook, use this interval. Live projects also use it when the relay is disconnected.")
+        let help = NSTextField(wrappingLabelWithString: "A Plane webhook covers a whole workspace. Settings → Live updates adds it, if you are an admin of the workspace. Workspaces without a webhook use this interval. Live projects also use it when the relay is disconnected.")
         help.font = .systemFont(ofSize: 11); help.textColor = .secondaryLabelColor
         help.frame = NSRect(x: 16, y: y, width: w - 32, height: 44)
         doc.addSubview(help)
@@ -349,13 +484,13 @@ final class ProjectSettingsVC: NSViewController {
 
     @objc func filterChanged() { rebuild() }
     @objc func refreshAll() { catalog.refreshAll(force: true) }
-    @objc func refreshOwner(_ sender: NSButton) { if let o = sender.identifier?.rawValue { catalog.refresh(owner: o, force: true) } }
+    @objc func refreshOwner(_ sender: NSButton) { if let o = sender.identifier?.rawValue { catalog.refresh(o, force: true) } }
     @objc func toggleExpand(_ sender: NSButton) {
         guard let o = sender.identifier?.rawValue else { return }
         if sender.state == .on {
             ProjectSettingsVC.expanded.insert(o)
             if catalog.projects(of: o).isEmpty {
-                if case .loading = catalog.fetch(o) {} else { catalog.refresh(owner: o, force: true) }
+                if case .loading = catalog.fetch(o) {} else { catalog.refresh(o, force: true) }
             }
         } else {
             ProjectSettingsVC.expanded.remove(o)
@@ -364,16 +499,16 @@ final class ProjectSettingsVC: NSViewController {
     }
     @objc func toggleAll(_ sender: NSButton) {
         guard let owner = sender.identifier?.rawValue else { return }
-        cfg.allOf.removeAll { $0.caseInsensitiveCompare(owner) == .orderedSame }
-        cfg.picked.removeAll { $0.lowercased().hasPrefix(owner.lowercased() + "/") }
+        cfg.allOf.removeAll { $0 == owner }
+        cfg.picked.removeAll { $0.hasPrefix(owner + "/") }
         if sender.state == .on { cfg.allOf.append(owner) }
         rebuild()
     }
     @objc func toggleProject(_ sender: NSButton) {
         guard let key = sender.identifier?.rawValue else { return }
         let owner = key.split(separator: "/").first.map(String.init) ?? key
-        if cfg.allOf.contains(where: { $0.caseInsensitiveCompare(owner) == .orderedSame }) {
-            cfg.allOf.removeAll { $0.caseInsensitiveCompare(owner) == .orderedSame }
+        if cfg.allOf.contains(owner) {
+            cfg.allOf.removeAll { $0 == owner }
             cfg.picked = catalog.projects(of: owner).filter { !$0.closed && $0.ref.key != key }.map(\.ref.key)
         } else if sender.state == .on {
             if !cfg.picked.contains(key) { cfg.picked.append(key) }
@@ -399,6 +534,7 @@ final class ProjectSettingsVC: NSViewController {
         case ("closed", "mine"): cfg.notifications.closed.mine = on
         case ("other", "any"): cfg.notifications.otherFields.any = on
         case ("other", "mine"): cfg.notifications.otherFields.mine = on
+        case ("intake", "any"): cfg.notifications.intake = on
         default: break
         }
     }
@@ -407,9 +543,11 @@ final class ProjectSettingsVC: NSViewController {
     static let hideDays = [-1, 1, 7, 30, 0]
     @objc func hideChanged(_ sender: NSPopUpButton) { cfg.hideDoneAfterDays = ProjectSettingsVC.hideDays[sender.indexOfSelectedItem] }
     @objc func toggleDot(_ sender: NSButton) { cfg.menuDot = sender.state == .on }
+    @objc func toggleSubItems(_ sender: NSButton) { cfg.showSubItems = sender.state == .on }
     @objc func pollChanged(_ sender: NSPopUpButton) { cfg.pollMinutes = [2, 5, 10, 15, 30][sender.indexOfSelectedItem] }
 
     @objc func doSave() {
+        cfg.workspaces = PROJECTS_CFG.workspaces
         PROJECTS_CFG = cfg
         saveConfig()
         let app = NSApp.delegate as? GHActionsBar

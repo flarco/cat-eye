@@ -9,7 +9,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
     var onClose: ((_ projectKey: String?, _ notice: String?) -> Void)?
     private let store: ProjectStore
     private let projects: [ProjectSummary]
-    private let repoCatalog: RepoCatalog
     private let ai: AIClient?
     private var target: String?          // nil = Auto
     private var picked: String?          // the project AI chose in Auto
@@ -38,8 +37,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
     private let countLabel = NSTextField(labelWithString: "0 chars")
     private let fieldsBox = Flipped()
     private var fieldPops: [(field: ProjectField, pop: NSPopUpButton, mark: NSTextField)] = []
-    private let kindSeg = NSSegmentedControl(labels: ["Draft", "Issue in repo"], trackingMode: .selectOne, target: nil, action: nil)
-    private let repoPop = NSPopUpButton(frame: .zero, pullsDown: false)
     private let noticeLabel = NSTextField(labelWithString: "")
     private let cancelBtn = NSButton(title: "Cancel", target: nil, action: nil)
     private let createBtn = NSButton(title: "Create  ⌘↩", target: nil, action: nil)
@@ -48,10 +45,9 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
     private var pad: CGFloat { 16 }
     private var innerW: CGFloat { cardW - 2 * pad }
 
-    init(store: ProjectStore, projects: [ProjectSummary], repoCatalog: RepoCatalog, target: String?, prefill: String?, w: CGFloat) {
+    init(store: ProjectStore, projects: [ProjectSummary], target: String?, prefill: String?, w: CGFloat) {
         self.store = store
         self.projects = projects
-        self.repoCatalog = repoCatalog
         self.ai = AIClient.current
         self.cardW = w - 40
         let auto = ai != nil && AI_CFG.pickProject && projects.count > 1
@@ -100,7 +96,7 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
             projectPop.lastItem?.representedObject = nil
         }
         for p in projects {
-            projectPop.addItem(withTitle: "\(p.ref.owner) › \(p.title)")
+            projectPop.addItem(withTitle: "\(p.ref.workspace) › \(p.title)")
             projectPop.lastItem?.representedObject = p.ref.key
             if p.ref.key == target { projectPop.select(projectPop.lastItem) }
         }
@@ -174,13 +170,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
 
         card.addSubview(fieldsBox)
 
-        kindSeg.selectedSegment = 0
-        kindSeg.font = .systemFont(ofSize: 11)
-        kindSeg.target = self; kindSeg.action = #selector(kindChanged)
-        card.addSubview(kindSeg)
-        repoPop.font = .systemFont(ofSize: 11)
-        repoPop.isHidden = true
-        card.addSubview(repoPop)
         noticeLabel.font = .systemFont(ofSize: 11)
         noticeLabel.lineBreakMode = .byTruncatingTail
         card.addSubview(noticeLabel)
@@ -202,7 +191,7 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
     // Single-select fields of the project. Status comes first.
     private func fields(of key: String?) -> [ProjectField] {
         guard let key, let snap = store.snapshots[key] else { return [] }
-        var list = snap.fields ?? []
+        var list = snap.fields
         if list.isEmpty, let id = snap.statusFieldId {
             list = [ProjectField(id: id, name: "Status", options: snap.statusOptions)]
         }
@@ -320,8 +309,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
         }()
         sep.frame.origin.y = y + 4
         y += 14
-        kindSeg.frame = NSRect(x: pad, y: y, width: 190, height: 24)
-        repoPop.frame = NSRect(x: pad + 198, y: y, width: 200, height: 24)
         createBtn.frame = NSRect(x: pad + innerW - 110, y: y - 2, width: 112, height: 28)
         cancelBtn.frame = NSRect(x: createBtn.frame.minX - 84, y: y - 2, width: 80, height: 28)
         y += 38
@@ -405,25 +392,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
         if titleField.stringValue.isEmpty && aiDraft { suggest() }
     }
 
-    @objc func kindChanged() {
-        let issue = kindSeg.selectedSegment == 1
-        repoPop.isHidden = !issue
-        if issue { fillRepos() }
-    }
-
-    // Repos of the project owner first. The repo used most by the project's items is the default.
-    private func fillRepos() {
-        repoPop.removeAllItems()
-        let owner = effectiveKey.flatMap { k in projects.first { $0.ref.key == k }?.ref.owner } ?? ""
-        var list = repoCatalog.repos(of: owner)
-        for r in REPOS where !list.contains(r) { list.append(r) }
-        let used = effectiveKey.flatMap { store.snapshots[$0] }?.items.compactMap(\.repo) ?? []
-        let best = Dictionary(grouping: used, by: { $0 }).max { $0.value.count < $1.value.count }?.key
-        if let best, !list.contains(best) { list.insert(best, at: 0) }
-        repoPop.addItems(withTitles: list.isEmpty ? ["No repos found"] : list)
-        if let best { repoPop.selectItem(withTitle: best) }
-    }
-
     @objc func cancel() { onClose?(nil, nil) }
 
     @objc func undoTidy() {
@@ -448,7 +416,7 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
     private func context() -> DraftContext {
         var ctx = DraftContext()
         if target == nil && AI_CFG.pickProject {
-            ctx.projects = projects.map { ($0.ref.key, "\($0.ref.owner) › \($0.title)") }
+            ctx.projects = projects.map { ($0.ref.key, "\($0.ref.workspace) › \($0.title)") }
         }
         if let key = effectiveKey {
             let snap = store.snapshots[key]
@@ -497,7 +465,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
             pickReason = s.reason
             suggested = []
             rebuildFields()
-            if kindSeg.selectedSegment == 1 { fillRepos() }
         }
         for entry in fieldPops {
             guard let value = s.fields[entry.field.name], entry.pop.item(withTitle: value) != nil else { continue }
@@ -549,11 +516,6 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
             return
         }
         guard let key = effectiveKey else { return }
-        var kind = NewItemKind.draft
-        if kindSeg.selectedSegment == 1 {
-            guard let repo = repoPop.titleOfSelectedItem, repo.contains("/") else { show("Pick a repo", error: true); return }
-            kind = .issue(repo: repo)
-        }
         var options: [String: String] = [:]
         for entry in fieldPops {
             let i = entry.pop.indexOfSelectedItem - 1
@@ -562,7 +524,7 @@ final class NewItemSheet: Flipped, NSTextViewDelegate, NSTextFieldDelegate {
         creating = true
         show(nil)
         let name = projects.first { $0.ref.key == key }?.title ?? key
-        store.create(NewItem(projectKey: key, title: title, body: body, kind: kind, fieldOptions: options)) { [weak self] ok, msg in
+        store.create(NewItem(projectKey: key, title: title, body: body, fieldOptions: options)) { [weak self] ok, msg in
             guard let self else { return }
             self.creating = false
             if ok {

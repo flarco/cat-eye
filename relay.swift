@@ -11,15 +11,14 @@ struct RelayConfig: Codable {
     var deviceID = ""            // 16 uppercase hex chars, made once for each Mac
     var accountID = ""
     var reconcileInterval: TimeInterval?
+    var oldOrgHooks: [String: Int]?   // GitHub org hooks of relay v2, org → hook id, still to delete
 }
 
 var RELAY = RelayConfig()
 let RELAY_DIR = (CONFIG_DIR as NSString).appendingPathComponent("relay")
-let RELAY_BUNDLED_VERSION = 2    // keep equal to RELAY_VERSION in worker/wrangler.jsonc
+let RELAY_BUNDLED_VERSION = 3    // keep equal to RELAY_VERSION in worker/wrangler.jsonc
 let RELAY_WORKER_NAME = "cat-eye-relay"
 let RELAY_EVENTS = ["workflow_run", "workflow_job", "pull_request", "pull_request_review"]
-// Org hooks only. Repo hooks keep RELAY_EVENTS, so an issue is not delivered twice.
-let ORG_RELAY_EVENTS = ["projects_v2_item", "projects_v2", "issues", "issue_comment"]
 let FREE_ROWS_PER_DAY = 100_000
 
 func randomHex(_ bytes: Int) -> String {
@@ -254,13 +253,12 @@ struct RelayEvent: Decodable {
     let runId: Int?
     let jobId: Int?
     let prNumber: Int?
-    let org: String?
+    let org: String?          // "plane:<slug>" for Plane events
     let projectId: String?
     let itemId: String?
-    let issueNumber: Int?
 
     private enum CodingKeys: String, CodingKey {
-        case seq, deliveryId, repo, kind, action, runId, jobId, prNumber, org, projectId, itemId, issueNumber
+        case seq, deliveryId, repo, kind, action, runId, jobId, prNumber, org, projectId, itemId
     }
 
     init(from decoder: Decoder) throws {
@@ -276,7 +274,6 @@ struct RelayEvent: Decodable {
         org = try c.decodeIfPresent(String.self, forKey: .org)
         projectId = try c.decodeIfPresent(String.self, forKey: .projectId)
         itemId = try c.decodeIfPresent(String.self, forKey: .itemId)
-        issueNumber = try c.decodeIfPresent(Int.self, forKey: .issueNumber)
     }
 }
 
@@ -319,10 +316,16 @@ struct RelayHook: Decodable {
     let lastDelivery: Double?
 }
 
-struct RelayOrgHook: Decodable {
+struct RelayPlaneHook: Decodable {
+    let workspace: String
+    let hookId: String?
+    let lastDelivery: Double?
+}
+
+// Relay v2 had GitHub org hooks for GitHub Projects.
+struct RelayOldOrgHook: Decodable {
     let org: String
     let hookId: Int?
-    let lastDelivery: Double?
 }
 
 struct RelayHealth: Decodable {
@@ -335,12 +338,13 @@ struct RelayHealth: Decodable {
     let rowsWrittenToday: Int
     let devices: [RelayDevice]
     let hooks: [RelayHook]
-    let orgHooks: [RelayOrgHook]
+    let planeHooks: [RelayPlaneHook]
     let projectEventsToday: Int
+    let oldOrgHooks: [RelayOldOrgHook]
 
     private enum CodingKeys: String, CodingKey {
         case version, retentionHours, head, events, oldestAt, lastWebhookAt, rowsWrittenToday
-        case devices, hooks, orgHooks, projectEventsToday
+        case devices, hooks, planeHooks, projectEventsToday, orgHooks
     }
 
     init(from decoder: Decoder) throws {
@@ -354,7 +358,8 @@ struct RelayHealth: Decodable {
         rowsWrittenToday = try c.decode(Int.self, forKey: .rowsWrittenToday)
         devices = try c.decode([RelayDevice].self, forKey: .devices)
         hooks = try c.decode([RelayHook].self, forKey: .hooks)
-        orgHooks = try c.decodeIfPresent([RelayOrgHook].self, forKey: .orgHooks) ?? []
+        planeHooks = try c.decodeIfPresent([RelayPlaneHook].self, forKey: .planeHooks) ?? []
+        oldOrgHooks = try c.decodeIfPresent([RelayOldOrgHook].self, forKey: .orgHooks) ?? []
         projectEventsToday = try c.decodeIfPresent(Int.self, forKey: .projectEventsToday) ?? 0
     }
 }
@@ -422,8 +427,10 @@ struct RelayAPI {
     func webhookSecret() -> String? { try? send("GET", "/v1/webhook-secret", as: Secret.self).get().secret }
     func putHook(repo: String, id: Int) -> Bool { (try? send("PUT", "/v1/hooks/\(repo)", body: ["hookId": id], as: OK.self).get()) != nil }
     func deleteHook(repo: String) -> Bool { (try? send("DELETE", "/v1/hooks/\(repo)", as: OK.self).get()) != nil }
-    func putOrgHook(org: String, id: Int) -> Bool { (try? send("PUT", "/v1/org-hooks/\(org)", body: ["hookId": id], as: OK.self).get()) != nil }
-    func deleteOrgHook(org: String) -> Bool { (try? send("DELETE", "/v1/org-hooks/\(org)", as: OK.self).get()) != nil }
+    func putPlaneHook(workspace: String, id: String, secret: String) -> Bool {
+        (try? send("PUT", "/v1/plane-hooks/\(workspace)", body: ["hookId": id, "secret": secret], as: OK.self).get()) != nil
+    }
+    func deletePlaneHook(workspace: String) -> Bool { (try? send("DELETE", "/v1/plane-hooks/\(workspace)", as: OK.self).get()) != nil }
 }
 
 // ─── Webhooks on GitHub ──────────────────────────────────────────────────────
@@ -537,81 +544,85 @@ final class HookManager {
         return ok
     }
 
-    func findOrg(org: String, url: String) -> Lookup {
-        guard let r = gh(["api", "orgs/\(org)/hooks?per_page=100", "--jq", "[.[] | {id, url: .config.url}]"]) else {
-            return .failed(.error("gh failed to start"))
-        }
-        if !r.ok { return .failed(denied(r) ? .pollingOnly("Not an org owner") : .error(String(r.err.prefix(80)))) }
-        let hooks = (try? JSONDecoder().decode([GHHook].self, from: r.out)) ?? []
-        return hooks.first { $0.url == url }.map { .found($0.id) } ?? .missing
+    enum OrgDelete { case deleted, noScope, failed(String) }
+
+    // GitHub gives 404 for a missing hook and for a missing scope. Only the hint of gh tells them apart.
+    func deleteOrgHook(org: String, hookId: Int) -> OrgDelete {
+        guard let r = gh(["api", "-X", "DELETE", "orgs/\(org)/hooks/\(hookId)"]) else { return .failed("gh failed to start") }
+        if r.ok { return .deleted }
+        if r.err.contains("admin:org_hook") { return .noScope }
+        if r.err.lowercased().contains("not found") { return .deleted }
+        return .failed(String(r.err.prefix(80)))
     }
 
-    // Org hooks need admin:org_hook and the org owner role. Denied access stays on polling.
-    func ensureOrg(org: String, workerURL: String, secret: String, api: RelayAPI) -> HookStatus {
-        let url = workerURL + "/webhook"
-        let key = "org:\(org)"
-        let body: [String: Any] = [
-            "name": "web", "active": true, "events": ORG_RELAY_EVENTS,
-            "config": ["url": url, "content_type": "json", "secret": secret, "insecure_ssl": "0"],
-        ]
-        let existing: Int?
-        switch findOrg(org: org, url: url) {
-        case .failed(let s): setStatus(key, s); return s
-        case .missing: existing = nil
-        case .found(let id): existing = id
-        }
-        let res = existing.map { gh(["api", "-X", "PATCH", "orgs/\(org)/hooks/\($0)", "--jq", ".id"], body: body) }
-            ?? gh(["api", "-X", "POST", "orgs/\(org)/hooks", "--jq", ".id"], body: body)
-        guard let r = res else { return .error("gh failed to start") }
-        guard r.ok, let id = Int(String(decoding: r.out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)) else {
-            let s: HookStatus = denied(r) ? .pollingOnly("Not an org owner") : .error(String(r.err.prefix(80)))
+    static func planeKey(_ slug: String) -> String { "plane:\(slug)" }
+    static func planeURL(_ slug: String, workerURL: String) -> String { "\(workerURL)/plane/\(slug)" }
+
+    // Plane shows a webhook secret only when it creates the hook. A hook that the
+    // relay has no secret for is deleted and created again. Needs a workspace admin.
+    func ensurePlane(_ client: PlaneClient, workerURL: String, relayHookId: String?, api: RelayAPI) -> HookStatus {
+        let slug = client.workspace.slug
+        let key = HookManager.planeKey(slug)
+        let url = HookManager.planeURL(slug, workerURL: workerURL)
+        let existing: [PlaneWebhook]
+        switch client.webhooks() {
+        case .success(let list): existing = list.filter { $0.url == url }
+        case .failure(let e):
+            let s = planeDenied(e) ? HookStatus.pollingOnly("Not a workspace admin") : .error(e.message)
             setStatus(key, s); return s
         }
-        _ = api.putOrgHook(org: org, id: id)
-        _ = gh(["api", "-X", "POST", "orgs/\(org)/hooks/\(id)/pings"])
-        setStatus(key, .waiting)
-        return .waiting
+        if let hook = existing.first(where: { $0.id == relayHookId }), hook.isActive, existing.count == 1 {
+            setStatus(key, .waiting)
+            return .waiting
+        }
+        for hook in existing { _ = client.deleteWebhook(id: hook.id) }
+        switch client.createWebhook(url: url) {
+        case .failure(let e):
+            let s = planeDenied(e) ? HookStatus.pollingOnly("Not a workspace admin") : .error(e.message)
+            setStatus(key, s); return s
+        case .success(let made):
+            guard api.putPlaneHook(workspace: slug, id: made.id, secret: made.secret) else {
+                _ = client.deleteWebhook(id: made.id)
+                setStatus(key, .error("The relay did not save the secret")); return .error("The relay did not save the secret")
+            }
+            setStatus(key, .waiting)
+            return .waiting
+        }
     }
 
-    func checkOrg(org: String, workerURL: String) -> HookStatus {
-        let key = "org:\(org)"
-        let id: Int
-        switch findOrg(org: org, url: workerURL + "/webhook") {
-        case .failed(let s): setStatus(key, s); return s
-        case .missing: setStatus(key, .error("No hook")); return .error("No hook")
-        case .found(let found): id = found
-        }
-        guard let r = gh(["api", "orgs/\(org)/hooks/\(id)/deliveries?per_page=5",
-                          "--jq", "[.[] | {status_code, delivered_at}]"]), r.ok,
-              let list = try? JSONDecoder().decode([Delivery].self, from: r.out) else {
-            setStatus(key, .waiting); return .waiting
-        }
-        guard let last = list.first else { setStatus(key, .waiting); return .waiting }
-        let ago = parseISO(last.delivered_at).map { relativeAgo($0) } ?? ""
+    // Plane has no delivery log in its API, so the relay gives the last delivery.
+    func checkPlane(_ client: PlaneClient, workerURL: String, relayHook: RelayPlaneHook?) -> HookStatus {
+        let key = HookManager.planeKey(client.workspace.slug)
+        let url = HookManager.planeURL(client.workspace.slug, workerURL: workerURL)
         let s: HookStatus
-        switch last.status_code {
-        case 200..<300: s = .live("\(last.status_code) · \(ago)")
-        case 401: s = .error("Secret mismatch (401) · \(ago)")
-        default: s = .error("HTTP \(last.status_code) · \(ago)")
+        switch client.webhooks() {
+        case .failure(let e):
+            s = planeDenied(e) ? .pollingOnly("Not a workspace admin") : .error(e.message)
+        case .success(let list):
+            if let hook = list.first(where: { $0.url == url }) {
+                if !hook.isActive { s = .error("Off in Plane. Click Add to turn it on.") }
+                else if relayHook?.hookId != hook.id { s = .error("The relay has no secret. Click Add.") }
+                else if let at = relayHook?.lastDelivery { s = .live(relativeAgo(Date(timeIntervalSince1970: at / 1000))) }
+                else { s = .waiting }
+            } else {
+                s = relayHook == nil ? .unknown : .error("No hook")
+            }
         }
         setStatus(key, s)
         return s
     }
 
-    func patchOrgSecret(org: String, hookId: Int, secret: String) -> Bool {
-        let body: [String: Any] = ["config": ["url": RELAY.workerURL + "/webhook", "content_type": "json",
-                                              "secret": secret, "insecure_ssl": "0"]]
-        return gh(["api", "-X", "PATCH", "orgs/\(org)/hooks/\(hookId)", "--jq", ".id"], body: body)?.ok == true
-    }
-
-    func deleteOrg(org: String, hookId: Int) -> Bool {
-        let ok = gh(["api", "-X", "DELETE", "orgs/\(org)/hooks/\(hookId)"])?.ok == true
-        lock.lock()
-        let drop = _statuses.keys.filter { $0.lowercased() == "org:\(org.lowercased())" }
-        for k in drop { _statuses[k] = nil }
-        lock.unlock()
+    func deletePlane(_ client: PlaneClient, hookId: String) -> Bool {
+        let ok = client.deleteWebhook(id: hookId).isSuccess
+        lock.lock(); _statuses[HookManager.planeKey(client.workspace.slug)] = nil; lock.unlock()
         return ok
     }
+
+    private func planeDenied(_ e: PlaneError) -> Bool { e == .forbidden || e == .unauthorized }
+}
+
+extension Result {
+    var isSuccess: Bool { if case .success = self { return true }; return false }
 }
 
 func relativeAgo(_ d: Date) -> String {
@@ -772,6 +783,69 @@ final class RelayDeployer {
         return false
     }
 
+    // Deploys the bundled Worker over an older one, then moves this Mac to it:
+    // registers again, adds the Plane webhooks and deletes the old GitHub org hooks.
+    func updateRelay() -> Bool {
+        if case .success(let h) = api.health() {
+            let old = Dictionary(h.oldOrgHooks.compactMap { o in o.hookId.map { (o.org, $0) } }, uniquingKeysWith: { a, _ in a })
+            if !old.isEmpty {
+                onMain { RELAY.oldOrgHooks = (RELAY.oldOrgHooks ?? [:]).merging(old) { a, _ in a }; saveConfig() }
+            }
+        }
+        guard deploy() else { return false }
+        let orgs = trackedOrgs()
+        if case .failure(let f) = api.registerSelf(name: Host.current().localizedName ?? "Mac", repos: onMain { REPOS }, orgs: orgs) {
+            append("Register this Mac: \(f.description)")
+        }
+        let slugs = onMain { trackedWorkspaces() }
+        if !slugs.isEmpty { _ = installPlaneHooks(slugs) }
+        _ = deleteOldOrgHooks()
+        return true
+    }
+
+    // Keeps the hooks that it cannot delete, to try again later.
+    func deleteOldOrgHooks() -> Bool {
+        let pending = onMain { RELAY.oldOrgHooks ?? [:] }
+        guard !pending.isEmpty else { return true }
+        var left = pending
+        var noScope = false
+        for (org, id) in pending.sorted(by: { $0.key < $1.key }) {
+            switch hooks.deleteOrgHook(org: org, hookId: id) {
+            case .deleted: left[org] = nil; append("\(org): old GitHub org hook deleted")
+            case .noScope: noScope = true
+            case .failed(let e): append("\(org): old GitHub org hook not deleted (\(e))")
+            }
+        }
+        if noScope {
+            append("Old GitHub org hooks need the admin:org_hook scope. Run: gh auth refresh -h github.com -s admin:org_hook")
+        }
+        onMain { RELAY.oldOrgHooks = left.isEmpty ? nil : left; saveConfig() }
+        return left.isEmpty
+    }
+
+    // An older relay than the app bundles updates without a click. That needs wrangler and a Cloudflare login.
+    func updateIfOld(then: ((Bool) -> Void)? = nil) {
+        guard !RELAY.workerURL.isEmpty else { return }
+        work.async {
+            guard let v = self.api.discover().flatMap({ Int($0.version ?? "") }) else { return }
+            guard v < RELAY_BUNDLED_VERSION else {
+                if self.onMain({ RELAY.oldOrgHooks != nil }) { _ = self.deleteOldOrgHooks() }
+                return
+            }
+            self.tools.findNode()
+            guard self.tools.wranglerVersion() != nil,
+                  RelayDeployer.parseWhoami(self.tools.wrangler(["whoami", "--json"]).output) != nil else {
+                self.append("Relay v\(v) is old. Log in to Cloudflare in Settings → Live updates to update it.")
+                return
+            }
+            DispatchQueue.main.async {
+                self.perform("Update relay v\(v) to v\(RELAY_BUNDLED_VERSION)", self.updateRelay) { ok in
+                    self.refreshState { then?(ok) }
+                }
+            }
+        }
+    }
+
     // The first Mac makes the webhook secret. Later Macs read it from the relay after they join.
     func ensureWebhookSecret() -> Bool {
         let list = tools.wrangler(["secret", "list"])
@@ -833,11 +907,14 @@ final class RelayDeployer {
         }
     }
 
-    func trackedOrgs() -> [String] {
-        let read = { (NSApp.delegate as? GHActionsBar)?.trackedOrgLogins() ?? [] }
-        if Thread.isMainThread { return read() }
-        return DispatchQueue.main.sync(execute: read)
-    }
+    // Set by the app. Called on the main thread.
+    var planeClient: (String) -> PlaneClient? = { _ in nil }
+    var trackedWorkspaces: () -> [String] = { [] }
+
+    private func onMain<T>(_ f: () -> T) -> T { Thread.isMainThread ? f() : DispatchQueue.main.sync(execute: f) }
+
+    // Plane workspaces register as "plane:<slug>". The relay sends them to this Mac only.
+    func trackedOrgs() -> [String] { onMain { trackedWorkspaces() }.map(HookManager.planeKey) }
 
     func registerRepos() {
         let api = self.api, repos = REPOS, orgs = trackedOrgs()
@@ -875,41 +952,61 @@ final class RelayDeployer {
         }
     }
 
-    func installOrgHooks(orgs: [String]) -> Bool {
-        guard let secret = webhookSecret() else { append("The webhook secret is not available"); return false }
+    func installPlaneHooks(_ slugs: [String]) -> Bool {
+        guard case .success(let h) = api.health() else { append("Relay health check failed"); return false }
+        guard Int(h.version ?? "") ?? 0 >= RELAY_BUNDLED_VERSION else {
+            append("The relay is too old for Plane webhooks. Update the relay first."); return false
+        }
         let api = self.api, url = RELAY.workerURL
         var ok = true
-        for org in orgs {
-            let s = hooks.ensureOrg(org: org, workerURL: url, secret: secret, api: api)
-            append("\(org) (org): \(describe(s))")
+        for slug in slugs {
+            guard let client = onMain({ planeClient(slug) }) else { append("\(slug): no token"); ok = false; continue }
+            let known = h.planeHooks.first { $0.workspace == slug }?.hookId
+            let s = hooks.ensurePlane(client, workerURL: url, relayHookId: known, api: api)
+            append("\(slug) (Plane): \(describe(s))")
             if case .error = s { ok = false }
-            if case .pollingOnly = s {
-                append("Org webhooks need an org owner. If you are one, run in Terminal: gh auth refresh -s admin:org_hook")
-            }
+            if case .pollingOnly = s { append("A Plane webhook needs a workspace admin. \(slug) stays on polling.") }
         }
         return ok
     }
 
-    func checkOrgHooks(orgs: [String]) {
+    func checkPlaneHooks(_ slugs: [String]) {
         let url = RELAY.workerURL
-        guard !url.isEmpty, !orgs.isEmpty else { return }
+        guard !url.isEmpty, !slugs.isEmpty else { return }
+        let api = self.api
+        let clients = slugs.compactMap { planeClient($0) }
         work.async {
-            DispatchQueue.concurrentPerform(iterations: orgs.count) { _ = self.hooks.checkOrg(org: orgs[$0], workerURL: url) }
+            let h = try? api.health().get()
+            for c in clients {
+                _ = self.hooks.checkPlane(c, workerURL: url, relayHook: h?.planeHooks.first { $0.workspace == c.workspace.slug })
+            }
             DispatchQueue.main.async { self.onChange?() }
         }
     }
 
-    // Deletes org hooks that no device tracks any more.
-    func pruneOrgHooks(removed: [String]) {
+    // Deletes Plane hooks of workspaces that no device tracks any more.
+    func prunePlaneHooks(removed: [String]) {
         guard !removed.isEmpty, !RELAY.workerURL.isEmpty else { return }
         let api = self.api
+        let clients = removed.compactMap { planeClient($0) }
         work.async {
             guard case .success(let h) = api.health() else { return }
-            let others = Set(h.devices.filter { $0.id != RELAY.deviceID }.flatMap { $0.orgs.map { $0.lowercased() } })
-            for org in removed where !others.contains(org.lowercased()) {
-                guard let hook = h.orgHooks.first(where: { $0.org == org.lowercased() }), let id = hook.hookId else { continue }
-                if self.hooks.deleteOrg(org: org, hookId: id) { _ = api.deleteOrgHook(org: org) }
+            let others = Set(h.devices.filter { $0.id != RELAY.deviceID }.flatMap { $0.orgs })
+            for c in clients where !others.contains(HookManager.planeKey(c.workspace.slug)) {
+                guard let id = h.planeHooks.first(where: { $0.workspace == c.workspace.slug })?.hookId else { continue }
+                if self.hooks.deletePlane(c, hookId: id) { _ = api.deletePlaneHook(workspace: c.workspace.slug) }
             }
+        }
+    }
+
+    // Before the token goes away: deletes the Plane hook of the workspace, also if other Macs use it.
+    func removePlaneHook(_ slug: String) {
+        guard !RELAY.workerURL.isEmpty, let client = planeClient(slug) else { return }
+        let api = self.api
+        work.async {
+            guard case .success(let h) = api.health(),
+                  let id = h.planeHooks.first(where: { $0.workspace == slug })?.hookId else { return }
+            if self.hooks.deletePlane(client, hookId: id) { _ = api.deletePlaneHook(workspace: slug) }
         }
     }
 
@@ -955,15 +1052,7 @@ final class RelayDeployer {
                 append("\(hook.repo): not updated. Click Repair on a Mac with admin access to this repo.")
             }
         }
-        for hook in h.orgHooks {
-            guard let id = hook.hookId else { continue }
-            if hooks.patchOrgSecret(org: hook.org, hookId: id, secret: secret) {
-                append("\(hook.org) (org): updated")
-            } else {
-                ok = false
-                append("\(hook.org) (org): not updated. An org owner can click Add project events again.")
-            }
-        }
+        // Plane hooks have their own secrets. They do not change.
         return ok
     }
 
@@ -974,9 +1063,13 @@ final class RelayDeployer {
                 guard let id = hook.hookId else { continue }
                 append("\(hook.repo): \(hooks.delete(repo: hook.repo, hookId: id) ? "hook deleted" : "hook not deleted")")
             }
-            for hook in h.orgHooks {
+            for hook in h.planeHooks {
                 guard let id = hook.hookId else { continue }
-                append("\(hook.org): \(hooks.deleteOrg(org: hook.org, hookId: id) ? "org hook deleted" : "org hook not deleted")")
+                guard let client = onMain({ planeClient(hook.workspace) }) else {
+                    append("\(hook.workspace): no token. Delete the webhook in Plane → Workspace settings → Webhooks.")
+                    continue
+                }
+                append("\(hook.workspace): \(hooks.deletePlane(client, hookId: id) ? "Plane hook deleted" : "Plane hook not deleted")")
             }
         }
         guard tools.wrangler(["delete", RELAY_WORKER_NAME], onLine: append).ok else { return false }
@@ -1038,7 +1131,7 @@ struct Backoff {
 // The consumer of relay events. GHActionsBar implements it.
 protocol RelaySink: AnyObject {
     func relayRefresh(repos: [String], includePRs: Bool, completedRuns: [(String, Int)], done: @escaping (Bool) -> Void)
-    func relayProjectRefresh(projectNodeIds: [String], issues: [(repo: String, number: Int)], done: @escaping (Bool) -> Void)
+    func relayProjectRefresh(_ events: [(workspace: String, project: String?)], done: @escaping (Bool) -> Void)
     func relayFullRefresh(done: @escaping (Bool) -> Void)
     func relayStateChanged()
 }
@@ -1048,10 +1141,9 @@ struct RelayApplyPlan {
     var repos: [String] = []
     var includePRs = false
     var completedRuns: [(String, Int)] = []
-    var projectNodeIds: [String] = []
-    var issues: [(repo: String, number: Int)] = []
+    var plane: [(workspace: String, project: String?)] = []   // nil project: the whole workspace
     var wantsRepoRefresh: Bool { !repos.isEmpty }
-    var wantsProjectRefresh: Bool { !projectNodeIds.isEmpty || !issues.isEmpty }
+    var wantsProjectRefresh: Bool { !plane.isEmpty }
 }
 
 func relayApplyPlan(_ events: [RelayEvent], knownRepos: [String]) -> RelayApplyPlan {
@@ -1065,15 +1157,12 @@ func relayApplyPlan(_ events: [RelayEvent], knownRepos: [String]) -> RelayApplyP
             if e.kind == "workflow_run", e.action == "completed", let id = e.runId, let r = byLower[e.repo] {
                 plan.completedRuns.append((r, id))
             }
-        case "projects_v2", "projects_v2_item":
-            if let id = e.projectId, !plan.projectNodeIds.contains(id) { plan.projectNodeIds.append(id) }
-        case "issues", "issue_comment":
-            if let n = e.issueNumber, !e.repo.isEmpty {
-                let repo = byLower[e.repo] ?? e.repo
-                if !plan.issues.contains(where: { $0.repo == repo && $0.number == n }) {
-                    plan.issues.append((repo, n))
-                }
-            }
+        case "plane":
+            guard let org = e.org, org.hasPrefix("plane:") else { break }
+            let slug = String(org.dropFirst(6))
+            if plan.plane.contains(where: { $0.workspace == slug && ($0.project == nil || $0.project == e.projectId) }) { break }
+            if e.projectId == nil { plan.plane.removeAll { $0.workspace == slug } }
+            plan.plane.append((slug, e.projectId))
         default:
             break
         }
@@ -1322,8 +1411,8 @@ final class RelayClient: NSObject, URLSessionWebSocketDelegate {
         }
         if plan.wantsProjectRefresh {
             group.enter()
-            log.info("Relay: project refresh for \(plan.projectNodeIds.count) project(s), \(plan.issues.count) issue(s)")
-            sink.relayProjectRefresh(projectNodeIds: plan.projectNodeIds, issues: plan.issues, done: note)
+            log.info("Relay: Plane refresh for \(plan.plane.count) project(s)")
+            sink.relayProjectRefresh(plan.plane, done: note)
         }
         group.notify(queue: .main) { finish(ok) }
     }

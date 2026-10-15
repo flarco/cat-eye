@@ -36,6 +36,8 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
     private static var shared: ItemWindow?
     private static let descriptionCap: CGFloat = 320
 
+    static var isOpen: Bool { shared?.window?.isVisible == true }
+
     static func show(_ itemId: String) {
         guard let store = (NSApp.delegate as? GHActionsBar)?.projectStore else { return }
         let w = shared ?? ItemWindow(store: store)
@@ -65,6 +67,9 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
     private var keyMonitor: Any?
     private var observer: Any?
     private var scrollObserver: Any?
+    private var agentObserver: Any?
+    private var agentTail: (key: String, lines: [String], at: Date)?
+    private var agents: AgentIndex? { (NSApp.delegate as? GHActionsBar)?.agentIndex.ready }
 
     init(store: ProjectStore) {
         self.store = store
@@ -81,6 +86,11 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
         markdown.onHeight = { [weak self] _ in self?.rebuild() }
         observer = NotificationCenter.default.addObserver(forName: ProjectStore.changed, object: store, queue: .main) { [weak self] _ in
             self?.storeChanged()
+        }
+        if let a = (NSApp.delegate as? GHActionsBar)?.agentIndex {
+            agentObserver = NotificationCenter.default.addObserver(forName: AgentIndex.changed, object: a, queue: .main) { [weak self] _ in
+                self?.storeChanged()
+            }
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.key(e) ?? e }
     }
@@ -288,6 +298,21 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
             s.toolTip = "Set In progress and assign me"
             place(s)
         }
+        if let agents {
+            if let a = agents.agent(item.key) {
+                let tint: NSColor = a.phase == .waiting ? .systemOrange : a.phase == .done ? .systemGreen
+                    : a.phase == .failed ? C_FAILURE : AgentPill.orca
+                let c = Chip("◉ " + a.label(), menu: false, tint: tint)
+                c.target = self; c.action = #selector(agentChip(_:))
+                c.toolTip = a.phase == .failed ? (a.message ?? "") : "Open the terminal in Orca"
+                place(c)
+            } else {
+                let c = Chip("▶ Start in Orca", menu: false, tint: AgentPill.orca)
+                c.target = self; c.action = #selector(startOrca(_:))
+                c.toolTip = "Open a Claude session for \(item.key) in Orca and send the prompt"
+                place(c)
+            }
+        }
         if let error {
             y += 28
             let e = NSTextField(labelWithString: error)
@@ -352,6 +377,7 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
             return y + 40
         }
 
+        y = agentCard(item: item, y: y, w: w, pad: pad, in: doc)
         section("DESCRIPTION", x: pad, y: y, in: doc)
         let text = (item.body ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let seg = NSSegmentedControl(labels: ["Rendered", "Code"], trackingMode: .selectOne,
@@ -461,9 +487,15 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
         y += 28
         for kid in kids {
             let p = snap.progress(of: kid.id)
+            let agent = agents?.agent(kid.key)
             let row = ProjectItemRow(item: kid, snap: snap, unread: store.isUnread(itemId: kid.id), last: nil, w: w,
-                                     expanded: false, progress: p.total > 0 ? p : nil)
+                                     expanded: false, progress: p.total > 0 ? p : nil, agent: agent,
+                                     canStart: agents != nil && agent == nil && snap.option(kid.statusOptionId)?.category ?? .todo == .todo)
             row.onToggle = { [weak self] in self?.open(kid.id, push: true) }
+            if let agents {
+                row.onStart = { [weak agents] anchor in agents?.start(kid, snap: snap, anchor: anchor) }
+                row.onPill = { [weak agents] anchor in agents?.pillClicked(kid, snap: snap, anchor: anchor) }
+            }
             row.onAgent = { [weak self] in self?.store.copyForAgent(kid.id) }
             row.frame.origin = NSPoint(x: 0, y: y)
             doc.addSubview(row)
@@ -670,6 +702,108 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
             self.saving = nil
             self.error = ok ? nil : (self.store.lastError ?? "Could not start the item")
             self.rebuild()
+        }
+    }
+
+    // The live agent of the item: state, prompt, buttons and the last lines of its terminal.
+    private func agentCard(item: ProjectItem, y: CGFloat, w: CGFloat, pad: CGFloat, in doc: NSView) -> CGFloat {
+        guard let agents, let a = agents.agent(item.key), a.phase != .failed else { return y }
+        let cw = w - pad * 2
+        let box = NSView(frame: NSRect(x: pad, y: y, width: cw, height: 52))
+        box.wantsLayer = true
+        box.layer?.cornerRadius = 8
+        box.layer?.borderWidth = 1
+        box.layer?.borderColor = NSColor.separatorColor.cgColor
+        box.layer?.backgroundColor = AgentPill.orca.withAlphaComponent(0.1).cgColor
+        doc.addSubview(box)
+        let open = button("Open terminal", #selector(revealAgent), in: doc)
+        open.frame.origin = NSPoint(x: pad + cw - open.frame.width - 8, y: y + 13)
+        let send = button("Send…", #selector(sendAgent), in: doc)
+        send.frame.origin = NSPoint(x: open.frame.minX - send.frame.width - 6, y: y + 13)
+        let words: String
+        switch a.phase {
+        case .working: words = "Agent working · " + ItemAgent.minutes(Date().timeIntervalSince(a.since))
+        case .waiting: words = "Agent needs input"
+        case .done: words = "Agent done"
+        default: words = "Agent starting…"
+        }
+        let t = NSTextField(labelWithString: "◉ " + words)
+        t.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        t.frame = NSRect(x: pad + 11, y: y + 8, width: send.frame.minX - pad - 20, height: 17)
+        doc.addSubview(t)
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm"
+        var sub = [a.type, a.repo.isEmpty ? "Orca" : a.repo, PROJECTS_CFG.orca.environment ?? "this Mac"].joined(separator: " · ")
+        if let p = a.prompt, !p.isEmpty { sub += " \"\(p.count > 70 ? p.prefix(70) + "…" : Substring(p))\"" }
+        sub += " · since " + df.string(from: a.since)
+        let st = NSTextField(labelWithString: sub)
+        st.font = .systemFont(ofSize: 11); st.textColor = .secondaryLabelColor
+        st.lineBreakMode = .byTruncatingTail; st.toolTip = a.prompt
+        st.frame = NSRect(x: pad + 11, y: y + 27, width: send.frame.minX - pad - 20, height: 15)
+        doc.addSubview(st)
+        var out = y + 60
+        let key = item.key.uppercased()
+        if agentTail?.key != key || -(agentTail?.at.timeIntervalSinceNow ?? 99) > 10 {
+            agentTail = (key, agentTail?.key == key ? agentTail?.lines ?? [] : [], Date())
+            agents.tail(item.key) { [weak self] lines in
+                guard let self, self.agentTail?.key == key, lines != self.agentTail?.lines else { return }
+                self.agentTail = (key, lines, Date())
+                self.storeChanged()
+            }
+        }
+        if let lines = agentTail?.lines, agentTail?.key == key, !lines.isEmpty {
+            let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            let h = CGFloat(lines.count) * 15 + 16
+            let term = NSView(frame: NSRect(x: pad, y: out, width: cw, height: h))
+            term.wantsLayer = true
+            term.layer?.cornerRadius = 8
+            term.layer?.backgroundColor = NSColor(red: 0.08, green: 0.1, blue: 0.12, alpha: 1).cgColor
+            doc.addSubview(term)
+            let l = NSTextField(labelWithString: lines.joined(separator: "\n"))
+            l.font = font
+            l.textColor = NSColor(red: 0.81, green: 0.85, blue: 0.88, alpha: 1)
+            l.lineBreakMode = .byTruncatingTail
+            l.maximumNumberOfLines = lines.count
+            l.frame = NSRect(x: pad + 12, y: out + 8, width: cw - 24, height: h - 16)
+            doc.addSubview(l)
+            out += h + 8
+        }
+        return out + 8
+    }
+
+    @objc private func startOrca(_ sender: NSButton) {
+        guard let id = itemId, let found = store.item(id) else { return }
+        agents?.start(found.item, snap: found.snap, anchor: sender)
+    }
+
+    @objc private func agentChip(_ sender: NSButton) {
+        guard let id = itemId, let found = store.item(id) else { return }
+        agents?.pillClicked(found.item, snap: found.snap, anchor: sender)
+    }
+
+    @objc private func revealAgent() {
+        if let id = itemId, let key = store.item(id)?.item.key { agents?.reveal(key) }
+    }
+
+    @objc private func sendAgent() {
+        guard let id = itemId, let key = store.item(id)?.item.key, let win = window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Send to the agent of \(key)"
+        alert.informativeText = "Cat Eye types the text into the Orca terminal and presses Return."
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        tf.placeholderString = "also add a test"
+        alert.accessoryView = tf
+        alert.addButton(withTitle: "Send")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = tf
+        alert.beginSheetModal(for: win) { [weak self] r in
+            let text = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard r == .alertFirstButtonReturn, !text.isEmpty else { return }
+            self?.agents?.send(key, text: text) { e in
+                guard let self else { return }
+                self.error = e?.message
+                self.rebuild()
+            }
         }
     }
 

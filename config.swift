@@ -59,6 +59,8 @@ struct ProjectNotificationSettings: Codable {
     var closed = NotifyScope(any: false, mine: true)
     var otherFields = NotifyScope(any: false, mine: false)
     var intake = true
+    var agentWaiting = true
+    var agentDone = true
 
     init() {}
 
@@ -72,6 +74,8 @@ struct ProjectNotificationSettings: Codable {
         closed = try c.decodeIfPresent(NotifyScope.self, forKey: .closed) ?? NotifyScope(any: false, mine: true)
         otherFields = try c.decodeIfPresent(NotifyScope.self, forKey: .otherFields) ?? NotifyScope(any: false, mine: false)
         intake = try c.decodeIfPresent(Bool.self, forKey: .intake) ?? true
+        agentWaiting = try c.decodeIfPresent(Bool.self, forKey: .agentWaiting) ?? true
+        agentDone = try c.decodeIfPresent(Bool.self, forKey: .agentDone) ?? true
     }
 }
 
@@ -92,6 +96,7 @@ struct ProjectsConfig: Codable {
     var order: [String] = []          // project keys, top to bottom
     var folded: [String] = []         // project keys that show only the header
     var capture = CaptureConfig()
+    var orca = OrcaConfig()
 
     init() {}
 
@@ -116,6 +121,7 @@ struct ProjectsConfig: Codable {
         order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
         folded = try c.decodeIfPresent([String].self, forKey: .folded) ?? []
         capture = try c.decodeIfPresent(CaptureConfig.self, forKey: .capture) ?? CaptureConfig()
+        orca = try c.decodeIfPresent(OrcaConfig.self, forKey: .orca) ?? OrcaConfig()
     }
 
     // Keys in `order` come first. Projects not in it follow by workspace, then title.
@@ -155,6 +161,49 @@ struct CaptureConfig: Codable, Equatable {
         modifiers = try c.decodeIfPresent(UInt32.self, forKey: .modifiers) ?? 0x1800
         pasteClipboard = try c.decodeIfPresent(Bool.self, forKey: .pasteClipboard) ?? true
         aiTitle = try c.decodeIfPresent(Bool.self, forKey: .aiTitle) ?? true
+    }
+}
+
+// ▶ starts a Plane item in an Orca terminal. `roots` maps a project key ("slug/uuid")
+// to the Orca workspace folder. The environment is per Mac: nil runs on this Mac.
+struct OrcaConfig: Codable, Equatable {
+    static let defaultPrompt = "work on {url} in worktree group .wt/{key}"
+
+    var enabled = true
+    var cli = OrcaClient.defaultPath
+    var environment: String?
+    var agent = "claude"
+    var prompt = OrcaConfig.defaultPrompt
+    var roots: [String: String] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        cli = try c.decodeIfPresent(String.self, forKey: .cli) ?? OrcaClient.defaultPath
+        environment = try c.decodeIfPresent(String.self, forKey: .environment)
+        agent = try c.decodeIfPresent(String.self, forKey: .agent) ?? "claude"
+        prompt = try c.decodeIfPresent(String.self, forKey: .prompt) ?? OrcaConfig.defaultPrompt
+        roots = try c.decodeIfPresent([String: String].self, forKey: .roots) ?? [:]
+    }
+
+    // {url}, {key} (lowercase), {KEY} and {title}.
+    func prompt(for item: ProjectItem) -> String {
+        (prompt.isEmpty ? OrcaConfig.defaultPrompt : prompt)
+            .replacingOccurrences(of: "{url}", with: item.url)
+            .replacingOccurrences(of: "{KEY}", with: item.key)
+            .replacingOccurrences(of: "{key}", with: item.key.lowercased())
+            .replacingOccurrences(of: "{title}", with: item.title)
+    }
+
+    var client: OrcaClient { OrcaClient(exe: cli, environment: environment) }
+
+    // The Orca workspace whose name matches the project: "towertail-workspace" for TOWERTAIL.
+    static func guess(_ p: ProjectSummary, _ repos: [OrcaRepo]) -> String? {
+        let names = [p.identifier, p.title].map { $0.lowercased() }.flatMap { [$0 + "-workspace", $0] }
+        for n in names { if let r = repos.first(where: { $0.name.lowercased() == n }) { return r.path } }
+        return nil
     }
 }
 

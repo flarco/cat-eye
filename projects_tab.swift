@@ -391,17 +391,83 @@ final class ProjectHeader: NSView {
     override func mouseExited(with event: NSEvent) { grip?.alphaValue = 0 }
 }
 
+// Orca agent state of an item. A click opens its terminal.
+final class AgentPill: NSView {
+    static let orca = NSColor(name: nil) { a in
+        a.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor(red: 0.64, green: 0.55, blue: 1, alpha: 1)
+            : NSColor(red: 0.42, green: 0.31, blue: 0.85, alpha: 1)
+    }
+    var onClick: (() -> Void)?
+    private let color: NSColor
+    private let dashed: Bool
+
+    init(_ agent: ItemAgent) {
+        switch agent.phase {
+        case .working: color = AgentPill.orca
+        case .waiting: color = .systemOrange
+        case .done: color = .systemGreen
+        case .starting, .failed: color = .secondaryLabelColor
+        }
+        dashed = agent.phase == .starting || agent.phase == .failed
+        let l = NSTextField(labelWithString: agent.label())
+        l.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        l.textColor = agent.phase == .failed ? .systemRed : color
+        let tw = ceil(l.intrinsicContentSize.width)
+        super.init(frame: NSRect(x: 0, y: 0, width: tw + 26, height: 18))
+        l.frame = NSRect(x: 19, y: 1, width: tw + 2, height: 15)
+        addSubview(l)
+        let dot = NSView(frame: NSRect(x: 8, y: 5.5, width: 7, height: 7))
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = (agent.phase == .failed ? NSColor.systemRed : color).cgColor
+        dot.layer?.cornerRadius = 3.5
+        if agent.phase == .working || agent.phase == .starting {
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1; pulse.toValue = 0.25; pulse.duration = 0.6
+            pulse.autoreverses = true; pulse.repeatCount = .infinity
+            dot.layer?.add(pulse, forKey: "pulse")
+        }
+        addSubview(dot)
+        var tip = "\(agent.type) · \(agent.repo.isEmpty ? "Orca" : agent.repo)"
+        if let m = agent.message, !m.isEmpty { tip += "\n" + String(m.prefix(300)) }
+        toolTip = tip + (agent.phase == .failed ? "" : "\nClick to open the terminal in Orca")
+        setAccessibilityRole(.button)
+        setAccessibilityLabel("Agent: " + agent.label())
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let p = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8.5, yRadius: 8.5)
+        if dashed {
+            NSColor.separatorColor.setStroke()
+            p.setLineDash([3, 2], count: 2, phase: 0)
+            p.lineWidth = 1; p.stroke()
+        } else {
+            color.withAlphaComponent(0.16).setFill(); p.fill()
+        }
+    }
+    override func mouseUp(with event: NSEvent) { if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() } }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
 final class ProjectItemRow: NSView {
     var onToggle: (() -> Void)?
     var onAgent: (() -> Void)?
+    var onStart: ((NSView) -> Void)?
+    var onPill: ((NSView) -> Void)?
     let urlStr: String
     let expanded: Bool
+    private var play: NSButton?
+    private var hasAgent = false
 
+    // `agent` shows a pill. `canStart` shows ▶ on hover when no agent works on the item.
     init(item: ProjectItem, snap: ProjectSnapshot, unread: Bool, last: String?, w: CGFloat, expanded: Bool,
-         progress: (done: Int, total: Int)? = nil) {
+         progress: (done: Int, total: Int)? = nil, agent: ItemAgent? = nil, canStart: Bool = false) {
         self.urlStr = item.url
         self.expanded = expanded
         super.init(frame: NSRect(x: 0, y: 0, width: w, height: ROW_H))
+        let pill = agent.map(AgentPill.init)
+        hasAgent = agent != nil
+        let reserve: CGFloat = pill.map { $0.frame.width + 6 } ?? (canStart ? 28 : 0)
         wantsLayer = true
         layer?.backgroundColor = expanded ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.1).cgColor : nil
         let opt = snap.option(item.statusOptionId)
@@ -417,7 +483,7 @@ final class ProjectItemRow: NSView {
         let title = NSTextField(labelWithString: item.title)
         title.font = .systemFont(ofSize: 12.5, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
-        title.frame = NSRect(x: textX, y: ROW_H - 24, width: w - textX - 200, height: 18)
+        title.frame = NSRect(x: textX, y: ROW_H - 24, width: w - textX - 200 - reserve, height: 18)
         title.toolTip = item.title
         addSubview(title)
         var x = textX
@@ -455,11 +521,11 @@ final class ProjectItemRow: NSView {
         let meta = NSTextField(labelWithString: who)
         meta.font = .systemFont(ofSize: 10); meta.textColor = .secondaryLabelColor
         meta.alignment = .right
-        meta.frame = NSRect(x: w - 196, y: ROW_H - 22, width: 120, height: 14)
+        meta.frame = NSRect(x: w - 196 - reserve, y: ROW_H - 22, width: 120, height: 14)
         addSubview(meta)
         let time = NSTextField(labelWithString: relativeTime(item.updatedAt))
         time.font = .systemFont(ofSize: 10); time.textColor = .secondaryLabelColor; time.alignment = .right
-        time.frame = NSRect(x: w - 196, y: 8, width: 120, height: 14)
+        time.frame = NSRect(x: w - 196 - reserve, y: 8, width: 120, height: 14)
         addSubview(time)
         if let last = last, !last.isEmpty {
             title.toolTip = (title.toolTip ?? item.title) + "\n" + last
@@ -474,6 +540,20 @@ final class ProjectItemRow: NSView {
         cp.isBordered = false; cp.target = self; cp.action = #selector(copyMenu(_:))
         cp.toolTip = "Copy"
         addSubview(cp)
+        if let pill {
+            pill.frame.origin = NSPoint(x: w - 66 - pill.frame.width, y: (ROW_H - 18) / 2)
+            pill.onClick = { [weak self, weak pill] in if let pill { self?.onPill?(pill) } }
+            addSubview(pill)
+        } else if canStart {
+            let b = NSButton(frame: NSRect(x: w - 92, y: (ROW_H - 22) / 2, width: 28, height: 22))
+            b.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Start in Orca")
+            b.contentTintColor = AgentPill.orca
+            b.isBordered = false; b.target = self; b.action = #selector(startAgent(_:))
+            b.toolTip = "Start \(item.key) in Orca"
+            b.alphaValue = 0
+            addSubview(b)
+            play = b
+        }
         let sub = progress.map { ", \($0.done) of \($0.total) sub-items done" } ?? ""
         setAccessibilityLabel("\(item.title), \(opt?.name ?? "no status")" + sub)
     }
@@ -482,8 +562,13 @@ final class ProjectItemRow: NSView {
         let menu = NSMenu()
         menu.addItem(withTitle: "Copy link", action: #selector(copyLink), keyEquivalent: "").target = self
         menu.addItem(withTitle: "Copy for agent", action: #selector(copyAgent), keyEquivalent: "").target = self
+        if onStart != nil, play == nil {
+            menu.addItem(.separator())
+            menu.addItem(withTitle: hasAgent ? "Start another agent in Orca" : "Start in Orca", action: #selector(startAgent(_:)), keyEquivalent: "").target = self
+        }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
     }
+    @objc func startAgent(_ sender: Any) { onStart?(play ?? (sender as? NSView) ?? self) }
     @objc func openLink() { if let u = URL(string: urlStr) { NSWorkspace.shared.open(u) } }
     @objc func copyLink() {
         NSPasteboard.general.clearContents()
@@ -509,6 +594,7 @@ final class ProjectItemRow: NSView {
         hovered = on
         let base = expanded ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.1).cgColor : nil
         layer?.backgroundColor = on ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.15).cgColor : base
+        play?.alphaValue = on ? 1 : 0
         if on, let title = subviews.compactMap({ $0 as? NSTextField }).first, title.intrinsicContentSize.width > title.bounds.width {
             HoverCard.schedule(title.stringValue, from: title)
         }
@@ -516,7 +602,7 @@ final class ProjectItemRow: NSView {
     override func mouseUp(with event: NSEvent) {
         let loc = convert(event.locationInWindow, from: nil)
         guard bounds.contains(loc) else { return }
-        if subviews.contains(where: { $0 is NSButton && $0.frame.contains(loc) }) { return }
+        if subviews.contains(where: { ($0 is NSButton || $0 is AgentPill) && $0.frame.contains(loc) }) { return }
         onToggle?()
     }
     override var acceptsFirstResponder: Bool { true }
@@ -645,6 +731,7 @@ extension TabVC {
             return [EmptyRow("Projects are not ready yet.", w: w)]
         }
         let tracked = (NSApp.delegate as? GHActionsBar)?.projectCatalog.resolve(PROJECTS_CFG) ?? []
+        let agents = (NSApp.delegate as? GHActionsBar)?.agentIndex.ready
         if PROJECTS_CFG.workspaces.isEmpty {
             return [EmptyRow("Add a Plane workspace in Settings → Projects.", w: w, icon: "square.grid.2x2")]
         }
@@ -705,8 +792,15 @@ extension TabVC {
                 let last = store.activity(limit: 20, project: key).first { $0.itemId == item.id }?.text
                 let row = ProjectItemRow(item: item, snap: snap, unread: store.isUnread(itemId: item.id),
                                          last: last, w: w, expanded: false,
-                                         progress: progress.total > 0 ? progress : nil)
+                                         progress: progress.total > 0 ? progress : nil,
+                                         agent: agents?.agent(item.key),
+                                         canStart: agents != nil && agents?.agent(item.key) == nil
+                                            && snap.option(item.statusOptionId)?.category ?? .todo == .todo)
                 row.onToggle = { ItemWindow.show(item.id) }
+                if let agents {
+                    row.onStart = { [weak agents] anchor in agents?.start(item, snap: snap, anchor: anchor) }
+                    row.onPill = { [weak agents] anchor in agents?.pillClicked(item, snap: snap, anchor: anchor) }
+                }
                 row.onAgent = { [weak store] in store?.copyForAgent(item.id) }
                 row.identifier = NSUserInterfaceItemIdentifier("item:" + item.id)
                 rows.append(row)

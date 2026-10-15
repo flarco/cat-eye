@@ -83,6 +83,24 @@ What AI does:
 
 **Extra context** is text that Cat Eye adds to each prompt, for example your team words or title rules. Cat Eye sends only the text you see in the dialog and the names of the projects, fields and options.
 
+### Orca agents (optional)
+Cat Eye can start a coding agent on a Plane item in an [Orca](https://github.com/stablyai/orca) terminal. The Orca server can be this Mac or a paired server.
+
+- **▶ Start** — hover a Todo or Backlog row and click ▶. The item window has the chip **▶ Start in Orca**. Cat Eye opens an Orca card with the item key as its name (for example `TOWERTAIL-2`). In it, Cat Eye starts `claude -n 'TOWERTAIL-2'` and sends the prompt. The copy menu of a row also has **Start in Orca**
+- **Agent pill** — a row with an agent shows its state: **Starting…**, **Working 12m**, **Needs input**, **Agent done** or **Not started**. Click the pill to open the terminal in Orca. Click **Not started** to see the error, try again or choose another workspace
+- **Agent card** — the Overview tab of the item window shows the agent, its last lines on the screen, **Send…** (type a reply to the agent) and **Open terminal**
+- **Notifications** — "Agent needs input" and "Agent done". Turn them on or off in Settings → Projects → Notifications
+- **The agent does the work** — ▶ does not change the Plane item. The agent sets In progress, does the work and closes the item. The default prompt is `work on {url} in worktree group .wt/{key}`
+
+To set it up:
+
+1. Install Orca. Cat Eye uses the CLI at `/Applications/Orca.app/Contents/Resources/bin/orca`.
+2. Open Settings → Projects → Orca. Click **Test**. The status line shows the Orca version.
+3. On a client Mac, set **Run agents on** to the paired server.
+4. Set the Orca workspace of each Plane project. If you leave "— ask each time —", ▶ shows a menu of the Orca workspaces and saves your choice.
+
+A workspace root often holds many repositories that depend on each other. The agent then makes a worktree group: one folder `.wt/<key>/` with a git worktree for each changed repository and a symlink for each other entry. The root `CLAUDE.md` tells the agent the rules of that root. The column "Root CLAUDE.md" in the settings shows whether the file tells the agent about worktree groups.
+
 ### Insights Tab
 - **Deploy log** — every run Cat Eye sees is appended to `~/.config/cat-eye/deploys.jsonl`, so your history survives restarts
 - **Last 7 days vs previous 7** — pass rate, average duration, deploy pass rate, and a per-workflow breakdown
@@ -254,6 +272,7 @@ Config lives in `~/.config/cat-eye/config.json` (managed via the Settings panel,
 | `projects.folded` | `[]` | Folded projects |
 | `projects.showSubItems` | `false` | List sub-items as rows. When it is off, the list shows top-level items only, with a sub-item ring |
 | `projects.capture` | on, ⌃⌥N | Quick capture: `enabled`, the Carbon `keyCode` and `modifiers`, `pasteClipboard` and `aiTitle`. Set it in Settings → Projects |
+| `projects.orca` | on, `claude` | Orca agents: `enabled`, `cli` (the path of the Orca CLI), `environment` (the paired Orca server, or none for this Mac), `agent`, `prompt` and `roots` (the Orca workspace path of each project key; `""` asks each time) |
 | `ai` | off | AI settings, written by **Settings → AI**. The API key is in the Keychain |
 
 ## Updates

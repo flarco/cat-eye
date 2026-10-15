@@ -79,6 +79,8 @@ final class ProjectSettingsVC: NSViewController {
             y = refreshSection(y: y, w: w, in: doc)
             y = header("QUICK CAPTURE", y: y, button: nil)
             y = captureSection(y: y, w: w, in: doc)
+            y = header("ORCA", y: y, button: nil)
+            y = orcaSection(y: y, w: w, in: doc)
             let save = NSButton(title: "Save & Apply", target: self, action: #selector(doSave))
             save.bezelStyle = .inline; save.font = .systemFont(ofSize: 12, weight: .semibold)
             save.frame = NSRect(x: w / 2 - 60, y: y + 12, width: 120, height: 28)
@@ -340,9 +342,11 @@ final class ProjectSettingsVC: NSViewController {
             ("Item is closed or set to Done", "closed", cfg.notifications.closed.any, cfg.notifications.closed.mine),
             ("Other field changes", "other", cfg.notifications.otherFields.any, cfg.notifications.otherFields.mine),
             ("Intake item is new, changed or closed", "intake", cfg.notifications.intake, false),
+            ("Orca agent needs input", "agentWaiting", cfg.notifications.agentWaiting, false),
+            ("Orca agent is done", "agentDone", cfg.notifications.agentDone, false),
         ]
         let anyDisabled: Set<String> = ["mention", "assigned"]
-        let mineDisabled: Set<String> = ["intake"]
+        let mineDisabled: Set<String> = ["intake", "agentWaiting", "agentDone"]
         for row in rows {
             let l = NSTextField(labelWithString: row.0)
             l.font = .systemFont(ofSize: 12)
@@ -535,6 +539,8 @@ final class ProjectSettingsVC: NSViewController {
         case ("other", "any"): cfg.notifications.otherFields.any = on
         case ("other", "mine"): cfg.notifications.otherFields.mine = on
         case ("intake", "any"): cfg.notifications.intake = on
+        case ("agentWaiting", "any"): cfg.notifications.agentWaiting = on
+        case ("agentDone", "any"): cfg.notifications.agentDone = on
         default: break
         }
     }
@@ -548,6 +554,9 @@ final class ProjectSettingsVC: NSViewController {
 
     @objc func doSave() {
         cfg.workspaces = PROJECTS_CFG.workspaces
+        if let f = doc?.subviews.first(where: { $0.identifier?.rawValue == "orca-prompt" }) as? NSTextField {
+            cfg.orca.prompt = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         PROJECTS_CFG = cfg
         saveConfig()
         let app = NSApp.delegate as? GHActionsBar

@@ -1132,6 +1132,59 @@ func runSelfTest() {
     cap.modifiers = 0
     check(cap.shortcutLabel == "None" && !cap.hasShortcut, "cleared shortcut")
 
+    // Orca: reply parse, agent index, prompt template.
+    if case .failure(let e) = OrcaClient.parse(Data(#"{"ok":false,"error":{"code":"runtime_unavailable","message":"no server"}}"#.utf8), stderr: "", command: "worktree ps") {
+        check(e.code == "runtime_unavailable" && e.message == "no server", "orca error reply")
+    } else { check(false, "orca error reply") }
+    if case .failure(let e) = OrcaClient.parse(Data("boom".utf8), stderr: "connect failed", command: "status") {
+        check(e.message == "orca status: connect failed", "orca non-JSON reply")
+    } else { check(false, "orca non-JSON reply") }
+    let psJSON = #"""
+    {"ok":true,"result":{"worktrees":[
+     {"worktreeId":"r1::/w::workspace:a","repo":"towertail-workspace","path":"/w","displayName":"TOWERTAIL-2","liveTerminalCount":1,"lastActivityAt":1000,
+      "agents":[{"paneKey":"t1:l1","state":"done","agentType":"claude","prompt":"second","stateStartedAt":1000000},
+                {"paneKey":"t2:l2","state":"waiting","agentType":"claude","prompt":"x","stateStartedAt":2000000}]},
+     {"worktreeId":"r2::/c","repo":"cat-eye","path":"/c","displayName":"main","liveTerminalCount":1,"lastActivityAt":1000,
+      "agents":[{"paneKey":"t3:l3","state":"working","agentType":"claude","prompt":"work on https://app.plane.so/ocral/browse/FRITZ-17/ now","stateStartedAt":3000000},
+                {"paneKey":"t4:l4","state":"done","agentType":"claude","prompt":"no key here","stateStartedAt":3000000},
+                {"paneKey":"t5:l5","state":"working","agentType":"codex","prompt":"other","stateStartedAt":3000000}]},
+     {"worktreeId":"r3::/x","repo":"x","path":"/x","displayName":"TREBI-9","liveTerminalCount":0,"lastActivityAt":1000,
+      "agents":[{"paneKey":"t6:l6","state":"done","agentType":"claude","stateStartedAt":3000000}]},
+     {"worktreeId":"r4::/y","repo":"y","path":"/y","displayName":"OLD","isArchived":true,"agents":[]}]}}
+    """#
+    if case .success(let r) = OrcaClient.parse(Data(psJSON.utf8), stderr: "", command: "worktree ps") {
+        let cards = OrcaClient.cards(from: r)
+        check(cards.count == 3 && cards[0].agents.count == 2 && cards[0].liveTerminals == 1, "orca cards parse")
+        let t0 = Date(timeIntervalSince1970: 3100)
+        let launches = ["SLING-5": AgentIndex.Launch(at: t0, card: "r2::/c", paneKey: "t5:l5"),
+                        "SLING-6": AgentIndex.Launch(at: t0, error: "Orca is not reachable"),
+                        "SLING-7": AgentIndex.Launch(at: t0)]
+        let idx = AgentIndex.index(cards, launches: launches, now: t0)
+        check(idx["TOWERTAIL-2"]?.phase == .waiting && idx["TOWERTAIL-2"]?.paneKey == "t2:l2", "card name match, waiting wins")
+        check(idx["FRITZ-17"]?.phase == .working && idx["FRITZ-17"]?.repo == "cat-eye", "prompt URL match")
+        check(idx["SLING-5"]?.phase == .working && idx["SLING-5"]?.type == "codex", "launch pane match")
+        check(idx["SLING-6"]?.phase == .failed && idx["SLING-6"]?.label() == "Not started", "failed launch")
+        check(idx["SLING-7"]?.phase == .starting, "pending launch")
+        check(idx["TREBI-9"] == nil, "done agent of a closed terminal drops")
+        check(idx.count == 5, "agent index size \(idx.count)")
+        let late = AgentIndex.index(cards, launches: [:], now: t0.addingTimeInterval(2 * 86400))
+        check(late["TOWERTAIL-2"]?.phase == .waiting && late["FRITZ-17"]?.phase == .working, "old waiting agents stay")
+        check(ItemAgent(phase: .working, since: t0).label(now: t0.addingTimeInterval(4 * 60 + 5)) == "Working 4m", "working label")
+    } else { check(false, "orca ps parse") }
+    let terms = [OrcaTerminal(handle: "h1", card: "c", title: "Terminal 1", paneKey: "t1:l1", orphaned: false),
+                 OrcaTerminal(handle: "h2", card: "c", title: "✳ FRITZ-27", paneKey: "t2:l2", orphaned: false)]
+    check(AgentIndex.pick(terms, agent: ItemAgent(phase: .working, since: Date(), paneKey: "t1:l1"), key: "FRITZ-27")?.handle == "h1", "pick by pane")
+    check(AgentIndex.pick(terms, agent: ItemAgent(phase: .working, since: Date(), paneKey: "gone"), key: "FRITZ-27")?.handle == "h2", "pick by key title")
+    check(AgentIndex.pick(terms, agent: ItemAgent(phase: .working, since: Date(), paneKey: "gone"), key: "FRITZ-9") == nil, "no wrong terminal")
+    var oc = OrcaConfig()
+    check(oc.prompt(for: draftItem) == "work on https://app.plane.so/ocral/browse/FRITZ-7/ in worktree group .wt/fritz-7", "orca prompt template")
+    oc.prompt = "{KEY}: {title}"
+    check(oc.prompt(for: draftItem) == "FRITZ-7: Add quick capture", "orca prompt fields")
+    check(OrcaClient.agentCommand("claude", key: "FRITZ-7") == "claude -n 'FRITZ-7'" && OrcaClient.agentCommand("codex", key: "X-1") == "codex", "agent command")
+    if let d = try? JSONDecoder().decode(ProjectsConfig.self, from: Data(#"{"orca":{"environment":"mbp","roots":{"a/b":"/w"}}}"#.utf8)) {
+        check(d.orca.environment == "mbp" && d.orca.agent == "claude" && d.orca.roots["a/b"] == "/w" && d.notifications.agentDone, "orca config decode")
+    } else { check(false, "orca config decode") }
+
     print("SELFTEST OK — \(ins.count) insights, report \(md.count) chars")
 }
 
@@ -1759,6 +1812,12 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         }
         return s
     }()
+    lazy var agentIndex: AgentIndex = {
+        let a = AgentIndex()
+        a.visible = { [weak self] in (self?.popover.isShown ?? false) || ItemWindow.isOpen }
+        a.onAlert = { [weak self] key, agent in self?.agentAlert(key, agent) }
+        return a
+    }()
     var catalogTimer: Timer?
     var captureHotKey: GlobalHotKey?
     let rateLimit = RateLimitMonitor()
@@ -1859,6 +1918,10 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
             self.projectStore.track(self.projectCatalog.resolve(PROJECTS_CFG), live: self.liveProjectKeys())
         }
         applyCaptureHotKey()
+        NotificationCenter.default.addObserver(forName: AgentIndex.changed, object: agentIndex, queue: .main) { [weak self] _ in
+            self?.reloadList()
+        }
+        agentIndex.startTimer()
         NotificationCenter.default.addObserver(forName: ProjectCatalog.changed, object: projectCatalog, queue: .main) { [weak self] _ in
             guard let self = self, !self.projectCatalog.refreshing else { return }
             self.projectStore.track(self.projectCatalog.resolve(PROJECTS_CFG), live: self.liveProjectKeys())
@@ -2210,6 +2273,7 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
     }
 
     func applyProjectSelection() {
+        agentIndex.poll()
         projectStore.track(projectCatalog.resolve(PROJECTS_CFG), live: liveProjectKeys())
         projectStore.restartTimer()
         syncPlaneWorkspaces()
@@ -2385,6 +2449,20 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: c, trigger: nil))
     }
 
+    // "Needs input" and "Agent done" for an item that Cat Eye tracks.
+    func agentAlert(_ key: String, _ agent: ItemAgent) {
+        let n = PROJECTS_CFG.notifications
+        guard agent.phase == .waiting ? n.agentWaiting : n.agentDone else { return }
+        let found = projectStore.snapshots.values.lazy.compactMap { s in
+            s.items.first { $0.key.uppercased() == key }.map { (s, $0) }
+        }.first
+        let title = found.map { $0.0.summary.ref.workspace + " › " + $0.0.summary.title } ?? "Orca"
+        let subtitle = found.map { "\($0.1.key) \($0.1.title)" } ?? key
+        var body = agent.phase == .waiting ? "Agent needs input" : "Agent done"
+        if let m = agent.message?.trimmingCharacters(in: .whitespacesAndNewlines), !m.isEmpty { body += ": " + String(m.prefix(200)) }
+        notify(title: title, subtitle: subtitle, body: body, id: "agent:" + (found?.1.id ?? key))
+    }
+
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler handler: @escaping () -> Void) {
@@ -2397,9 +2475,9 @@ class GHActionsBar: NSObject, NSApplicationDelegate, NSPopoverDelegate, UNUserNo
                 if let key = parts.first { IntakeWindow.show(projectKey: key, workItemId: parts.count > 1 ? parts[1] : nil) }
                 return
             }
-            if id.hasPrefix("project:") {
+            if id.hasPrefix("project:") || id.hasPrefix("agent:") {
                 if self.popover.isShown { self.popover.close() }
-                ItemWindow.show(String(id.dropFirst("project:".count)))
+                ItemWindow.show(String(id.drop { $0 != ":" }.dropFirst()))
                 return
             }
             self.toggle()

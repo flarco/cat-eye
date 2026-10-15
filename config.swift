@@ -13,6 +13,7 @@ struct AppConfig: Codable {
     var filterDefaultBranches: Bool?
     var sortByRecent: Bool?
     var oneRowPerWorkflow: Bool?
+    var latestAcrossBranches: Bool?
     var repoColors: [String: Int]?
     var autoUpdate: Bool?
     var relay: RelayConfig?
@@ -284,6 +285,8 @@ var RUNS_PER_REPO: Int = 10
 var FILTER_DEFAULT_BRANCHES: Bool = false
 var SORT_BY_RECENT: Bool = true
 var ONE_ROW_PER_WORKFLOW: Bool = true
+// With ONE_ROW_PER_WORKFLOW, keep only the latest run of each workflow over all branches.
+var LATEST_ACROSS_BRANCHES: Bool = false
 var REPO_COLORS: [String: Int] = [:]
 var AUTO_UPDATE: Bool = true
 var NOTIFICATIONS = NotificationSettings()
@@ -312,6 +315,7 @@ func loadConfig() {
     FILTER_DEFAULT_BRANCHES = c.filterDefaultBranches ?? false
     SORT_BY_RECENT = c.sortByRecent ?? true
     ONE_ROW_PER_WORKFLOW = c.oneRowPerWorkflow ?? true
+    LATEST_ACROSS_BRANCHES = c.latestAcrossBranches ?? false
     REPO_COLORS = c.repoColors ?? [:]
     AUTO_UPDATE = c.autoUpdate ?? true
     if let n = c.notifications { NOTIFICATIONS = n }
@@ -327,7 +331,7 @@ func saveConfig() {
                       orgs: PICKED_ORGS.isEmpty ? nil : PICKED_ORGS, pollInterval: POLL_NORMAL,
                       pollActiveInterval: POLL_ACTIVE, runsPerRepo: RUNS_PER_REPO,
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
-                      oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW,
+                      oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW, latestAcrossBranches: LATEST_ACROSS_BRANCHES,
                       repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE,
                       relay: RELAY, notifications: NOTIFICATIONS, tabs: TABS, projects: PROJECTS_CFG, ai: AI_CFG)
     if let data = try? JSONEncoder().encode(c) {

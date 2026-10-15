@@ -592,7 +592,9 @@ func buildActionsContent(_ w: CGFloat) -> [NSView] {
     return rows
 }
 
-func shownRuns(_ visible: [Run]) -> [Run] { ONE_ROW_PER_WORKFLOW ? latestPerWorkflow(visible) : visible }
+func shownRuns(_ visible: [Run]) -> [Run] {
+    ONE_ROW_PER_WORKFLOW ? latestPerWorkflow(visible, acrossBranches: LATEST_ACROSS_BRANCHES) : visible
+}
 
 func appendRun(_ rows: inout [NSView], repo: String, group: [Run], history: [Run], w: CGFloat, showRepo: Bool) {
     let primary = RunRow.pickPrimary(group)

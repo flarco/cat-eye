@@ -534,8 +534,8 @@ func overallStatus(_ g: [(String, [Run])]) -> (color: NSColor, badge: String?, l
     if all.contains(where: { $0.status == "in_progress" || $0.status == "queued" }) {
         return (C_RUNNING, "hourglass.circle.fill", "Run in progress")
     }
-    // A failure counts until a newer run of the same workflow on the same branch replaces it.
-    let failed = g.flatMap { latestPerWorkflow($0.1) }.contains { $0.isFailure && !IGNORED.contains($0) }
+    // A failure counts until a newer run of the same workflow replaces it (same branch, or any branch).
+    let failed = g.flatMap { latestPerWorkflow($0.1, acrossBranches: LATEST_ACROSS_BRANCHES) }.contains { $0.isFailure && !IGNORED.contains($0) }
     if failed { return (C_FAILURE, "xmark.circle.fill", "Run failed") }
     return (C_SUCCESS, "checkmark.circle.fill", "All runs passing")
 }
@@ -574,10 +574,10 @@ func newerActivity(_ a: Run, _ b: Run) -> Bool {
 
 func byLastActivity(_ runs: [Run]) -> [Run] { runs.sorted(by: newerActivity) }
 
-// The newest run of each workflow on each branch. `runs` is newest first, as the API returns it.
-func latestPerWorkflow(_ runs: [Run]) -> [Run] {
+// The newest run of each workflow on each branch, or over all branches. `runs` is newest first, as the API returns it.
+func latestPerWorkflow(_ runs: [Run], acrossBranches: Bool = false) -> [Run] {
     var seen = Set<String>()
-    return runs.filter { seen.insert("\($0.workflowName ?? $0.name)|\($0.headBranch)").inserted }
+    return runs.filter { seen.insert(acrossBranches ? ($0.workflowName ?? $0.name) : "\($0.workflowName ?? $0.name)|\($0.headBranch)").inserted }
 }
 
 func sortedByRecent(_ g: [(String, [Run])]) -> [(String, [Run])] {
@@ -685,6 +685,9 @@ func runSelfTest() {
     check(order.map { $0.workflowName ?? "" } == ["ci", "old", "new"], "recent first sorts by completion time, active on top")
     let latest = latestPerWorkflow([dispatch("Deploy", "s2"), dispatch("Deploy", "s1"), dispatch("Build", "s1")])
     check(latest.map(\.headSha) == ["s2", "s1"], "one row per workflow keeps the newest run")
+    let branches = [run("dependabot/x", "completed"), run("main", "completed")]
+    check(latestPerWorkflow(branches).count == 2, "per branch keeps one run on each branch")
+    check(latestPerWorkflow(branches, acrossBranches: true).map(\.headBranch) == ["dependabot/x"], "across branches keeps only the newest run")
     let chipJob = RunJob(id: 1, name: "release-linux-amd64", status: "completed", conclusion: "success", url: nil,
                          startedAt: nil, completedAt: nil, runnerName: nil, steps: nil)
     check((JobChip(job: chipJob, notes: [], maxW: 400).subviews.first as? NSTextField)?.stringValue == "release\u{2026}x-amd64",

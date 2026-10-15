@@ -16,6 +16,7 @@ final class ActionsSettingsVC: NSViewController {
     var syncSpinner: NSProgressIndicator?
     var refreshAllBtn: NSButton?
     var addField: NSTextField?
+    var acrossBtn: NSButton?
     var observer: NSObjectProtocol?
     init(catalog: RepoCatalog, picked: Set<String>, orgs: Set<String>) {
         self.catalog = catalog
@@ -49,6 +50,17 @@ final class ActionsSettingsVC: NSViewController {
         one.frame = NSRect(x: 16, y: 8, width: w - 32, height: 20)
         dispRow.addSubview(one)
         container.addSubview(dispRow); y += 36
+        let acrossRow = NSView(frame: NSRect(x: 0, y: y - 8, width: w, height: 28))
+        let across = NSButton(checkboxWithTitle: "Ignore the branch (latest run of each workflow in the repo)",
+                              target: self, action: #selector(toggleAcrossBranches(_:)))
+        across.font = .systemFont(ofSize: 12)
+        across.state = LATEST_ACROSS_BRANCHES ? .on : .off
+        across.isEnabled = ONE_ROW_PER_WORKFLOW
+        across.toolTip = "A newer run on any branch replaces an old failure, also for the menu bar icon"
+        across.frame = NSRect(x: 36, y: 0, width: w - 52, height: 20)
+        acrossRow.addSubview(across)
+        acrossBtn = across
+        container.addSubview(acrossRow); y += 20
         container.addSubview(SeparatorLine(y: y, w: w)); y += 0.5
 
         // ── Notifications section ──
@@ -98,7 +110,7 @@ final class ActionsSettingsVC: NSViewController {
         container.addSubview(repoHdr); y += 28
 
         // The notification switches add a row; keep the whole panel within its popover height.
-        let scrollH: CGFloat = 360
+        let scrollH: CGFloat = 340
         let rd = Flipped(frame: NSRect(x: 0, y: 0, width: w, height: scrollH))
         let rs = NSScrollView(frame: NSRect(x: 0, y: y, width: w, height: scrollH))
         rs.hasVerticalScroller = true; rs.drawsBackground = false
@@ -144,6 +156,12 @@ final class ActionsSettingsVC: NSViewController {
 
     @objc func toggleOneRow(_ sender: NSButton) {
         ONE_ROW_PER_WORKFLOW = sender.state == .on
+        acrossBtn?.isEnabled = ONE_ROW_PER_WORKFLOW
+        saveConfig()
+    }
+
+    @objc func toggleAcrossBranches(_ sender: NSButton) {
+        LATEST_ACROSS_BRANCHES = sender.state == .on
         saveConfig()
     }
 

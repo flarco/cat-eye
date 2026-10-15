@@ -556,12 +556,15 @@ func buildActionsContent(_ w: CGFloat) -> [NSView] {
     }
     if SORT_BY_RECENT {
         if let sel = selectedRepo { rows.append(RepoHeader(sel, w: w)) }
+        // Each group sorts by its most recent run.
         let items = data.flatMap { repo, runs in
             let visible = visibleRuns(runs)
-            return shownRuns(visible).map { (repo: repo, run: $0, history: visible) }
-        }.sorted { newerActivity($0.run, $1.run) }
+            return groupRuns(shownRuns(visible)).map {
+                (repo: repo, group: $0, lead: $0.min(by: newerActivity)!, history: visible)
+            }
+        }.sorted { newerActivity($0.lead, $1.lead) }
         for it in items {
-            appendRun(&rows, repo: it.repo, group: [it.run], history: it.history, w: w, showRepo: selectedRepo == nil)
+            appendRun(&rows, repo: it.repo, group: it.group, history: it.history, w: w, showRepo: selectedRepo == nil)
         }
         if items.isEmpty {
             rows.append(EmptyRow(FILTER_DEFAULT_BRANCHES ? "No recent runs on main or develop" : "No recent runs", w: w))

@@ -246,6 +246,14 @@ final class JobLogs: NSObject, URLSessionTaskDelegate {
         }
     }
 
+    // The cleaned end of the job log, read again on each call. GitHub gives the log only after the job ends.
+    func lines(repo: String, jobId: Int, done: @escaping ([String]?) -> Void) {
+        queue.async {
+            let l = self.tail(repo: repo, jobId: jobId).map(JobLogs.clean)
+            DispatchQueue.main.async { done(l) }
+        }
+    }
+
     // Stops at the redirect, so the GitHub token does not go to the log storage host.
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -289,15 +297,26 @@ final class JobLogs: NSObject, URLSessionTaskDelegate {
 
     // The lines up to the last "##[error]" marker, or the last lines when there is no marker.
     static func errorSnippet(_ log: String) -> String {
-        let stamp = try! NSRegularExpression(pattern: #"^\d{4}-\d\d-\d\dT[\d:.]+Z ?"#)
-        let lines: [String] = log.components(separatedBy: "\n").compactMap { raw in
+        let lines = clean(log)
+        let end = lines.lastIndex { $0.hasPrefix("##[error]") }.map { $0 + 1 } ?? lines.count
+        return lines[max(0, end - snippetLines)..<end].joined(separator: "\n")
+    }
+
+    // Log lines without time stamps, group markers and empty lines.
+    static func clean(_ log: String) -> [String] {
+        let stamp = try! NSRegularExpression(pattern: #"^\d{4}-\d\d-\d\dT[\d:.]+Z ?|\u001B?\[[0-9;]*m"#)
+        return log.components(separatedBy: "\n").compactMap { raw in
             let ns = raw.trimmingCharacters(in: .newlines) as NSString
             var l = stamp.stringByReplacingMatches(in: ns as String, range: NSRange(location: 0, length: ns.length), withTemplate: "")
             if l.hasPrefix("##[group]") || l.hasPrefix("##[endgroup]") || l.trimmingCharacters(in: .whitespaces).isEmpty { return nil }
             if l.count > 220 { l = String(l.prefix(220)) + "\u{2026}" }
             return l
         }
-        let end = lines.lastIndex { $0.hasPrefix("##[error]") }.map { $0 + 1 } ?? lines.count
-        return lines[max(0, end - snippetLines)..<end].joined(separator: "\n")
+    }
+
+    static func isError(_ line: String) -> Bool {
+        if line.hasPrefix("##[error]") { return true }
+        let l = line.lowercased()
+        return l.contains("error:") || l.hasPrefix("fail") || l.contains("--- fail") || l.contains("panic:") || l.contains("exit code 1")
     }
 }

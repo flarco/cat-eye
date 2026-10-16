@@ -50,7 +50,7 @@ extension ProjectSettingsVC {
 
         let envs = Array(Set((probe?.environments ?? []) + [cfg.orca.environment].compactMap { $0 })).sorted()
         let hosts = ["This Mac"] + envs.map { "\($0) (paired server)" }
-        y = popupRow("Run agents on", hosts, cfg.orca.environment.flatMap { e in envs.firstIndex(of: e).map { $0 + 1 } } ?? 0,
+        y = popupRow("Run sessions on", hosts, cfg.orca.environment.flatMap { e in envs.firstIndex(of: e).map { $0 + 1 } } ?? 0,
                      #selector(orcaHostChanged(_:)), y: y, in: doc)
         let agents = ProjectSettingsVC.orcaAgents + (ProjectSettingsVC.orcaAgents.contains(cfg.orca.agent) ? [] : [cfg.orca.agent])
         y = popupRow("Agent", agents, agents.firstIndex(of: cfg.orca.agent) ?? 0, #selector(orcaAgentChanged(_:)), y: y, in: doc)

@@ -421,6 +421,43 @@ final class PlaneClient {
              body: ["comment_html": PlaneMarkup.html(fromMarkdown: markdown)]).map { _ in () }
     }
 
+    func descriptionHTML(project: String, item: String) -> Result<String, PlaneError> {
+        send("GET", "\(ws)/projects/\(project)/issues/\(item)/").map { ($0 as? [String: Any])?["description_html"] as? String ?? "" }
+    }
+
+    func links(project: String, item: String) -> Result<[String], PlaneError> {
+        list("\(ws)/projects/\(project)/issues/\(item)/links/", max: 200).map { $0.compactMap { $0["url"] as? String } }
+    }
+
+    func addLink(project: String, item: String, url: String, title: String) -> Result<Void, PlaneError> {
+        send("POST", "\(ws)/projects/\(project)/issues/\(item)/links/", body: ["url": url, "title": title]).map { _ in () }
+    }
+
+    // Returns the id of the new label.
+    func createLabel(project: String, name: String, color: String) -> Result<String, PlaneError> {
+        send("POST", "\(ws)/projects/\(project)/labels/", body: ["name": name, "color": color]).flatMap { obj in
+            jsonID((obj as? [String: Any])?["id"]).map { .success($0) } ?? .failure(.http(200, "no id for the new label"))
+        }
+    }
+
+    // The label ids of a work item.
+    func labelIds(project: String, item: String) -> Result<[String], PlaneError> {
+        send("GET", "\(ws)/projects/\(project)/issues/\(item)/").map { obj in
+            ((obj as? [String: Any])?["labels"] as? [Any] ?? []).compactMap { jsonID($0) ?? jsonID(($0 as? [String: Any])?["id"]) }
+        }
+    }
+
+    // The body of a pending intake item. The work item endpoints do not see it.
+    func intakeHTML(project: String, workItem: String) -> Result<String, PlaneError> {
+        send("GET", "\(ws)/projects/\(project)/intake-issues/\(workItem)/").map { obj in
+            ((obj as? [String: Any])?["issue_detail"] as? [String: Any])?["description_html"] as? String ?? ""
+        }
+    }
+
+    func updateIntake(project: String, workItem: String, _ fields: [String: Any]) -> Result<Void, PlaneError> {
+        send("PATCH", "\(ws)/projects/\(project)/intake-issues/\(workItem)/", body: ["issue": fields]).map { _ in () }
+    }
+
     // Adds me and keeps the other assignees.
     func assignMe(project: String, item: String) -> Result<Void, PlaneError> {
         me().flatMap { me in

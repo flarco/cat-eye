@@ -394,6 +394,14 @@ final class ProjectStore {
         return nil
     }
 
+    func item(key: String) -> (key: String, snap: ProjectSnapshot, item: ProjectItem)? {
+        let k = key.uppercased()
+        for (pk, snap) in snapshots {
+            if let item = snap.items.first(where: { $0.key.uppercased() == k }) { return (pk, snap, item) }
+        }
+        return nil
+    }
+
     var snapshotLimit: Int {
         let n = PROJECTS_CFG.itemsPerProject
         return min(300, max(100, n == 0 ? 200 : n))
@@ -522,6 +530,6 @@ final class ProjectStore {
     }
 }
 
-private extension Result {
+extension Result {
     var isOk: Bool { if case .success = self { return true }; return false }
 }

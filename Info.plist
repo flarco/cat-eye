@@ -22,6 +22,17 @@
     <true/>
     <key>LSUIElement</key>
     <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.flarco.cateye</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>cateye</string>
+            </array>
+        </dict>
+    </array>
     <key>NSSupportsAutomaticTermination</key>
     <false/>
     <key>NSSupportsSuddenTermination</key>

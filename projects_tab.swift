@@ -431,7 +431,7 @@ final class AgentPill: NSView {
         if let m = agent.message, !m.isEmpty { tip += "\n" + String(m.prefix(300)) }
         toolTip = tip + (agent.phase == .failed ? "" : "\nClick to open the terminal in Orca")
         setAccessibilityRole(.button)
-        setAccessibilityLabel("Agent: " + agent.label())
+        setAccessibilityLabel("Session: " + agent.label())
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -564,7 +564,7 @@ final class ProjectItemRow: NSView {
         menu.addItem(withTitle: "Copy for agent", action: #selector(copyAgent), keyEquivalent: "").target = self
         if onStart != nil, play == nil {
             menu.addItem(.separator())
-            menu.addItem(withTitle: hasAgent ? "Start another agent in Orca" : "Start in Orca", action: #selector(startAgent(_:)), keyEquivalent: "").target = self
+            menu.addItem(withTitle: hasAgent ? "Start another session in Orca" : "Start in Orca", action: #selector(startAgent(_:)), keyEquivalent: "").target = self
         }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
     }

@@ -251,3 +251,11 @@ class SettingsNav: NSView {
         (NSApp.delegate as? GHActionsBar)?.showSettings(tab)
     }
 }
+
+func textHeight(_ s: String, font: NSFont, width: CGFloat) -> CGFloat {
+    let r = (s as NSString).boundingRect(
+        with: NSSize(width: width, height: .greatestFiniteMagnitude),
+        options: [.usesLineFragmentOrigin, .usesFontLeading],
+        attributes: [.font: font])
+    return ceil(r.height)
+}

@@ -19,6 +19,7 @@ final class RelaySettingsVC: NSViewController {
     var reconcileDraft: String?
     var unitDraft: Int?
     var checked = false
+    private var inspecting = false
     var autoSetup = false
     var triedUpdate = false
     var lastHealthCheck = Date.distantPast
@@ -47,11 +48,20 @@ final class RelaySettingsVC: NSViewController {
         view = container
         preferredContentSize = NSSize(width: w, height: POP_MAX_H)
 
-        deployer.onChange = { [weak self] in self?.rebuild() }
+        deployer.onChange = { [weak self] in
+            guard let self else { return }
+            // A task ran when the page loaded, so the first check waited for it.
+            if !self.checked, !self.inspecting, self.deployer.busy == nil {
+                self.inspecting = true
+                self.deployer.refreshState { [weak self] in self?.inspecting = false; self?.afterInspect() }
+            }
+            self.rebuild()
+        }
         deployer.onLog = { [weak self] in self?.updateLog() }
         rebuild()
         if deployer.busy == nil {
-            deployer.refreshState { [weak self] in self?.afterInspect() }
+            inspecting = true
+            deployer.refreshState { [weak self] in self?.inspecting = false; self?.afterInspect() }
         }
     }
 

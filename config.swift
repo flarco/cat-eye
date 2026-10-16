@@ -21,6 +21,110 @@ struct AppConfig: Codable {
     var tabs: TabVisibility?
     var projects: ProjectsConfig?
     var ai: AIConfig?
+    var general: GeneralConfig?
+    var linking: LinkRules?
+    var agents: AgentsConfig?
+}
+
+// How much the AI checks may do. Auto acts only on "looks done". "Looks stuck" always asks.
+enum AIMode: String, Codable, CaseIterable {
+    case off, ask, auto
+    var label: String { self == .off ? "Off" : self == .ask ? "Ask me" : "Auto" }
+}
+
+// The queue, the AI checks of agents, the intake agent and the write-back to Plane.
+struct AgentsConfig: Codable, Equatable {
+    var autoStart = true                // the queue starts the next item when its condition holds
+    var slots: [String: Int] = [:]      // project ref key → agents at the same time
+    var startLabel = "agent"            // a Plane label that adds the item to the queue
+    var botUser = ""                    // a Plane assignee that adds the item to the queue
+    var aiMode = AIMode.ask
+    var quietMinutes = 10.0             // an agent with no output this long gets a check
+    var intakePrompt = AgentsConfig.defaultIntakePrompt
+    var intakeScratch = false           // the intake agent works in a scratch worktree, not in main
+    var writeBack = WriteBackConfig()
+
+    static let defaultIntakePrompt = """
+    You check a new intake ticket. Do not change files. Read the code in this folder to understand the ticket.
+    If it is a bug, find the steps to reproduce it, and reproduce it with read-only commands if you can.
+    If the ticket is too vague, list the facts that are missing.
+    End with one JSON object on one line and nothing after it:
+    {"verdict":"clear|vague|reproduced|not_reproduced|duplicate","findings":["..."],"block":"markdown to add to the ticket","priority":"urgent|high|medium|low|none","labels":["..."]}
+
+    Ticket {KEY}: {title}
+    {url}
+
+    {body}
+    """
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        autoStart = try c.decodeIfPresent(Bool.self, forKey: .autoStart) ?? true
+        slots = try c.decodeIfPresent([String: Int].self, forKey: .slots) ?? [:]
+        startLabel = try c.decodeIfPresent(String.self, forKey: .startLabel) ?? "agent"
+        botUser = try c.decodeIfPresent(String.self, forKey: .botUser) ?? ""
+        aiMode = try c.decodeIfPresent(AIMode.self, forKey: .aiMode) ?? .ask
+        quietMinutes = try c.decodeIfPresent(Double.self, forKey: .quietMinutes) ?? 10
+        intakePrompt = try c.decodeIfPresent(String.self, forKey: .intakePrompt) ?? AgentsConfig.defaultIntakePrompt
+        intakeScratch = try c.decodeIfPresent(Bool.self, forKey: .intakeScratch) ?? false
+        writeBack = try c.decodeIfPresent(WriteBackConfig.self, forKey: .writeBack) ?? WriteBackConfig()
+    }
+
+    func slots(_ projectKey: String) -> Int { max(1, slots[projectKey] ?? 1) }
+}
+
+// What Cat Eye may add to Plane. It never changes text of other people.
+struct WriteBackConfig: Codable, Equatable {
+    var enabled = true
+    var links = true                    // add the PR, run and worktree links once
+    var labels = true                   // agent:working, agent:needs-input, agent:done
+    var block = true                    // the Cat Eye block at the end of the body, between markers
+    var sessionComment = true           // one comment with the summary when the session ends
+    var moveToReview = false            // set In review when the PR opens
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        links = try c.decodeIfPresent(Bool.self, forKey: .links) ?? true
+        labels = try c.decodeIfPresent(Bool.self, forKey: .labels) ?? true
+        block = try c.decodeIfPresent(Bool.self, forKey: .block) ?? true
+        sessionComment = try c.decodeIfPresent(Bool.self, forKey: .sessionComment) ?? true
+        moveToReview = try c.decodeIfPresent(Bool.self, forKey: .moveToReview) ?? false
+    }
+}
+
+enum Theme: String, Codable, CaseIterable { case system, dark, light }
+
+// Where the app shows: the menu bar icon, the Dock icon, or both.
+enum ShowIn: String, Codable, CaseIterable {
+    case menu, dock, both
+    var dock: Bool { self != .menu }
+    var menuBar: Bool { self != .dock }
+}
+
+struct GeneralConfig: Codable, Equatable {
+    var theme = Theme.dark
+    var showIn = ShowIn.both
+    var windowKey = KeyShortcut(keyCode: 8, modifiers: 0x1800)   // ⌃⌥C
+    var openWindowAtLaunch = false
+    var sidebarCollapsed = false
+    var smallPopover = true
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        theme = try c.decodeIfPresent(Theme.self, forKey: .theme) ?? .dark
+        showIn = try c.decodeIfPresent(ShowIn.self, forKey: .showIn) ?? .both
+        windowKey = try c.decodeIfPresent(KeyShortcut.self, forKey: .windowKey) ?? KeyShortcut(keyCode: 8, modifiers: 0x1800)
+        openWindowAtLaunch = try c.decodeIfPresent(Bool.self, forKey: .openWindowAtLaunch) ?? false
+        sidebarCollapsed = try c.decodeIfPresent(Bool.self, forKey: .sidebarCollapsed) ?? false
+        smallPopover = try c.decodeIfPresent(Bool.self, forKey: .smallPopover) ?? true
+    }
 }
 
 // Which transition events create macOS notifications. Omitted legacy config
@@ -223,6 +327,15 @@ struct AIConfig: Codable, Equatable {
     var titleAndFields = true
     var tidy = true
     var pickProject = true
+    // Features for agents and CI. Each is a switch in Settings › AI.
+    var agentChecks = true              // "looks done" and "looks stuck"
+    var queueOrder = true
+    var intakeAgent = true
+    var sessionSummary = true
+    var ciExplain = true                // a short cause of a failed run that no agent watches
+    var flaky = true                    // mark a run that failed, then passed on the same commit
+    var digest = false                  // morning digest on Home
+    var digestHour = 8
 
     init() {}
 
@@ -239,6 +352,14 @@ struct AIConfig: Codable, Equatable {
         titleAndFields = try c.decodeIfPresent(Bool.self, forKey: .titleAndFields) ?? true
         tidy = try c.decodeIfPresent(Bool.self, forKey: .tidy) ?? true
         pickProject = try c.decodeIfPresent(Bool.self, forKey: .pickProject) ?? true
+        agentChecks = try c.decodeIfPresent(Bool.self, forKey: .agentChecks) ?? true
+        queueOrder = try c.decodeIfPresent(Bool.self, forKey: .queueOrder) ?? true
+        intakeAgent = try c.decodeIfPresent(Bool.self, forKey: .intakeAgent) ?? true
+        sessionSummary = try c.decodeIfPresent(Bool.self, forKey: .sessionSummary) ?? true
+        ciExplain = try c.decodeIfPresent(Bool.self, forKey: .ciExplain) ?? true
+        flaky = try c.decodeIfPresent(Bool.self, forKey: .flaky) ?? true
+        digest = try c.decodeIfPresent(Bool.self, forKey: .digest) ?? false
+        digestHour = try c.decodeIfPresent(Int.self, forKey: .digestHour) ?? 8
     }
 
     func fingerprint(key: String) -> String {
@@ -273,6 +394,11 @@ let CONFIG_PATH = (CONFIG_DIR as NSString).appendingPathComponent("config.json")
 let REPO_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("repo-cache.json")
 let PROJECT_CACHE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("plane-cache.json")
 let PROJECT_STATE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("plane-state.json")
+let QUEUE_PATH = (CONFIG_DIR as NSString).appendingPathComponent("queue.json")
+let WRITEBACK_PATH = (CONFIG_DIR as NSString).appendingPathComponent("writeback.json")
+let CHECKS_PATH = (CONFIG_DIR as NSString).appendingPathComponent("agent-checks.json")
+let SESSIONS_PATH = (CONFIG_DIR as NSString).appendingPathComponent("sessions.json")
+let CI_ASSIST_PATH = (CONFIG_DIR as NSString).appendingPathComponent("ci-assist.json")
 let PROJECT_ACTIVITY_PATH = (CONFIG_DIR as NSString).appendingPathComponent("plane-activity.jsonl")
 
 // REPOS is what the app tracks: PICKED_REPOS plus every repo of PICKED_ORGS.
@@ -293,6 +419,9 @@ var NOTIFICATIONS = NotificationSettings()
 var TABS = TabVisibility()
 var PROJECTS_CFG = ProjectsConfig()
 var AI_CFG = AIConfig()
+var GENERAL = GeneralConfig()
+var LINKING = LinkRules()
+var AGENTS = AgentsConfig()
 let DEFAULT_BRANCHES: Set<String> = ["main", "develop"]
 
 let repoPattern = try! NSRegularExpression(pattern: "^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
@@ -323,6 +452,9 @@ func loadConfig() {
     if let t = c.tabs { TABS = t }
     if let p = c.projects { PROJECTS_CFG = p }
     if let a = c.ai { AI_CFG = a }
+    if let g = c.general { GENERAL = g }
+    if let l = c.linking { LINKING = l }
+    if let a = c.agents { AGENTS = a }
 }
 
 func saveConfig() {
@@ -333,7 +465,7 @@ func saveConfig() {
                       filterDefaultBranches: FILTER_DEFAULT_BRANCHES, sortByRecent: SORT_BY_RECENT,
                       oneRowPerWorkflow: ONE_ROW_PER_WORKFLOW, latestAcrossBranches: LATEST_ACROSS_BRANCHES,
                       repoColors: REPO_COLORS.isEmpty ? nil : REPO_COLORS, autoUpdate: AUTO_UPDATE,
-                      relay: RELAY, notifications: NOTIFICATIONS, tabs: TABS, projects: PROJECTS_CFG, ai: AI_CFG)
+                      relay: RELAY, notifications: NOTIFICATIONS, tabs: TABS, projects: PROJECTS_CFG, ai: AI_CFG, general: GENERAL, linking: LINKING, agents: AGENTS)
     if let data = try? JSONEncoder().encode(c) {
         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         if let pretty = try? JSONSerialization.data(withJSONObject: json as Any, options: .prettyPrinted) {

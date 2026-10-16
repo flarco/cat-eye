@@ -342,8 +342,8 @@ final class ProjectSettingsVC: NSViewController {
             ("Item is closed or set to Done", "closed", cfg.notifications.closed.any, cfg.notifications.closed.mine),
             ("Other field changes", "other", cfg.notifications.otherFields.any, cfg.notifications.otherFields.mine),
             ("Intake item is new, changed or closed", "intake", cfg.notifications.intake, false),
-            ("Orca agent needs input", "agentWaiting", cfg.notifications.agentWaiting, false),
-            ("Orca agent is done", "agentDone", cfg.notifications.agentDone, false),
+            ("Orca session needs input", "agentWaiting", cfg.notifications.agentWaiting, false),
+            ("Orca session is done", "agentDone", cfg.notifications.agentDone, false),
         ]
         let anyDisabled: Set<String> = ["mention", "assigned"]
         let mineDisabled: Set<String> = ["intake", "agentWaiting", "agentDone"]
@@ -411,7 +411,7 @@ final class ProjectSettingsVC: NSViewController {
         l.font = .systemFont(ofSize: 12)
         l.frame = NSRect(x: 64, y: y + 2, width: 300, height: 18)
         doc.addSubview(l)
-        let field = ShortcutField(cfg.capture)
+        let field = ShortcutField(cfg.capture.shortcut)
         field.frame = NSRect(x: w - 230, y: y - 2, width: 110, height: 26)
         field.isEnabled = cfg.capture.enabled
         field.onChange = { [weak self] code, mods in
@@ -464,7 +464,7 @@ final class ProjectSettingsVC: NSViewController {
     }
     @objc func clearShortcut() {
         cfg.capture.modifiers = 0
-        shortcutField?.set(cfg.capture)
+        shortcutField?.set(cfg.capture.shortcut)
     }
     @objc func toggleCaptureOption(_ sender: NSButton) {
         let on = sender.state == .on

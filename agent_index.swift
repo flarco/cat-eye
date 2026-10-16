@@ -19,7 +19,7 @@ struct ItemAgent: Equatable {
         case .starting: return "Starting…"
         case .working: return "Working " + ItemAgent.minutes(now.timeIntervalSince(since))
         case .waiting: return "Needs input"
-        case .done: return "Agent done"
+        case .done: return "Session done"
         case .failed: return "Not started"
         }
     }
@@ -40,6 +40,42 @@ struct ItemAgent: Equatable {
     }
 }
 
+// One agent state change, for the Orca activity list.
+struct OrcaEvent: Equatable {
+    let key: String
+    let repo: String
+    let phase: ItemAgent.Phase
+    let at: Date
+    let text: String
+}
+
+// The last agent state changes, newest first.
+struct OrcaFeed {
+    var limit = 50
+    private(set) var events: [OrcaEvent] = []
+
+    mutating func record(before: [String: ItemAgent], after: [String: ItemAgent]) {
+        for (key, a) in after {
+            let old = before[key]
+            guard old?.phase != a.phase || (a.phase != .working && old?.since != a.since) else { continue }
+            events.append(OrcaEvent(key: key, repo: a.repo, phase: a.phase, at: a.since, text: OrcaFeed.text(a, from: old?.phase)))
+        }
+        events.sort { $0.at > $1.at }
+        if events.count > limit { events.removeLast(events.count - limit) }
+    }
+
+    static func text(_ a: ItemAgent, from old: ItemAgent.Phase?) -> String {
+        let msg = a.message.map { ": " + $0.replacingOccurrences(of: "\n", with: " ").prefix(120) } ?? ""
+        switch a.phase {
+        case .starting: return "Session starts"
+        case .working: return old == .waiting ? "Got input, works again" : "Session works"
+        case .waiting: return "Needs input" + msg
+        case .done: return "Session done" + msg
+        case .failed: return "Did not start" + msg
+        }
+    }
+}
+
 final class AgentIndex: NSObject {
     static let changed = Notification.Name("AgentIndexChanged")
 
@@ -51,7 +87,9 @@ final class AgentIndex: NSObject {
     }
 
     private(set) var agents: [String: ItemAgent] = [:]   // uppercased item key
+    private(set) var cards: [OrcaCard] = []                // the last `worktree ps`
     private(set) var lastError: String?
+    private(set) var feed = OrcaFeed()
     private var launches: [String: Launch] = [:]
     private var notified: [String: String] = [:]
     private var primed = false
@@ -149,7 +187,7 @@ final class AgentIndex: NSObject {
     func pillClicked(_ item: ProjectItem, snap: ProjectSnapshot, anchor: NSView) {
         guard let a = agent(item.key), a.phase == .failed else { reveal(item.key); return }
         let menu = NSMenu()
-        let head = NSMenuItem(title: a.message ?? "The agent did not start", action: nil, keyEquivalent: "")
+        let head = NSMenuItem(title: a.message ?? "The session did not start", action: nil, keyEquivalent: "")
         head.isEnabled = false
         menu.addItem(head)
         menu.addItem(.separator())
@@ -208,7 +246,9 @@ final class AgentIndex: NSObject {
     private func fail(_ key: String, _ message: String) {
         let k = key.uppercased()
         launches[k] = Launch(at: now(), error: message)
+        let before = agents
         agents[k] = ItemAgent(phase: .failed, since: now(), message: message)
+        feed.record(before: before, after: agents)
         publish()
     }
 
@@ -252,17 +292,26 @@ final class AgentIndex: NSObject {
         }
     }
 
+    // Shows the first live terminal of a worktree in Orca.
+    func reveal(card: String) {
+        let client = cfg.client
+        q.async {
+            guard case .success(let ts) = client.terminals(card: card), let t = ts.first(where: { !$0.orphaned }) else { return }
+            client.reveal(handle: t.handle)
+        }
+    }
+
     func send(_ key: String, text: String, done: @escaping (OrcaError?) -> Void) {
         terminal(key) { client, handle in
-            guard let handle else { return OrcaError(code: "no_terminal", message: "The agent terminal is closed") }
+            guard let handle else { return OrcaError(code: "no_terminal", message: "The session terminal is closed") }
             if case .failure(let e) = client.send(handle: handle, text: text) { return e }
             return nil
         } done: { done($0) }
     }
 
-    func tail(_ key: String, done: @escaping ([String]) -> Void) {
+    func tail(_ key: String, lines n: Int = 8, done: @escaping ([String]) -> Void) {
         terminal(key) { client, handle -> [String] in
-            guard let handle, case .success(let lines) = client.tail(handle: handle) else { return [] }
+            guard let handle, case .success(let lines) = client.tail(handle: handle, lines: n) else { return [] }
             return lines
         } done: { done($0) }
     }
@@ -283,14 +332,23 @@ final class AgentIndex: NSObject {
     // The agent's own terminal: its pane, else a live tab titled with the item key.
     static func pick(_ ts: [OrcaTerminal], agent: ItemAgent, key: String) -> OrcaTerminal? {
         if let p = agent.paneKey, let t = ts.first(where: { $0.paneKey == p }) { return t }
-        return ts.first { !$0.orphaned && $0.title.range(of: key, options: .caseInsensitive) != nil }
+        if let t = ts.first(where: { !$0.orphaned && $0.title.range(of: key, options: .caseInsensitive) != nil }) { return t }
+        // The only terminal with an agent title (not "Terminal N") that names no other item.
+        let titled = ts.filter { t in
+            !t.title.isEmpty && t.title.range(of: #"^Terminal \d+$"#, options: .regularExpression) == nil
+                && WorkstreamIndex.keyRE.firstMatch(in: t.title, range: NSRange(t.title.startIndex..., in: t.title)) == nil
+        }
+        return titled.count == 1 ? titled[0] : nil
     }
 
     func absorb(_ cards: [OrcaCard]) {
         let at = now()
         launches = launches.filter { at.timeIntervalSince($0.value.at) < ($0.value.error == nil ? 90 : 600) }
         let before = agents
+        let cardsChanged = self.cards != cards
+        self.cards = cards
         agents = AgentIndex.index(cards, launches: launches, now: at)
+        feed.record(before: before, after: agents)
         for (key, a) in agents where a.phase == .waiting || a.phase == .done {
             let tag = "\(a.phase)|\(a.paneKey ?? "")|\(Int(a.since.timeIntervalSince1970))"
             guard notified[key] != tag else { continue }
@@ -301,11 +359,12 @@ final class AgentIndex: NSObject {
         }
         primed = true
         // Working minutes change without a state change. A publish each minute keeps them current.
-        if agents != before || (agents.values.contains { $0.phase == .working } && at.timeIntervalSince(lastPublish) >= 60) { publish() }
+        if agents != before || cardsChanged || (agents.values.contains { $0.phase == .working } && at.timeIntervalSince(lastPublish) >= 60) { publish() }
     }
 
     static let browseRE = try! NSRegularExpression(pattern: "/browse/([A-Za-z][A-Za-z0-9]*-[0-9]+)\\b")
     static let keyRE = try! NSRegularExpression(pattern: "^[A-Za-z][A-Za-z0-9]*-[0-9]+$")
+    static let keyPrefixRE = try! NSRegularExpression(pattern: "^([A-Za-z][A-Za-z0-9]*-[0-9]+)[/_]")
 
     // Item key → the most urgent agent. Old done agents and agents of closed terminals drop out.
     static func index(_ cards: [OrcaCard], launches: [String: Launch], now: Date) -> [String: ItemAgent] {
@@ -317,8 +376,13 @@ final class AgentIndex: NSObject {
             out[key] = a
         }
         for c in cards {
-            let name = c.name.uppercased()
-            let named = keyRE.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+            var name = c.name.uppercased()
+            var named = keyRE.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+            // A branch name as card name: FRITZ-28/desktop-app.
+            if !named, let m = keyPrefixRE.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)), let r = Range(m.range(at: 1), in: name) {
+                name = String(name[r])
+                named = true
+            }
             for g in c.agents {
                 let key: String
                 if named { key = name }

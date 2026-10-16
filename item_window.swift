@@ -722,10 +722,10 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
         send.frame.origin = NSPoint(x: open.frame.minX - send.frame.width - 6, y: y + 13)
         let words: String
         switch a.phase {
-        case .working: words = "Agent working · " + ItemAgent.minutes(Date().timeIntervalSince(a.since))
-        case .waiting: words = "Agent needs input"
-        case .done: words = "Agent done"
-        default: words = "Agent starting…"
+        case .working: words = "Session working · " + ItemAgent.minutes(Date().timeIntervalSince(a.since))
+        case .waiting: words = "Session needs input"
+        case .done: words = "Session done"
+        default: words = "Session starting…"
         }
         let t = NSTextField(labelWithString: "◉ " + words)
         t.font = .systemFont(ofSize: 12.5, weight: .semibold)
@@ -788,7 +788,7 @@ final class ItemWindow: NSWindowController, NSWindowDelegate, NSTextFieldDelegat
     @objc private func sendAgent() {
         guard let id = itemId, let key = store.item(id)?.item.key, let win = window else { return }
         let alert = NSAlert()
-        alert.messageText = "Send to the agent of \(key)"
+        alert.messageText = "Send to the session of \(key)"
         alert.informativeText = "Cat Eye types the text into the Orca terminal and presses Return."
         let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         tf.placeholderString = "also add a test"

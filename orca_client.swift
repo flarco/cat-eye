@@ -214,6 +214,34 @@ final class OrcaClient {
         }
     }
 
+    // A new terminal in the checkout at `path`. It runs `command` and gets `prompt` when the agent is idle.
+    func openTerminal(path: String, title: String, command: String, prompt: String) -> Result<String, OrcaError> {
+        switch run(["terminal", "create", "--worktree", "path:" + path, "--title", title, "--command", command], timeout: 30) {
+        case .failure(let e): return .failure(e)
+        case .success(let r):
+            guard let h = (r["terminal"] as? [String: Any])?["handle"] as? String else {
+                return .failure(OrcaError(code: "bad_reply", message: "Orca made no terminal"))
+            }
+            var idle = false
+            for _ in 0..<2 where !idle {
+                if case .success(let w) = run(["terminal", "wait", "--terminal", h, "--for", "tui-idle", "--timeout-ms", "45000"], timeout: 60) {
+                    idle = (w["wait"] as? [String: Any])?["satisfied"] as? Bool ?? false
+                }
+            }
+            guard idle else { return .failure(OrcaError(code: "not_started", message: "The agent did not start in \(title)")) }
+            return send(handle: h, text: prompt).map { _ in h }
+        }
+    }
+
+    // The output of a terminal as text, the last `limit` lines.
+    func output(handle: String, limit: Int = 400) -> Result<[String], OrcaError> {
+        run(["terminal", "read", "--terminal", handle, "--limit", "\(limit)"]).map { r in
+            ((r["terminal"] as? [String: Any])?["tail"] as? [String] ?? []).map { $0.replacingOccurrences(of: "\u{a0}", with: " ") }
+        }
+    }
+
+    func close(handle: String) { _ = run(["terminal", "close", "--terminal", handle]) }
+
     static func agentCommand(_ agent: String, key: String) -> String {
         agent == "claude" ? "claude -n '\(key)'" : agent
     }

@@ -45,7 +45,11 @@ final class GlobalHotKey {
     }
 }
 
-extension CaptureConfig {
+// A key code and its Carbon modifier flags.
+struct KeyShortcut: Codable, Equatable {
+    var keyCode: UInt32
+    var modifiers: UInt32
+
     static let keyNames: [UInt32: String] = [
         0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V", 11: "B", 12: "Q",
         13: "W", 14: "E", 15: "R", 16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6", 23: "5",
@@ -66,7 +70,7 @@ extension CaptureConfig {
         if modifiers & UInt32(optionKey) != 0 { s += "⌥" }
         if modifiers & UInt32(shiftKey) != 0 { s += "⇧" }
         if modifiers & UInt32(cmdKey) != 0 { s += "⌘" }
-        return s + (CaptureConfig.keyNames[keyCode] ?? "Key \(keyCode)")
+        return s + (KeyShortcut.keyNames[keyCode] ?? "Key \(keyCode)")
     }
 
     static func carbonModifiers(_ flags: NSEvent.ModifierFlags) -> UInt32 {
@@ -79,14 +83,20 @@ extension CaptureConfig {
     }
 }
 
+extension CaptureConfig {
+    var shortcut: KeyShortcut { KeyShortcut(keyCode: keyCode, modifiers: modifiers) }
+    var hasShortcut: Bool { shortcut.hasShortcut }
+    var shortcutLabel: String { shortcut.shortcutLabel }
+}
+
 // Click, then press the new shortcut. Esc cancels. It needs ⌘, ⌃ or ⌥.
 final class ShortcutField: NSButton {
     var onChange: ((UInt32, UInt32) -> Void)?
     var onRecording: ((Bool) -> Void)?
-    private var current: CaptureConfig
+    private var current: KeyShortcut
     private var recording = false { didSet { onRecording?(recording); updateTitle() } }
 
-    init(_ cfg: CaptureConfig) {
+    init(_ cfg: KeyShortcut) {
         current = cfg
         super.init(frame: .zero)
         bezelStyle = .rounded
@@ -98,7 +108,7 @@ final class ShortcutField: NSButton {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func set(_ cfg: CaptureConfig) { current = cfg; updateTitle() }
+    func set(_ cfg: KeyShortcut) { current = cfg; updateTitle() }
     private func updateTitle() { title = recording ? "Press keys…" : current.shortcutLabel }
 
     override var acceptsFirstResponder: Bool { true }
@@ -121,7 +131,7 @@ final class ShortcutField: NSButton {
         let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
         guard !flags.intersection([.command, .control, .option]).isEmpty else { NSSound.beep(); return }
         current.keyCode = UInt32(event.keyCode)
-        current.modifiers = CaptureConfig.carbonModifiers(flags)
+        current.modifiers = KeyShortcut.carbonModifiers(flags)
         recording = false
         onChange?(current.keyCode, current.modifiers)
     }

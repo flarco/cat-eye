@@ -3,6 +3,7 @@ import Security
 
 // Installs signed, notarized releases from GitHub and restarts the app.
 // Dev builds (version ends in "-dev") only report a newer release.
+// Cat Eye is now OverSire. This last version installs OverSire next to Cat Eye and then removes Cat Eye.
 final class Updater {
     enum State: Equatable {
         case idle, checking, upToDate
@@ -13,8 +14,10 @@ final class Updater {
     }
 
     static let changed = Notification.Name("UpdaterChanged")
-    static let repo = "flarco/cat-eye"
-    static let bundleID = "com.flarco.cateye"
+    static let repo = "oversire/oversire"
+    static let bundleID = "com.oversire.app"
+    static let appName = "OverSire.app"
+    static let asset = "OverSire.zip"
     static let requirement = "anchor apple generic and identifier \"\(bundleID)\" and certificate leaf[subject.OU] = \"Q56WK6TB88\""
     static let checkInterval: TimeInterval = 4 * 3600
 
@@ -77,7 +80,7 @@ final class Updater {
                 }
                 let latest = rel.version
                 guard Updater.isNewer(latest, than: self.current) else { self.state = .upToDate; return }
-                guard !self.isDev, let asset = rel.assets.first(where: { $0.name == "CatEye.zip" }) else {
+                guard !self.isDev, let asset = rel.assets.first(where: { $0.name == Updater.asset }) else {
                     self.state = .available(latest); return
                 }
                 self.download(asset.browserDownloadURL, version: latest)
@@ -115,8 +118,8 @@ final class Updater {
         let dir = try fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: appURL, create: true)
         let out = try Updater.run("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path])
         guard out.ok else { throw UpdateError("unzip failed: \(out.text)") }
-        let app = dir.appendingPathComponent("CatEye.app")
-        guard fm.fileExists(atPath: app.path) else { throw UpdateError("CatEye.app is missing from the zip") }
+        let app = dir.appendingPathComponent(Updater.appName)
+        guard fm.fileExists(atPath: app.path) else { throw UpdateError("\(Updater.appName) is missing from the zip") }
         try Updater.verify(app, version: version)
         return app
     }
@@ -145,28 +148,30 @@ final class Updater {
         install()
     }
 
-    // A detached script waits for this process to exit, swaps the bundles, and opens the new app.
-    // If the new app is not running after 15 seconds, the script puts the old app back.
+    // A detached script waits for this process to exit, moves OverSire next to Cat Eye, and opens it.
+    // If OverSire is not running after 15 seconds, the script puts Cat Eye back.
     func install() {
         guard case .ready(let version) = state, let staged = staged else { return }
         let parent = appURL.deletingLastPathComponent().path
         guard !appURL.path.contains("/AppTranslocation/"), FileManager.default.isWritableFile(atPath: parent) else {
             fail("cannot write to \(parent)"); return
         }
+        let dest = appURL.deletingLastPathComponent().appendingPathComponent(Updater.appName)
         let script = """
-        pid=$1; app=$2; new=$3; backup="$2.previous"
+        pid=$1; old=$2; new=$3; app=$4; backup="$2.previous"; prior="$4.previous"
         while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
-        rm -rf "$backup"
-        mv "$app" "$backup" || { open "$app"; exit 1; }
-        if ! mv "$new" "$app"; then mv "$backup" "$app"; open "$app"; exit 1; fi
+        rm -rf "$backup" "$prior"
+        [ -e "$app" ] && { mv "$app" "$prior" || { open "$old"; exit 1; }; }
+        mv "$old" "$backup" || { open "$old"; exit 1; }
+        if ! mv "$new" "$app"; then mv "$backup" "$old"; [ -e "$prior" ] && mv "$prior" "$app"; open "$old"; exit 1; fi
         open "$app"
         sleep 15
-        if pgrep -f "$app/Contents/MacOS/cat-eye" >/dev/null; then rm -rf "$backup" "$(dirname "$new")"
-        else rm -rf "$app"; mv "$backup" "$app"; open "$app"; fi
+        if pgrep -f "$app/Contents/MacOS/oversire" >/dev/null; then rm -rf "$backup" "$prior" "$(dirname "$new")"
+        else rm -rf "$app"; [ -e "$prior" ] && mv "$prior" "$app"; mv "$backup" "$old"; open "$old"; fi
         """
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", script, "sh", "\(getpid())", appURL.path, staged.path]
+        p.arguments = ["-c", script, "sh", "\(getpid())", appURL.path, staged.path, dest.path]
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         do { try p.run() } catch { fail("cannot start the installer: \(error.localizedDescription)"); return }
